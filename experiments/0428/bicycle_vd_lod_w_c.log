@@ -1,0 +1,9 @@
+2026-04-28 05:54:26.086 | INFO     | __main__:main:127 - device=cuda
+2026-04-28 05:54:26.086 | INFO     | __main__:main:128 - ply=/mnt/data1/samk/gs-quic/cs5262_tile_quic/exp-dataset/bicycle/point_cloud.ply output=/mnt/data1/samk/gs-quic/cs5262_tile_quic/experiments/0428/bicycle_vd_lod_w_c.ply trace=/mnt/data1/samk/gs-quic/cs5262_tile_quic/Frustum-for-3DGS/sample_data/camera_trace/trace1.json
+2026-04-28 05:54:26.086 | INFO     | __main__:main:129 - grid_shape=[4, 4, 4] budget_mb=100.0 num_lod=1 scheme=vd_lod_w_c
+2026-04-28 05:54:46.032 | INFO     | __main__:main:150 - cameras=50 using_index=0
+2026-04-28 05:54:46.316 | INFO     | __main__:main:183 - top_utility_pairs (tile_idx, lod): [[29, 0], [16, 0], [32, 0], [17, 0], [30, 0], [26, 0], [20, 0], [34, 0], [14, 0], [13, 0], [3, 0], [15, 0], [38, 0], [5, 0], [19, 0], [1, 0], [33, 0], [35, 0], [37, 0], [21, 0]]
+2026-04-28 05:54:55.786 | INFO     | __main__:main:200 - tiles=40
+2026-04-28 05:54:55.786 | INFO     | __main__:main:201 - selected_gaussians=422812
+2026-04-28 05:54:55.787 | INFO     | __main__:main:202 - approx_bytes_used=104857376/104857600
+2026-04-28 05:54:55.787 | INFO     | __main__:main:203 - output=/mnt/data1/samk/gs-quic/cs5262_tile_quic/experiments/0428/bicycle_vd_lod_w_c.ply

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from loguru import logger
 
 HERE = Path(__file__).resolve().parent
 WORKSPACE = HERE.parent
@@ -107,6 +108,9 @@ def main() -> None:
                         help="Write PLY in ASCII instead of binary (larger, human-readable)")
     args = parser.parse_args()
 
+    logger.remove()
+    logger.add(sys.stdout, level="INFO")
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     ply_path = Path(args.ply)
@@ -116,6 +120,14 @@ def main() -> None:
         raise FileNotFoundError(ply_path)
     if not camera_trace.exists():
         raise FileNotFoundError(camera_trace)
+
+    log_path = output_path.with_suffix(".log")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logger.add(str(log_path), level="INFO")
+    logger.info("device={}", device)
+    logger.info("ply={} output={} trace={}", ply_path, output_path, camera_trace)
+    logger.info("grid_shape={} budget_mb={} num_lod={} scheme={}",
+                args.grid_shape, args.budget_mb, args.num_lod, args.scheme)
 
     gs = io_3dgs.GaussianModelV2(str(ply_path))
     tile_aabbs, tile_indices, _, _ = tiling.tiling_uniform_layered_gs([gs], grid_shape=tuple(args.grid_shape))
@@ -135,6 +147,7 @@ def main() -> None:
     if args.camera_index < 0 or args.camera_index >= len(cameras):
         raise ValueError("camera-index out of range")
     cam = cameras[args.camera_index]
+    logger.info("cameras={} using_index={}", len(cameras), args.camera_index)
 
     distances = uc.calculate_distances(tile_centers, cam.camera_center.to(device))
     visibility = visibility_AABB_pytorch.batched_check_tiles_visible(
@@ -166,6 +179,9 @@ def main() -> None:
         include_c=include_c,
     )
 
+    top_k = min(20, utilities.shape[0])
+    logger.info("top_utility_pairs (tile_idx, lod): {}", utilities[:top_k].tolist())
+
     budget_bytes = int(args.budget_mb * 1024 * 1024)
     bytes_per_gaussian = _bytes_per_gaussian(gs)
     selected_indices, used_bytes = _select_gaussians(
@@ -181,11 +197,15 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     selected_gs.export_gs_to_ply(str(output_path), ascii=args.ascii_ply)
 
-    print(f"[utility] tiles={len(index_offsets) - 1}")
-    print(f"[utility] selected gaussians={len(selected_indices)}")
-    print(f"[utility] approx bytes used={used_bytes} / {budget_bytes}")
-    print(f"[utility] output={output_path}")
+    logger.info("tiles={}", len(index_offsets) - 1)
+    logger.info("selected_gaussians={}", len(selected_indices))
+    logger.info("approx_bytes_used={}/{}", used_bytes, budget_bytes)
+    logger.info("output={}", output_path)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logger.exception("utility run failed")
+        raise

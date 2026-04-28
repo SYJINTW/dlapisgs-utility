@@ -11,3 +11,14 @@
 2026-04-28 06:17:03.345 | INFO     | __main__:main:214 - approx_bytes_used=104857376/104857600
 2026-04-28 06:17:03.345 | INFO     | __main__:main:215 - output=/mnt/data1/samk/gs-quic/cs5262_tile_quic/experiments/0428/bicycle_vd.ply
 2026-04-28 06:17:03.345 | INFO     | __main__:main:216 - tiling_metadata_npz=/mnt/data1/samk/gs-quic/cs5262_tile_quic/experiments/0428/bicycle_vd.npz
+2026-04-28 08:20:36.268 | INFO     | __main__:main:127 - device=cuda
+2026-04-28 08:20:36.268 | INFO     | __main__:main:128 - ply=/mnt/data1/samk/gs-quic/cs5262_tile_quic/exp-dataset/bicycle/point_cloud.ply output=/mnt/data1/samk/gs-quic/cs5262_tile_quic/dlapisgs-utility/experiments/0428/bicycle_vd.ply trace=/mnt/data1/samk/gs-quic/cs5262_tile_quic/Frustum-for-3DGS/sample_data/camera_trace/trace1.json
+2026-04-28 08:20:36.268 | INFO     | __main__:main:129 - grid_shape=[4, 4, 4] budget_mb=100.0 num_lod=1 scheme=vd
+2026-04-28 08:20:53.729 | INFO     | __main__:main:150 - cameras=50 using_index=0
+2026-04-28 08:20:53.813 | INFO     | __main__:main:186 - saved visibility metadata to=/mnt/data1/samk/gs-quic/cs5262_tile_quic/dlapisgs-utility/experiments/0428/bicycle_vd.vis.npz
+2026-04-28 08:20:54.028 | INFO     | __main__:main:216 - top_utility_pairs (tile_idx, lod): [[29, 0], [32, 0], [30, 0], [33, 0], [16, 0], [25, 0], [20, 0], [17, 0], [26, 0], [21, 0], [12, 0], [13, 0], [23, 0], [10, 0], [36, 0], [39, 0], [37, 0], [34, 0], [28, 0], [31, 0]]
+2026-04-28 08:21:03.951 | INFO     | __main__:main:245 - tiles=40
+2026-04-28 08:21:03.951 | INFO     | __main__:main:246 - selected_gaussians=422812
+2026-04-28 08:21:03.951 | INFO     | __main__:main:247 - approx_bytes_used=104857376/104857600
+2026-04-28 08:21:03.951 | INFO     | __main__:main:248 - output=/mnt/data1/samk/gs-quic/cs5262_tile_quic/dlapisgs-utility/experiments/0428/bicycle_vd.ply
+2026-04-28 08:21:03.951 | INFO     | __main__:main:249 - tiling_metadata_npz=/mnt/data1/samk/gs-quic/cs5262_tile_quic/dlapisgs-utility/experiments/0428/bicycle_vd.npz

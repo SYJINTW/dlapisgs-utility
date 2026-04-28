@@ -22,7 +22,7 @@ sys.path.insert(0, str(WORKSPACE / "GGSP"))
 sys.path.insert(0, str(WORKSPACE / "GS-Interface"))
 
 import visibility_AABB_pytorch  # noqa: E402
-import tiling  # noqa: E402
+import tiling as ggsp_tiling  # noqa: E402
 import utility_calculation as uc  # noqa: E402
 import io_3dgs  # noqa: E402
 
@@ -130,9 +130,9 @@ def main() -> None:
                 args.grid_shape, args.budget_mb, args.num_lod, args.scheme)
 
     gs = io_3dgs.GaussianModelV2(str(ply_path))
-    tile_aabbs, tile_indices, _, _ = tiling.tiling_uniform_layered_gs([gs], grid_shape=tuple(args.grid_shape))
+    tile_aabbs, tile_indices, scene_min, scene_max = ggsp_tiling.tiling_uniform_layered_gs([gs], grid_shape=tuple(args.grid_shape))
 
-    min_corners, max_corners, index_offsets, flat_indices, _ = _build_tile_arrays(
+    min_corners, max_corners, index_offsets, flat_indices, sorted_tile_keys = _build_tile_arrays(
         tile_aabbs, tile_indices, layer_idx=0
     )
 
@@ -153,6 +153,39 @@ def main() -> None:
     visibility = visibility_AABB_pytorch.batched_check_tiles_visible(
         min_corners_t, max_corners_t, cam, device=device
     )
+
+    # Save visibility and camera info for headless visualization
+    try:
+        vis_npz_path = output_path.with_suffix('.vis.npz')
+        # Ensure numpy arrays on CPU
+        np_min = min_corners
+        np_max = max_corners
+        np_visibility_all = visibility.cpu().numpy() if hasattr(visibility, 'cpu') else np.asarray(visibility)
+        np_distances = distances.cpu().numpy() if hasattr(distances, 'cpu') else np.asarray(distances)
+        # Camera matrices (world->view and projection) and camera center
+        cam_w2v = cam.world_view_transform.cpu().numpy()
+        cam_proj = cam.projection_matrix.cpu().numpy()
+        cam_center = cam.camera_center.cpu().numpy()
+
+        # Align visibility to the metadata ordering used by save_tiles_to_npz()
+        # save_tiles_to_npz only writes non-empty tiles (it filters empty tiles out).
+        # Build positions of non-empty tiles in the sorted_tile_keys order.
+        meta_positions = [i for i, tk in enumerate(sorted_tile_keys) if len(tile_indices[tk][0]) > 0]
+        visibility_meta = np_visibility_all[meta_positions] if len(meta_positions) > 0 else np.zeros((0,), dtype=bool)
+
+        np.savez(str(vis_npz_path),
+                 min_corners=np_min,
+                 max_corners=np_max,
+                 visibility_all=np_visibility_all,
+                 visibility=visibility_meta,
+                 distances=np_distances,
+                 tile_centers=tile_centers.cpu().numpy(),
+                 camera_center=cam_center,
+                 world_view_transform=cam_w2v,
+                 projection_matrix=cam_proj)
+        logger.info("saved visibility metadata to={}", vis_npz_path)
+    except Exception as e:
+        logger.warning("Failed saving visibility NPZ: {}", e)
 
     opacity = gs.data["opacity"]["data"]
     scale_0 = gs.data["scale_0"]["data"]
@@ -197,10 +230,23 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     selected_gs.export_gs_to_ply(str(output_path), ascii=args.ascii_ply)
 
+    # Save tiling metadata for visualization/debug
+    npz_output_path = output_path.with_suffix(".npz")
+    ggsp_tiling.save_tiles_to_npz(
+        tile_aabbs,
+        tile_indices,
+        str(npz_output_path),
+        grid_shape=tuple(args.grid_shape),
+        scene_min=scene_min,
+        scene_max=scene_max,
+        layer_idx=0
+    )
+
     logger.info("tiles={}", len(index_offsets) - 1)
     logger.info("selected_gaussians={}", len(selected_indices))
     logger.info("approx_bytes_used={}/{}", used_bytes, budget_bytes)
     logger.info("output={}", output_path)
+    logger.info("tiling_metadata_npz={}", npz_output_path)
 
 
 if __name__ == "__main__":

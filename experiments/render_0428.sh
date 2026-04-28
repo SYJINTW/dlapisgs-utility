@@ -11,6 +11,8 @@ OUT_DIR="$ROOT/dlapisgs-utility/experiments/0428"
 TRACE="$ROOT/Frustum-for-3DGS/sample_data/camera_trace/trace1.json"
 RENDERER_DIR="$ROOT/LapisGS-object-based-renderer"
 RENDER_OUT_DIR="$ROOT/dlapisgs-utility/experiments/0428/renders"
+CONDA_ENV="${CONDA_ENV:-gaussian_splatting}"
+DUMMY_IMAGE="${DUMMY_IMAGE:-$ROOT/exp-dataset/chair/predictions/color/test/r_0.png}"
 
 # Rendering parameters
 IMG_WIDTH=${IMG_WIDTH:-800}
@@ -46,12 +48,14 @@ echo "=========================================="
 echo "Trace: $TRACE"
 echo "Width x Height: $IMG_WIDTH x $IMG_HEIGHT"
 echo "Output: $RENDER_OUT_DIR"
+echo "Conda env: $CONDA_ENV"
+echo "Dummy image: $DUMMY_IMAGE"
 echo "=========================================="
 echo ""
 
 # Scheme 1: vd (visibility + distance)
 echo "[1/3] Rendering: vd (visibility + distance)"
-python3 "$RENDERER_DIR/render-lapisgs_streaming_trace.py" \
+LAPISGS_DUMMY_IMAGE="$DUMMY_IMAGE" conda run -n "$CONDA_ENV" python3 "$RENDERER_DIR/render-lapisgs_streaming_trace.py" \
     --name "bicycle_vd" \
     --gs_path_list "$OUT_DIR/bicycle_vd.ply" \
     --gs_res_list 1 \
@@ -66,7 +70,7 @@ echo ""
 
 # Scheme 2: vd_lod (with LOD levels)
 echo "[2/3] Rendering: vd_lod (with LOD levels)"
-python3 "$RENDERER_DIR/render-lapisgs_streaming_trace.py" \
+LAPISGS_DUMMY_IMAGE="$DUMMY_IMAGE" conda run -n "$CONDA_ENV" python3 "$RENDERER_DIR/render-lapisgs_streaming_trace.py" \
     --name "bicycle_vd_lod" \
     --gs_path_list "$OUT_DIR/bicycle_vd_lod.ply" \
     --gs_res_list 1 \
@@ -81,7 +85,7 @@ echo ""
 
 # Scheme 3: vd_lod_w_c (full model)
 echo "[3/3] Rendering: vd_lod_w_c (full model with weights + complexity)"
-python3 "$RENDERER_DIR/render-lapisgs_streaming_trace.py" \
+LAPISGS_DUMMY_IMAGE="$DUMMY_IMAGE" conda run -n "$CONDA_ENV" python3 "$RENDERER_DIR/render-lapisgs_streaming_trace.py" \
     --name "bicycle_vd_lod_w_c" \
     --gs_path_list "$OUT_DIR/bicycle_vd_lod_w_c.ply" \
     --gs_res_list 1 \

@@ -10,6 +10,7 @@ set -euo pipefail
 
 ROOT="/mnt/data1/samk/gs-quic/cs5262_tile_quic"
 SCRIPT_DIR="$ROOT/dlapisgs-utility/experiments"
+CONDA_ENV="${CONDA_ENV:-gaussian_splatting}"
 
 echo ""
 echo "╔════════════════════════════════════════════════════════════════╗"
@@ -26,13 +27,13 @@ echo ""
 # Step 2: Visualize tiling results
 echo "[STEP 2/3] Visualize Tiling Results"
 echo "────────────────────────────────────────────────────────────────"
-bash "$SCRIPT_DIR/visualize_0428.sh"
+bash "$SCRIPT_DIR/headless_visualize_0428.sh"
 echo ""
 
 # Step 3: Render for evaluation
 echo "[STEP 3/3] Rendering for Evaluation"
 echo "────────────────────────────────────────────────────────────────"
-bash "$SCRIPT_DIR/render_0428.sh"
+conda run -n "$CONDA_ENV" bash "$SCRIPT_DIR/render_0428.sh"
 echo ""
 
 echo "╔════════════════════════════════════════════════════════════════╗"

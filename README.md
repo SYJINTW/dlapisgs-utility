@@ -6,8 +6,8 @@ It evaluates which 3DGS tiles to transmit first (and at which Level-of-Detail) b
 
 ## Key Logic (`utility_calculation.py`)
 
-- **`calculate_utility_basic(...)`**: The original baseline heuristic scoring. Ranks tiles based strictly on binary visibility, inverse distance, and static layer weights.
-- **`calculate_utility_proposed(...)`**: The proposed rate-utility mathematical model. Computes the utility gain if tile `k` is promoted to its next LOD layer.
+- **`calculate_utility_baseline(...)`**: Baseline scoring using visibility and inverse distance only (no LOD).
+- **`calculate_utility_param(...)`**: Parameterized scoring with optional LOD, Gaussian weight `W_k`, and complexity `C_k` factors.
 - **`compute_gaussian_weights(...)`**: Calculates the importance weight $w(g_i)$ for individual Gaussians using their spatial volume (determinant of covariance) and opacity.
 - **`compute_tile_weights_and_counts(...)`**: Aggregates the per-Gaussian weights within a tile to produce the aggregate weight $W_k$ and extracts the normalized Gaussian count $C_k$.
 

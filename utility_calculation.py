@@ -16,116 +16,90 @@ DISTANCE_EPS = 1e-3             # added to distance to prevent division by zero
 LAYER_WEIGHT_BASE = 10.0        # base of the per-layer geometric weighting
 
 
-def calculate_utility_basic(visibility_mask_tensor, tile_distances_tensor, num_of_level):
+def _compute_base_scores(visibility_mask_tensor, tile_distances_tensor):
+    vis_factor = torch.where(visibility_mask_tensor, 1.0, INVISIBLE_PRIORITY_EPS)
+    dist_factor = 1.0 / (tile_distances_tensor + DISTANCE_EPS)
+    return vis_factor * dist_factor
+
+
+def calculate_utility_baseline(visibility_mask_tensor, tile_distances_tensor):
     """
-    Compute the utility score matrix for 3DGS tiles.
-    (transmission-priority)
+    Compute the baseline utility using visibility and distance only.
 
     Args:
         visibility_mask_tensor: length-N tensor; True if the tile is visible.
         tile_distances_tensor:  length-N tensor; Euclidean distance from camera to each tile center.
-        num_of_level (int):     total number of LOD layers (e.g. 3 means LOD 0, 1, 2).
 
     Returns:
-        np.array: shape (N * num_of_level, 2). Higher score = higher transmission priority.
+        np.array: shape (N, 2). Pairs of (tile_index, lod_level=0), sorted by score.
     """
-    device = visibility_mask_tensor.device
-    N = visibility_mask_tensor.shape[0]
-
-    # --- 1. Per-factor weights ---
-    # Visibility: 1.0 if visible, INVISIBLE_PRIORITY_EPS otherwise (avoids hard-zeroing the score).
-    vis_factor = torch.where(visibility_mask_tensor, 1.0, INVISIBLE_PRIORITY_EPS)
-    print("Visibility factor:", vis_factor.cpu().numpy())
-    # Distance: closer tiles score higher; DISTANCE_EPS guards against div-by-zero.
-    dist_factor = 1.0 / (tile_distances_tensor + DISTANCE_EPS)
-    print("Distance factor:", dist_factor.cpu().numpy())
-    # Layer: prefer base layer (for num_of_level=3, weights are [100.0, 10.0, 1.0]).
-    levels = torch.arange(num_of_level, device=device, dtype=torch.float32)
-    layer_weights = LAYER_WEIGHT_BASE ** ((num_of_level - 1) - levels)
-
-    # --- 2. Build the utility matrix ---
-    base_scores = vis_factor * dist_factor   # shape: (N,)
-    print("Base scores (visibility * distance):", base_scores.cpu().numpy())
-
-    # Broadcast to (N, num_of_level)
-    utility_matrix = base_scores.unsqueeze(1) * layer_weights.unsqueeze(0)
-
-    # --- 3. Flatten and sort ---
-    flattened_scores = utility_matrix.view(-1)
-    sorted_1d_indices = torch.argsort(flattened_scores, descending=True)
-
-    # --- 4. Recover (tile_index, lod_level) from the flat index ---
-    tile_indices = sorted_1d_indices // num_of_level
-    lod_levels = sorted_1d_indices % num_of_level
-
-    # --- 5. Stack and return ---
-    result_tensor = torch.stack((tile_indices, lod_levels), dim=1)
+    base_scores = _compute_base_scores(visibility_mask_tensor, tile_distances_tensor)
+    sorted_indices = torch.argsort(base_scores, descending=True)
+    lod_levels = torch.zeros_like(sorted_indices, dtype=torch.long)
+    result_tensor = torch.stack((sorted_indices, lod_levels), dim=1)
     return result_tensor.cpu().numpy()
 
-
-def calculate_two_level_utility(
-    visibility_mask_tensor,
+# Our method with configurable factors and LOD consideration
+def calculate_utility_param(
+    visibility_mask_tensor, # [TODO] change to probability in [0,1] later
     tile_distances_tensor,
-    current_tile_lods_tensor,
     num_of_level,
-    complexity_tensor,
-    weight_sum_tensor,
-    alpha=1.0,
-    beta=2.0
+    weight_sum_tensor=None,
+    complexity_tensor=None,
+    include_lod=True,
+    include_w=False,
+    include_c=False,
 ):
     """
-    Compute the utility score matrix U(k) for 3DGS tiles according to the new rate-utility model.
+    full version:
+    U(k) = log(beta * (l_k + 1)) * (v_k / d_k) * C_k * W_k
 
-    U(k) = alpha * log(beta * (l_k + 1)) * (v_k / d_k) * C_k * W_k
+    Compute a configurable utility score with optional LOD, weight, and complexity factors.
+    
+    sent l_k in {0, 1, 2,..., L-1}
+    l_k = -1 means not sent 
 
     Args:
-        visibility_mask_tensor: length-N tensor; True if the tile is visible.
+        visibility_mask_tensor: length-N tensor; True if the tile is visible. 
         tile_distances_tensor:  length-N tensor; Euclidean distance from camera.
-        current_tile_lods_tensor: length-N tensor; Current LOD level of each tile l_k.
-        num_of_level (int):     total number of LOD layers.
-        complexity_tensor:      length-N tensor; Normalized Gaussian count or entropy.
-        weight_sum_tensor:      length-N tensor; Aggregate Gaussian weight per tile.
-        alpha (float):          Alpha parameter for log curve.
-        beta (float):           Beta parameter for log curve.
+        num_of_level (int):     total number of LOD layers (1 means plain 3DGS). 
+        weight_sum_tensor:      length-N tensor; Aggregate Gaussian weight per tile (W_k).
+        complexity_tensor:      length-N tensor; Normalized count or entropy per tile (C_k).
+        include_lod (bool):     If True, rank (tile, lod) pairs using per-layer weights.
+        include_w (bool):       If True, multiply scores by W_k.
+        include_c (bool):       If True, multiply scores by C_k.
 
     Returns:
-        np.array: shape (N, 2). Pairs of (tile_index, target_lod_level), sorted by U(k).
-                  This function evaluates U(k) at target_lod = current_lod + 1.
+        np.array: shape (N, 2) if LOD disabled or num_of_level==1, otherwise (N*num_of_level, 2).
+                  The second column is the target lod_level.
     """
-    device = visibility_mask_tensor.device
-    N = visibility_mask_tensor.shape[0]
+    if include_w and weight_sum_tensor is None:
+        raise ValueError("weight_sum_tensor is required when include_w=True")
+    if include_c and complexity_tensor is None:
+        raise ValueError("complexity_tensor is required when include_c=True")
 
-    # Evaluate at next LOD level: l_next = l_k + 1
-    # Note: Using torch.clamp to ensure we don't exceed max LOD layer
-    l_next = current_tile_lods_tensor + 1
-    
-    # Base factors
-    vis_factor = torch.where(visibility_mask_tensor, 1.0, INVISIBLE_PRIORITY_EPS)
-    dist_factor = 1.0 / (tile_distances_tensor + DISTANCE_EPS)
-    
-    # Utility log term: log(beta * (l_next + 1)) -> Note: if formula is log(beta*(l_k+1)), 
-    # we evaluate for the *new* state which means we plug in l_next for l_k in the formula, 
-    # so we do log(beta * (l_next + 1))? The prompt says "Evaluate U(k) at LOD = ℓ_k + 1".
-    # Wait, the prompt formula is U(k) = log(beta*(l_k+1)). So evaluated at l_next, it's log(beta*(l_next)).
-    utility_val = alpha * torch.log(beta * l_next) * vis_factor * dist_factor * complexity_tensor * weight_sum_tensor
+    base_scores = _compute_base_scores(visibility_mask_tensor, tile_distances_tensor)
 
-    # Sort the single utility scores for the next layer promotion
-    flattened_scores = utility_val.view(-1)
-    
-    # Only consider tiles that haven't reached the max LOD layer
-    valid_mask = current_tile_lods_tensor < num_of_level
-    # Make invalid ones have -inf priority
-    flattened_scores = torch.where(valid_mask, flattened_scores, -torch.inf)
+    if include_w:
+        base_scores = base_scores * weight_sum_tensor
+    if include_c:
+        base_scores = base_scores * complexity_tensor
 
-    sorted_indices = torch.argsort(flattened_scores, descending=True)
-    
-    # Filter out the invalid ones (-inf)
-    valid_sorted_indices = sorted_indices[valid_mask[sorted_indices]]
+    if not include_lod or num_of_level <= 1:
+        sorted_indices = torch.argsort(base_scores, descending=True)
+        lod_levels = torch.zeros_like(sorted_indices, dtype=torch.long)
+        result_tensor = torch.stack((sorted_indices, lod_levels), dim=1)
+        return result_tensor.cpu().numpy()
 
-    # Target LODs are just the current LODs + 1 for each tile
-    target_lods = (current_tile_lods_tensor[valid_sorted_indices] + 1)
-    
-    result_tensor = torch.stack((valid_sorted_indices, target_lods.to(torch.long)), dim=1)
+    levels = torch.arange(num_of_level, device=base_scores.device, dtype=torch.float32)
+    layer_weights = LAYER_WEIGHT_BASE ** ((num_of_level - 1) - levels)
+    utility_matrix = base_scores.unsqueeze(1) * layer_weights.unsqueeze(0)
+
+    flattened_scores = utility_matrix.view(-1)
+    sorted_1d_indices = torch.argsort(flattened_scores, descending=True)
+    tile_indices = sorted_1d_indices // num_of_level
+    lod_levels = sorted_1d_indices % num_of_level
+    result_tensor = torch.stack((tile_indices, lod_levels), dim=1)
     return result_tensor.cpu().numpy()
 
 
@@ -135,19 +109,21 @@ def compute_gaussian_weights(opacity, scale_0, scale_1, scale_2, gamma=1.0):
     det(Sigma_i) relates to the 3D volume = exp(2 * (scale_0 + scale_1 + scale_2))
     Opacity o_i = 1 / (1 + exp(-opacity))
     
+    refer to original 3DGS implementation if anything here seems unclear.
+    
     Args:
         opacity (torch.Tensor or np.ndarray): raw opacity values from PLY
         scale_0, scale_1, scale_2: raw scale values from PLY
         gamma (float): empirical exponent
     """
     if not isinstance(opacity, torch.Tensor):
-        opacity = torch.tensor(opacity, dtype=torch.float32)
+        opacity = torch.tensor(opacity, dtype=torch.float32) 
         scale_0 = torch.tensor(scale_0, dtype=torch.float32)
         scale_1 = torch.tensor(scale_1, dtype=torch.float32)
         scale_2 = torch.tensor(scale_2, dtype=torch.float32)
 
-    o_i = torch.sigmoid(opacity)
-    det_sigma = torch.exp(2.0 * (scale_0 + scale_1 + scale_2))
+    o_i = torch.sigmoid(opacity) # activate opacity to [0, 1]
+    det_sigma = torch.exp(2.0 * (scale_0 + scale_1 + scale_2)) # calculate det covariance (volume) from log scales of std
     w_gi = o_i * (det_sigma ** gamma)
     return w_gi
 
@@ -217,7 +193,14 @@ def main():
         print(f"Camera {cam.uid} can see tiles: {visible_tile_idxs}")
         # print(visible_mask)
         
-        tile_utilities = calculate_utility_basic(visibility_mask_tensor, tile_distances_tensor, 3)
+        tile_utilities = calculate_utility_param(
+            visibility_mask_tensor,
+            tile_distances_tensor,
+            num_of_level=3,
+            include_lod=True,
+            include_w=False,
+            include_c=False,
+        )
         print(f"Camera {cam.uid} utility scores (tile_index, lod_level):")
         print(tile_utilities[:])
         break

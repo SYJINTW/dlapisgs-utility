@@ -6,6 +6,13 @@ Steps:
 2) Tile it using GGSP tiling.
 3) Compute view-conditioned utilities per scheme.
 4) Select Gaussians under a byte budget and export a subset PLY.
+
+[TODO] 
+- test utility scoring scheme
+- test scheduler without GS-level or without Tile-level vs. Ours Full
+(pure progressive v. pure adaptive v. our two-level design)
+
+
 """
 import argparse
 import json

@@ -161,6 +161,7 @@ def calculate_distances(tile_centers_tensor, cam_center_tensor):
     return torch.norm(tile_centers_tensor - cam_center_tensor.unsqueeze(0), dim=1)
 
 
+# main func for unit test
 def main():
     base_dir = Path("/home/syjintw/Desktop/NUS/dlapisgs-output/longdress/opacity")
     res1_frame0_path = base_dir / "longdress_res1" / "dynamic_1051" / "point_cloud" / "iteration_30000" / "point_cloud.ply"

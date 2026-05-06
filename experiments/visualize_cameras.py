@@ -90,9 +90,9 @@ def main():
     ax.scatter(centers[:,0], centers[:,1], centers[:,2], c='blue', s=20)
 
     # Draw orientation arrows (skip to avoid clutter)
-    for i in range(0, len(centers), args.skip):
-        draw_camera(ax, centers[i], Rs[i], scale=args.scale, color='blue')
-        ax.text(centers[i][0], centers[i][1], centers[i][2], str(i), color='black')
+    # for i in range(0, len(centers), args.skip):
+    #     draw_camera(ax, centers[i], Rs[i], scale=args.scale, color='blue')
+    #     ax.text(centers[i][0], centers[i][1], centers[i][2], str(i), color='black')
 
     ax.set_xlabel('X')
     ax.set_ylabel('Y')

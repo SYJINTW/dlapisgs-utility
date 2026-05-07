@@ -28,20 +28,24 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+# Peek before importing pyplot — backend must be set before pyplot is loaded.
 import matplotlib
+matplotlib.use("TkAgg" if "--interactive" in sys.argv else "Agg")
+
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.colors import Normalize
 from matplotlib.cm import ScalarMappable
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(WORKSPACE_ROOT / "GS-Interface"))   # needed by tiling.py → io_3dgs
 sys.path.insert(0, str(WORKSPACE_ROOT / "dlapisgs-utility"))
 from utility_calculation import (
     compute_gaussian_weights,
     compute_tile_weights_and_counts,
     INVISIBLE_PRIORITY_EPS,
     DISTANCE_EPS,
-    LAYER_WEIGHT_BASE,
 )
 
 SCHEME_LABELS = {
@@ -60,11 +64,13 @@ def _project_points(points_world: np.ndarray,
                     world_view: np.ndarray,
                     proj: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Project Nx3 world points → NDC xy.  Returns (ndc_xy, in_front) arrays."""
+    # 3DGS stores world_view_transform and projection_matrix pre-transposed
+    # for row-vector left-multiplication: clip = p4 @ wv @ proj  (no .T needed)
     N = len(points_world)
     ones = np.ones((N, 1), dtype=np.float32)
     p4 = np.concatenate([points_world, ones], axis=1)          # (N,4)
-    cam = p4 @ world_view.T                                      # (N,4)
-    clip = cam @ proj.T                                          # (N,4)
+    cam = p4 @ world_view                                        # (N,4)
+    clip = cam @ proj                                            # (N,4)
     w = clip[:, 3:4]
     in_front = w[:, 0] > 0
     w_safe = np.where(np.abs(w) < 1e-6, 1e-6, w)
@@ -101,40 +107,57 @@ def _raw_scores(vis: np.ndarray, dist: np.ndarray,
 
 def _scatter_tiles(ax: plt.Axes,
                    ndc: np.ndarray,
+                   in_front: np.ndarray,
                    values: np.ndarray,
                    visible: np.ndarray,
                    gs_counts: np.ndarray,
                    title: str,
                    cmap: str = "plasma",
                    label: str = "score") -> None:
-    """Scatter tile centres in NDC space, sized by GS count, coloured by values."""
-    sizes = 40 + 400 * (gs_counts / gs_counts.max())
+    """Scatter tile centres in screen space, sized by Gaussian count, coloured by values."""
+    sizes = 80 + 600 * (gs_counts / gs_counts.max())
     norm = Normalize(vmin=values.min(), vmax=values.max())
     sm = ScalarMappable(norm=norm, cmap=cmap)
     colors = sm.to_rgba(values)
 
-    # Invisible tiles dimmed
-    alpha = np.where(visible, 1.0, 0.25)
+    # Culled tiles shown as hollow grey circles; visible tiles filled + labelled
     for i in range(len(ndc)):
-        ax.scatter(ndc[i, 0], ndc[i, 1], s=sizes[i],
-                   color=colors[i], alpha=float(alpha[i]),
-                   edgecolors="white" if visible[i] else "grey",
-                   linewidths=0.5, zorder=3)
+        if visible[i]:
+            ax.scatter(ndc[i, 0], ndc[i, 1], s=sizes[i],
+                       color=colors[i], edgecolors="black",
+                       linewidths=0.8, zorder=4)
+            ax.annotate(str(i), (ndc[i, 0], ndc[i, 1]),
+                        fontsize=6, ha="center", va="center",
+                        color="white", fontweight="bold", zorder=5)
+        else:
+            ax.scatter(ndc[i, 0], ndc[i, 1], s=max(sizes[i] * 0.4, 30),
+                       facecolors="none", edgecolors="#aaaaaa",
+                       linewidths=0.5, zorder=2)
 
-    ax.set_xlim(-1.1, 1.1)
-    ax.set_ylim(-1.1, 1.1)
-    ax.axhline(0, color="grey", lw=0.4, ls="--")
-    ax.axvline(0, color="grey", lw=0.4, ls="--")
-    ax.set_xlabel("NDC x", fontsize=8)
-    ax.set_ylabel("NDC y", fontsize=8)
+    # Show all projected centres; draw a dashed rectangle marking the actual screen boundary
+    all_x, all_y = ndc[:, 0][in_front], ndc[:, 1][in_front]
+    pad = 0.5
+    xlo = min(-1.1, all_x.min() - pad) if len(all_x) else -1.1
+    xhi = max( 1.1, all_x.max() + pad) if len(all_x) else  1.1
+    ylo = min(-1.1, all_y.min() - pad) if len(all_y) else -1.1
+    yhi = max( 1.1, all_y.max() + pad) if len(all_y) else  1.1
+    ax.set_xlim(xlo, xhi)
+    ax.set_ylim(ylo, yhi)
+    ax.axhline(0, color="#cccccc", lw=0.5, ls="--")
+    ax.axvline(0, color="#cccccc", lw=0.5, ls="--")
+    # Screen boundary (what the camera actually sees)
+    ax.add_patch(mpatches.FancyBboxPatch((-1, -1), 2, 2,
+                 boxstyle="square,pad=0", linewidth=1.5,
+                 edgecolor="black", facecolor="none", linestyle="--", zorder=6))
+    ax.set_xlabel("screen x (−1 to 1)", fontsize=8)
+    ax.set_ylabel("screen y (−1 to 1)", fontsize=8)
     ax.set_title(title, fontsize=9, fontweight="bold")
-    ax.set_aspect("equal")
-    ax.set_facecolor("#111111")
+    ax.set_facecolor("#f5f5f5")
 
     plt.colorbar(sm, ax=ax, label=label, fraction=0.046, pad=0.04)
 
-    vis_patch = mpatches.Patch(color="white", alpha=1.0, label="visible")
-    cull_patch = mpatches.Patch(color="grey",  alpha=0.4, label="culled")
+    vis_patch = mpatches.Patch(color="steelblue", label="visible (filled)")
+    cull_patch = mpatches.Patch(facecolor="none", edgecolor="#aaaaaa", label="culled (hollow)")
     ax.legend(handles=[vis_patch, cull_patch], fontsize=7, loc="lower right")
 
 
@@ -155,8 +178,7 @@ def _birdseye(ax: plt.Axes,
     ax.set_xlabel("X", fontsize=8)
     ax.set_ylabel("Z", fontsize=8)
     ax.set_title("Bird's-eye tile map (XZ)", fontsize=9, fontweight="bold")
-    ax.set_facecolor("#111111")
-    ax.legend(fontsize=7)
+    ax.set_facecolor("#f5f5f5")
     vis_p = mpatches.Patch(color="#44cc44", label=f"visible ({visible.sum()})")
     cull_p = mpatches.Patch(color="#cc4444", label=f"culled ({(~visible).sum()})")
     ax.legend(handles=[vis_p, cull_p], fontsize=7)
@@ -182,13 +204,15 @@ def main() -> None:
                         help="Show plot in a window instead of saving (run locally, no GPU needed)")
     args = parser.parse_args()
 
-    if args.interactive:
-        matplotlib.use("TkAgg")   # works on macOS/Linux with display
-    else:
-        matplotlib.use("Agg")
-
+    import json as _json
     vis_data  = np.load(args.vis_npz)
     tile_data = np.load(args.tile_npz, allow_pickle=True)
+
+    manifest_path = Path(args.tile_npz).parent / "selected.json"
+    selected_gs: int | None = None
+    if manifest_path.exists():
+        with open(manifest_path) as f:
+            selected_gs = _json.load(f).get("selected_gaussians")
 
     min_corners = vis_data["min_corners"]    # (N,3)
     max_corners = vis_data["max_corners"]    # (N,3)
@@ -214,11 +238,12 @@ def main() -> None:
         print(f"Loading PLY: {args.ply} ...")
         sys.path.insert(0, str(WORKSPACE_ROOT / "GS-Interface"))
         from io_3dgs import GaussianModelV2  # type: ignore
-        gs_model = GaussianModelV2()
-        gs_model.load_ply(args.ply)
-        opacity = gs_model.get_opacity.squeeze().detach()
-        scales  = gs_model.get_scaling.detach()
-        w_gi = compute_gaussian_weights(opacity, scales[:, 0], scales[:, 1], scales[:, 2], args.gamma)
+        gs_model = GaussianModelV2(args.ply)
+        opacity = gs_model.data["opacity"]["data"]
+        scale_0 = gs_model.data["scale_0"]["data"]
+        scale_1 = gs_model.data["scale_1"]["data"]
+        scale_2 = gs_model.data["scale_2"]["data"]
+        w_gi = compute_gaussian_weights(opacity, scale_0, scale_1, scale_2, args.gamma)
         W_k, C_k = compute_tile_weights_and_counts(
             torch.tensor(offsets, dtype=torch.long),
             torch.tensor(flat_idx,  dtype=torch.long),
@@ -235,14 +260,14 @@ def main() -> None:
     #   Row 0: [bird's-eye | screen vis/dist | vd_lod | vd_lod_w]
     #   Row 1: [blank      | blank           | vd_lod_c | vd_lod_w_c]
     # -----------------------------------------------------------------------
-    fig = plt.figure(figsize=(22, 10))
+    fig = plt.figure(figsize=(28, 12))
     fig.suptitle(f"Camera {args.camera_index:03d}  —  "
                  f"{visibility.sum()}/{N} tiles visible  |  "
                  f"{int(gs_counts[visibility].sum()):,} visible GS  |  "
                  f"{int(gs_counts.sum()):,} total GS",
                  fontsize=13, fontweight="bold")
 
-    gs_fig = fig.add_gridspec(2, 4, hspace=0.45, wspace=0.35)
+    gs_fig = fig.add_gridspec(2, 4, hspace=0.65, wspace=0.55)
 
     # Panel 0: bird's-eye
     ax0 = fig.add_subplot(gs_fig[0, 0])
@@ -250,7 +275,7 @@ def main() -> None:
 
     # Panel 1: screen projection coloured by distance (visible only)
     ax1 = fig.add_subplot(gs_fig[0, 1])
-    _scatter_tiles(ax1, ndc, distances, visibility, gs_counts,
+    _scatter_tiles(ax1, ndc, in_front, distances, visibility, gs_counts,
                    title="Screen projection (distance)", cmap="cool", label="dist")
 
     # Panels 2-5: one per scheme
@@ -265,7 +290,7 @@ def main() -> None:
             ax.set_title(SCHEME_LABELS[scheme], fontsize=9, fontweight="bold")
             ax.set_facecolor("#111111")
             continue
-        _scatter_tiles(ax, ndc, s, visibility, gs_counts,
+        _scatter_tiles(ax, ndc, in_front, s, visibility, gs_counts,
                        title=SCHEME_LABELS[scheme], cmap="plasma", label="utility")
 
     # Blank panels in row 1 cols 0-1
@@ -275,22 +300,33 @@ def main() -> None:
 
         if col == 0:
             # Summary table
-            visible_gs = int(gs_counts[visibility].sum())
-            total_gs   = int(gs_counts.sum())
+            visible_gs  = int(gs_counts[visibility].sum())
+            total_gs    = int(gs_counts.sum())
+            BYTES_PER_GS = 248
+            def _mb(n): return n * BYTES_PER_GS / 1e6
+            budget_given = manifest_path.exists() and _json.load(open(manifest_path)).get("budget_mb")
+            if selected_gs is not None:
+                sel_str = (f"{selected_gs:,}  "
+                           f"{100*selected_gs/total_gs:.1f}%  "
+                           f"{_mb(selected_gs):.0f} MB")
+            else:
+                sel_str = "N/A (no manifest)"
+            budget_str = (f"{budget_given:.0f} MB" if budget_given else
+                          f"~{_mb(visible_gs):.0f} MB (full visible)")
             lines = [
                 f"Camera index : {args.camera_index}",
-                f"Tiles        : {N} total, {visibility.sum()} visible",
-                f"Visible GS   : {visible_gs:,}",
-                f"Total GS     : {total_gs:,}",
-                f"Visible frac : {100*visible_gs/total_gs:.1f}%",
-                f"Budget needed: ~{visible_gs*248/1e6:.0f} MB (full quality)",
+                f"Tiles        : {N} total,  {visibility.sum()} visible",
+                f"Total GS     : {total_gs:,}   100%   {_mb(total_gs):.0f} MB",
+                f"Visible GS   : {visible_gs:,}   {100*visible_gs/total_gs:.1f}%   {_mb(visible_gs):.0f} MB",
+                f"Selected GS  : {sel_str}",
+                f"Budget given : {budget_str}",
             ]
             ax_blank.text(0.05, 0.95, "\n".join(lines),
                           transform=ax_blank.transAxes,
                           va="top", ha="left", fontsize=9,
                           fontfamily="monospace",
-                          bbox=dict(boxstyle="round", fc="#1a1a1a", ec="grey", alpha=0.8),
-                          color="white")
+                          bbox=dict(boxstyle="round", fc="#f0f0f0", ec="#aaaaaa"),
+                          color="black")
 
     if args.interactive:
         plt.show()
@@ -298,7 +334,7 @@ def main() -> None:
         out_path = Path(args.out) if args.out else \
             Path(args.vis_npz).parent / f"debug_cam{args.camera_index:03d}.png"
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_path, dpi=180, bbox_inches="tight", facecolor="#0d0d0d")
+        fig.savefig(out_path, dpi=180, bbox_inches="tight", facecolor="white")
         plt.close(fig)
         print(f"Saved: {out_path}")
 

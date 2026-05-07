@@ -93,11 +93,15 @@ def _raw_scores(vis: np.ndarray, dist: np.ndarray,
     dist_f = 1.0 / (dist + DISTANCE_EPS)
     base = vis_f * dist_f
 
+    def _norm(s):
+        mx = s.max()
+        return s / mx if mx > 0 else s
+
     scores: dict[str, np.ndarray] = {}
-    scores["vd_lod"] = base.copy()
-    scores["vd_lod_w"] = base * W_k if W_k is not None else None
-    scores["vd_lod_c"] = base * C_k if C_k is not None else None
-    scores["vd_lod_w_c"] = base * W_k * C_k if (W_k is not None and C_k is not None) else None
+    scores["vd_lod"]     = _norm(base.copy())
+    scores["vd_lod_w"]   = _norm(base * W_k)   if W_k is not None else None
+    scores["vd_lod_c"]   = _norm(base * C_k)   if C_k is not None else None
+    scores["vd_lod_w_c"] = _norm(base * W_k * C_k) if (W_k is not None and C_k is not None) else None
     return scores
 
 
@@ -303,21 +307,23 @@ def main() -> None:
             visible_gs  = int(gs_counts[visibility].sum())
             total_gs    = int(gs_counts.sum())
             BYTES_PER_GS = 248
-            def _mb(n): return n * BYTES_PER_GS / 1e6
-            budget_given = manifest_path.exists() and _json.load(open(manifest_path)).get("budget_mb")
+            MiB = 1024 * 1024
+            def _mib(n): return n * BYTES_PER_GS / MiB
+            manifest_data = _json.load(open(manifest_path)) if manifest_path.exists() else {}
+            budget_given  = manifest_data.get("budget_mb")   # stored in MiB
             if selected_gs is not None:
                 sel_str = (f"{selected_gs:,}  "
                            f"{100*selected_gs/total_gs:.1f}%  "
-                           f"{_mb(selected_gs):.0f} MB")
+                           f"{_mib(selected_gs):.1f} MiB")
             else:
                 sel_str = "N/A (no manifest)"
-            budget_str = (f"{budget_given:.0f} MB" if budget_given else
-                          f"~{_mb(visible_gs):.0f} MB (full visible)")
+            budget_str = (f"{budget_given:.0f} MiB" if budget_given else
+                          f"~{_mib(visible_gs):.0f} MiB (full visible)")
             lines = [
                 f"Camera index : {args.camera_index}",
                 f"Tiles        : {N} total,  {visibility.sum()} visible",
-                f"Total GS     : {total_gs:,}   100%   {_mb(total_gs):.0f} MB",
-                f"Visible GS   : {visible_gs:,}   {100*visible_gs/total_gs:.1f}%   {_mb(visible_gs):.0f} MB",
+                f"Total GS     : {total_gs:,}   100%   {_mib(total_gs):.0f} MiB",
+                f"Visible GS   : {visible_gs:,}   {100*visible_gs/total_gs:.1f}%   {_mib(visible_gs):.0f} MiB",
                 f"Selected GS  : {sel_str}",
                 f"Budget given : {budget_str}",
             ]

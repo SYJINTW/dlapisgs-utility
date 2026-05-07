@@ -13,7 +13,6 @@ import tiling
 # Numerical constants
 INVISIBLE_PRIORITY_EPS = 1e-2   # priority weight for invisible tiles (kept >0 to avoid starvation)
 DISTANCE_EPS = 1e-3             # added to distance to prevent division by zero
-LAYER_WEIGHT_BASE = 10.0        # base of the per-layer geometric weighting
 
 
 def _compute_base_scores(visibility_mask_tensor, tile_distances_tensor):
@@ -49,29 +48,25 @@ def calculate_utility_param(
     include_lod=True,
     include_w=False,
     include_c=False,
+    beta=10.0,
 ):
     """
-    full version:
-    U(k) = log(beta * (l_k + 1)) * (v_k / d_k) * C_k * W_k
-
-    Compute a configurable utility score with optional LOD, weight, and complexity factors.
-    
-    sent l_k in {0, 1, 2,..., L-1}
-    l_k = -1 means not sent 
+    U(k, l) = log(β·(l+1)) · (v_k / d_k) [· W_k] [· C_k]
 
     Args:
-        visibility_mask_tensor: length-N tensor; True if the tile is visible. 
+        visibility_mask_tensor: length-N tensor; True if the tile is visible.
         tile_distances_tensor:  length-N tensor; Euclidean distance from camera.
-        num_of_level (int):     total number of LOD layers (1 means plain 3DGS). 
-        weight_sum_tensor:      length-N tensor; Aggregate Gaussian weight per tile (W_k).
-        complexity_tensor:      length-N tensor; Normalized count or entropy per tile (C_k).
-        include_lod (bool):     If True, rank (tile, lod) pairs using per-layer weights.
-        include_w (bool):       If True, multiply scores by W_k.
-        include_c (bool):       If True, multiply scores by C_k.
+        num_of_level (int):     Total number of LOD layers (1 = plain 3DGS, no LOD effect).
+        weight_sum_tensor:      length-N tensor; W_k (required when include_w=True).
+        complexity_tensor:      length-N tensor; C_k (required when include_c=True).
+        include_lod (bool):     If True, weight (tile, lod) pairs by log(β·(l+1)).
+        include_w (bool):       Multiply scores by W_k.
+        include_c (bool):       Multiply scores by C_k.
+        beta (float):           Controls diminishing-returns curve shape in the log term.
 
     Returns:
-        np.array: shape (N, 2) if LOD disabled or num_of_level==1, otherwise (N*num_of_level, 2).
-                  The second column is the target lod_level.
+        np.ndarray: shape (N, 2) or (N*num_of_level, 2) — (tile_index, lod_level) sorted
+                    by descending utility.
     """
     if include_w and weight_sum_tensor is None:
         raise ValueError("weight_sum_tensor is required when include_w=True")
@@ -91,9 +86,10 @@ def calculate_utility_param(
         result_tensor = torch.stack((sorted_indices, lod_levels), dim=1)
         return result_tensor.cpu().numpy()
 
+    # log(β·(l+1)) for l in {0, 1, ..., num_of_level-1}
     levels = torch.arange(num_of_level, device=base_scores.device, dtype=torch.float32)
-    layer_weights = LAYER_WEIGHT_BASE ** ((num_of_level - 1) - levels)
-    utility_matrix = base_scores.unsqueeze(1) * layer_weights.unsqueeze(0)
+    log_weights = torch.log(beta * (levels + 1.0))          # shape (num_of_level,)
+    utility_matrix = base_scores.unsqueeze(1) * log_weights.unsqueeze(0)  # (N, num_of_level)
 
     flattened_scores = utility_matrix.view(-1)
     sorted_1d_indices = torch.argsort(flattened_scores, descending=True)

@@ -6,7 +6,7 @@ SCRIPT_DIR="$ROOT/dlapisgs-utility/experiments"
 PLY="$ROOT/exp-dataset/bicycle/point_cloud.ply"
 TRACE="$ROOT/Frustum-for-3DGS/sample_data/camera_trace/trace1.json"
 OUT_DIR="${OUTPUT_ROOT:-$ROOT/dlapisgs-utility/output/0507_budget_sweep}"
-CONDA_ENV="${CONDA_ENV:-gaussian_splatting}"
+CONDA_ENV="${CONDA_ENV:-gsquic}"
 
 # Exactly 6 budget points by default. Override via BUDGET_LIST="...".
 BUDGET_LIST="${BUDGET_LIST:-10 20 40 60 80 100}"

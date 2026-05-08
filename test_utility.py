@@ -17,6 +17,7 @@ Steps:
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -84,8 +85,10 @@ def _greedy_order(order_pairs, tile_index_offsets, tile_flat_indices, w_gi, byte
         start = tile_index_offsets[tile_idx]
         end = tile_index_offsets[tile_idx + 1]
         indices_for_tile = tile_flat_indices[start:end]
-        if len(indices_for_tile) == 0:
+        
+        if len(indices_for_tile) == 0: # empty tile, skip
             continue
+        
         tile_weights = w_gi[indices_for_tile]
         sorted_tile = indices_for_tile[torch.argsort(tile_weights, descending=True).cpu().numpy()]
         for idx in sorted_tile:
@@ -182,31 +185,40 @@ def main() -> None:
                 args.grid_shape, budget_list, args.num_lod, scheme_list)
 
     # ---- Shared preprocessing (once per run) ----
+    logger.success("stage=ply_load start")
+    _t0 = time.perf_counter()
     gs = io_3dgs.GaussianModelV2(str(ply_path))
-    tile_aabbs, tile_indices, scene_min, scene_max = ggsp_tiling.tiling_uniform_layered_gs([gs], grid_shape=tuple(args.grid_shape))
+    logger.success("stage=ply_load done t={:.3f}s", time.perf_counter() - _t0)
 
+    logger.success("stage=tiling start")
+    _t0 = time.perf_counter()
+    tile_aabbs, tile_indices, scene_min, scene_max = ggsp_tiling.tiling_uniform_layered_gs([gs], grid_shape=tuple(args.grid_shape))
     min_corners, max_corners, index_offsets, flat_indices, sorted_tile_keys = _build_tile_arrays(
         tile_aabbs, tile_indices, layer_idx=0
     )
-
     min_corners_t = torch.tensor(min_corners, dtype=torch.float32, device=device)
     max_corners_t = torch.tensor(max_corners, dtype=torch.float32, device=device)
     tile_centers = (min_corners_t + max_corners_t) / 2.0
+    logger.success("stage=tiling done t={:.3f}s", time.perf_counter() - _t0)
 
+    _t0 = time.perf_counter()
     cam_infos = visibility_AABB_pytorch.readCamerasFromTransforms(
         str(camera_trace), args.img_w, args.img_h
     )
     cameras = visibility_AABB_pytorch.camera_infos_to_MiniCam_list(cam_infos)
+    logger.success("stage=camera_load done t={:.3f}s", time.perf_counter() - _t0)
 
+    logger.success("stage=gaussian_weights start")
+    _t0 = time.perf_counter()
     opacity = gs.data["opacity"]["data"]
     scale_0 = gs.data["scale_0"]["data"]
     scale_1 = gs.data["scale_1"]["data"]
     scale_2 = gs.data["scale_2"]["data"]
     w_gi = uc.compute_gaussian_weights(opacity, scale_0, scale_1, scale_2, gamma=args.gamma).to(device)
-
     tile_index_offsets = torch.tensor(index_offsets, dtype=torch.long, device=device)
     tile_flat_indices = torch.tensor(flat_indices, dtype=torch.long, device=device)
     W_k, C_k = uc.compute_tile_weights_and_counts(tile_index_offsets, tile_flat_indices, w_gi)
+    logger.success("stage=gaussian_weights done t={:.3f}s", time.perf_counter() - _t0)
 
     bytes_per_gaussian = _bytes_per_gaussian(gs)
     max_budget_bytes = int(max(budget_list) * 1024 * 1024)
@@ -224,10 +236,13 @@ def main() -> None:
     # ---- Per-camera loop ----
     for camera_index in camera_indices:
         cam = cameras[camera_index]
+
+        _t0 = time.perf_counter()
         distances = uc.calculate_distances(tile_centers, cam.camera_center.to(device))
         visibility = visibility_AABB_pytorch.batched_check_tiles_visible(
             min_corners_t, max_corners_t, cam, device=device
         )
+        logger.success("camera={} stage=visibility done t={:.3f}s", camera_index, time.perf_counter() - _t0)
 
         # Precompute visibility arrays for NPZ (same for all schemes/budgets of this camera)
         np_visibility_all = visibility.cpu().numpy() if hasattr(visibility, 'cpu') else np.asarray(visibility)
@@ -245,6 +260,7 @@ def main() -> None:
             include_w = scheme in ("vd_lod_w", "vd_lod_w_c")
             include_c = scheme in ("vd_lod_c", "vd_lod_w_c")
 
+            _t0 = time.perf_counter()
             utilities = uc.calculate_utility_param(
                 visibility,
                 distances,
@@ -255,17 +271,22 @@ def main() -> None:
                 include_w=include_w,
                 include_c=include_c,
             )
+            logger.success("camera={} scheme={} stage=utility done t={:.3f}s",
+                           camera_index, scheme, time.perf_counter() - _t0)
 
             top_k = min(20, utilities.shape[0])
-            logger.info("camera={} scheme={} top_utility_pairs (tile_idx, lod): {}",
-                        camera_index, scheme, utilities[:top_k].tolist())
+            logger.debug("camera={} scheme={} top_utility_pairs (tile_idx, lod): {}",
+                         camera_index, scheme, utilities[:top_k].tolist())
 
-            # Greedy order once at max budget; subsequent budgets are prefix slices
+            _t0 = time.perf_counter()
             all_ordered = _greedy_order(
                 utilities, tile_index_offsets, tile_flat_indices, w_gi, bytes_per_gaussian, max_budget_bytes
             )
+            logger.success("camera={} scheme={} stage=greedy done t={:.3f}s n_ordered={}",
+                           camera_index, scheme, time.perf_counter() - _t0, len(all_ordered))
 
             # ---- Per-budget loop (free: just slice the prefix) ----
+            _t_ply = _t_vis_npz = _t_tile_npz = 0.0
             for budget_mb in budget_list:
                 budget_bytes = int(budget_mb * 1024 * 1024)
                 selected_indices, used_bytes = _select_at_budget(all_ordered, budget_bytes, bytes_per_gaussian)
@@ -286,6 +307,7 @@ def main() -> None:
                 camera_dir.mkdir(parents=True, exist_ok=True)
 
                 vis_npz_path = output_path.with_suffix('.vis.npz')
+                _t1 = time.perf_counter()
                 try:
                     np.savez(str(vis_npz_path),
                              min_corners=min_corners,
@@ -300,11 +322,15 @@ def main() -> None:
                 except Exception as e:
                     logger.warning("Failed saving visibility NPZ camera={} scheme={} budget={}: {}",
                                    camera_index, scheme, budget_mb, e)
+                _t_vis_npz += time.perf_counter() - _t1
 
+                _t1 = time.perf_counter()
                 selected_gs = gs.extract_gaussians(selected_indices)
                 selected_gs.export_gs_to_ply(str(output_path), ascii=args.ascii_ply)
+                _t_ply += time.perf_counter() - _t1
 
                 npz_output_path = output_path.with_suffix(".npz")
+                _t1 = time.perf_counter()
                 ggsp_tiling.save_tiles_to_npz(
                     tile_aabbs,
                     tile_indices,
@@ -314,6 +340,7 @@ def main() -> None:
                     scene_max=scene_max,
                     layer_idx=0
                 )
+                _t_tile_npz += time.perf_counter() - _t1
 
                 manifest_path = output_path.with_suffix(".json")
                 manifest = {
@@ -333,8 +360,12 @@ def main() -> None:
                 }
                 manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-                logger.info("camera={} scheme={} budget_mb={} selected={} used={}/{} out={}",
-                            camera_index, scheme, budget_mb, len(selected_indices), used_bytes, budget_bytes, output_path)
+                logger.debug("camera={} scheme={} budget_mb={} selected={} used={}/{} out={}",
+                             camera_index, scheme, budget_mb, len(selected_indices), used_bytes, budget_bytes, output_path)
+
+            logger.success("camera={} scheme={} stage=io done  "
+                           "ply_export={:.3f}s  vis_npz={:.3f}s  tile_npz={:.3f}s  ({} budgets)",
+                           camera_index, scheme, _t_ply, _t_vis_npz, _t_tile_npz, len(budget_list))
 
     logger.info("done")
 

@@ -15,6 +15,7 @@
 
 ### render + metrics
 - [ ] Fix render + metrics pipeline bottlenecks
+- [ ] Explore in-memory render pipeline: skip PLY writes entirely, render selected Gaussians directly in-memory → save PNG + metrics only. HDD is the bottleneck (ROTA=1 spinning disk, ~50MB/s effective with parallel writes). In-memory approach: after greedy selection, pass indices directly to renderer, capture image tensor, compute PSNR/SSIM, write PNG (tiny). Eliminates ~2050MB/camera of PLY I/O per scheme.
 
 ## Up next
 1. Utility function design iteration (scoring schemes, weighting factors)

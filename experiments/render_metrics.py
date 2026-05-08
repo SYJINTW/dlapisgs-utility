@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from loguru import logger
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 RENDERER_ROOT = WORKSPACE_ROOT / "LapisGS-object-based-renderer"
@@ -100,16 +101,22 @@ def main() -> None:
     metrics_dir = output_root / "metrics"
     metrics_dir.mkdir(parents=True, exist_ok=True)
 
+    logger.remove()
+    logger.add(sys.stdout, level="INFO")
+    log_path = metrics_dir / "render_metrics.log"
+    logger.add(str(log_path), level="INFO")
+    logger.info("output_root={} gt_ply={} trace={}", output_root, gt_ply, trace_path)
+
     render_dir: Path | None = Path(args.render_dir) if args.render_dir else None
     if render_dir is not None:
         render_dir.mkdir(parents=True, exist_ok=True)
 
     frames  = _load_trace(trace_path)
     cameras = [_build_camera(f, args.width, args.height) for f in frames]
-    print(f"Loaded {len(cameras)} cameras from {trace_path}")
+    logger.info("Loaded {} cameras from {}", len(cameras), trace_path)
 
     # Pre-render ground truth
-    print(f"Rendering GT from {gt_ply} ...")
+    logger.info("Rendering GT from {} ...", gt_ply)
     gt_gaussians = GaussianModel(args.sh_degree)
     gt_gaussians.load_ply(str(gt_ply))
     gt_gs_res = torch.ones(len(gt_gaussians.get_xyz), device="cuda")
@@ -128,12 +135,12 @@ def main() -> None:
                 gt_frame_path = render_dir / "ground_truth" / f"{idx:05d}.png"
                 gt_frame_path.parent.mkdir(parents=True, exist_ok=True)
                 torchvision.utils.save_image(frame_tensor, str(gt_frame_path))
-    print(f"GT rendered: {len(gt_renders)} frames")
+    logger.success("GT rendered: {} frames", len(gt_renders))
     del gt_gaussians
 
     # Iterate manifests
     manifests = sorted(output_root.glob("**/selected.json"))
-    print(f"Found {len(manifests)} manifests under {output_root}")
+    logger.info("Found {} manifests under {}", len(manifests), output_root)
 
     rows: list[dict[str, Any]] = []
     for manifest_path in manifests:
@@ -144,7 +151,7 @@ def main() -> None:
         selected_ply = Path(manifest["output_path"])
 
         if not selected_ply.exists():
-            print(f"  SKIP (PLY missing): {selected_ply}")
+            logger.warning("SKIP (PLY missing): {}", selected_ply)
             continue
 
         rendered = _render_ply(selected_ply, cameras[cam_idx], args.sh_degree, args.white_bg)
@@ -175,8 +182,8 @@ def main() -> None:
         (per_json_dir / f"camera_{cam_idx:03d}.json").write_text(
             json.dumps({**manifest, **m}, indent=2)
         )
-        print(f"  [{budget_tag}/{scheme}/camera_{cam_idx:03d}]  "
-              f"PSNR={m['psnr']:.2f}  SSIM={m['ssim']:.4f}")
+        logger.success("[{}/{}/camera_{:03d}]  PSNR={:.2f}  SSIM={:.4f}",
+                       budget_tag, scheme, cam_idx, m["psnr"], m["ssim"])
 
     rows.sort(key=lambda r: (r["budget_mb"], r["scheme"], r["camera_index"]))
 
@@ -186,11 +193,11 @@ def main() -> None:
             writer = csv.DictWriter(fp, fieldnames=list(rows[0].keys()))
             writer.writeheader()
             writer.writerows(rows)
-        print(f"Wrote {len(rows)} rows → {csv_path}")
+        logger.info("Wrote {} rows → {}", len(rows), csv_path)
 
     json_path = metrics_dir / "summary.json"
     json_path.write_text(json.dumps({"rows": rows}, indent=2))
-    print(f"Wrote summary → {json_path}")
+    logger.info("Wrote summary → {}", json_path)
 
 
 if __name__ == "__main__":

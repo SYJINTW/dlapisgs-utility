@@ -78,25 +78,24 @@ def _camera_output_dir(output_root: Path, budget_mb: float, scheme: str, camera_
 
 
 def _greedy_order(order_pairs, tile_index_offsets, tile_flat_indices, w_gi, bytes_per_gaussian, max_budget_bytes):
-    """Returns Gaussian indices in greedy priority order up to max_budget_bytes."""
-    selected = []
-    used = 0
+    """Returns Gaussian indices as a numpy array in greedy priority order up to max_budget_bytes."""
+    max_count = max_budget_bytes // bytes_per_gaussian
+    chunks = []
+    count = 0
     for tile_idx, _lod in order_pairs:
+        if count >= max_count:
+            break
         start = tile_index_offsets[tile_idx]
         end = tile_index_offsets[tile_idx + 1]
         indices_for_tile = tile_flat_indices[start:end]
-        
-        if len(indices_for_tile) == 0: # empty tile, skip
+        if len(indices_for_tile) == 0:
             continue
-        
         tile_weights = w_gi[indices_for_tile]
-        sorted_tile = indices_for_tile[torch.argsort(tile_weights, descending=True).cpu().numpy()]
-        for idx in sorted_tile:
-            if used + bytes_per_gaussian > max_budget_bytes:
-                return selected
-            selected.append(int(idx))
-            used += bytes_per_gaussian
-    return selected
+        sorted_tile = indices_for_tile[torch.argsort(tile_weights, descending=True)].cpu().numpy()
+        take = min(len(sorted_tile), max_count - count)
+        chunks.append(sorted_tile[:take])
+        count += take
+    return np.concatenate(chunks) if chunks else np.empty(0, dtype=np.int64)
 
 
 def _select_at_budget(all_ordered, budget_bytes, bytes_per_gaussian):

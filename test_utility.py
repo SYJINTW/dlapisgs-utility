@@ -7,7 +7,7 @@ Steps:
 3) Compute view-conditioned utilities per scheme.
 4) Select Gaussians under a byte budget and export a subset PLY.
 
-[TODO] 
+[TODO]
 - test utility scoring scheme
 - test scheduler without GS-level or without Tile-level vs. Ours Full
 (pure progressive v. pure adaptive v. our two-level design)
@@ -33,6 +33,9 @@ import visibility_AABB_pytorch  # noqa: E402
 import tiling as ggsp_tiling  # noqa: E402
 import utility_calculation as uc  # noqa: E402
 import io_3dgs  # noqa: E402  # pyright: ignore[reportMissingImports]
+
+
+VALID_SCHEMES = ["vd", "vd_lod", "vd_lod_w", "vd_lod_c", "vd_lod_w_c"]
 
 
 def _build_tile_arrays(tile_aabbs, tile_indices, layer_idx=0):
@@ -65,32 +68,38 @@ def _bytes_per_gaussian(gs):
     return int(np.sum(per_attr))
 
 
-def _camera_output_dir(output_root: Path, scheme: str, camera_index: int) -> Path:
-    return output_root / scheme / f"camera_{camera_index:03d}"
+def _budget_tag(budget_mb: float) -> str:
+    return f"{budget_mb:g}".replace(".", "p") + "mb"
 
 
-def _select_gaussians(order_pairs, tile_index_offsets, tile_flat_indices, w_gi, bytes_per_gaussian, budget_bytes):
-    selected_indices = []
-    used_bytes = 0
+def _camera_output_dir(output_root: Path, budget_mb: float, scheme: str, camera_index: int) -> Path:
+    return output_root / f"budget_{_budget_tag(budget_mb)}" / scheme / f"camera_{camera_index:03d}"
 
+
+def _greedy_order(order_pairs, tile_index_offsets, tile_flat_indices, w_gi, bytes_per_gaussian, max_budget_bytes):
+    """Returns Gaussian indices in greedy priority order up to max_budget_bytes."""
+    selected = []
+    used = 0
     for tile_idx, _lod in order_pairs:
         start = tile_index_offsets[tile_idx]
         end = tile_index_offsets[tile_idx + 1]
         indices_for_tile = tile_flat_indices[start:end]
         if len(indices_for_tile) == 0:
             continue
-
-        # sort the tile's Gaussians by weight (opacity * volume) and select until budget is exhausted
         tile_weights = w_gi[indices_for_tile]
         sorted_tile = indices_for_tile[torch.argsort(tile_weights, descending=True).cpu().numpy()]
-
         for idx in sorted_tile:
-            if used_bytes + bytes_per_gaussian > budget_bytes:
-                return selected_indices, used_bytes
-            selected_indices.append(int(idx))
-            used_bytes += bytes_per_gaussian
+            if used + bytes_per_gaussian > max_budget_bytes:
+                return selected
+            selected.append(int(idx))
+            used += bytes_per_gaussian
+    return selected
 
-    return selected_indices, used_bytes
+
+def _select_at_budget(all_ordered, budget_bytes, bytes_per_gaussian):
+    count = budget_bytes // bytes_per_gaussian
+    selected = all_ordered[:count]
+    return selected, len(selected) * bytes_per_gaussian
 
 
 def main() -> None:
@@ -98,20 +107,25 @@ def main() -> None:
     parser.add_argument("--ply", required=True, type=str,
                         help="Input full-scene PLY (original 3DGS model)")
     parser.add_argument("--output", type=str, default=None,
-                        help="Legacy single-output PLY path for selected Gaussians")
+                        help="Legacy single-output PLY path (single budget/scheme only)")
     parser.add_argument("--output-root", type=str, default=None,
                         help="Directory root for trace-wide outputs")
     parser.add_argument("--camera-trace", required=True, type=str,
                         help="Camera trace JSON (Frustum-for-3DGS format)")
     parser.add_argument("--grid-shape", nargs=3, type=int, default=[4, 4, 4],
                         help="Number of tiles along each axis as Nx Ny Nz (e.g., 4 4 4)")
-    parser.add_argument("--budget-mb", type=float, default=100.0,
-                        help="Byte budget in MB for the output subset")
+    # Budget args: prefer --budgets-mb for multi-budget sweeps
+    parser.add_argument("--budget-mb", type=float, default=None,
+                        help="Single byte budget in MB (this is legacy; use --budgets-mb for sweeps)")
+    parser.add_argument("--budgets-mb", nargs="+", type=float, default=None,
+                        help="One or more budgets in MB; overrides --budget-mb")
     parser.add_argument("--num-lod", type=int, default=1,
                         help="Number of LOD layers (1 means plain 3DGS)")
-    parser.add_argument("--scheme", type=str, default="vd",
-                        choices=["vd", "vd_lod", "vd_lod_w", "vd_lod_c", "vd_lod_w_c"],
-                        help="Utility scheme: vd | vd_lod | vd_lod_w | vd_lod_c | vd_lod_w_c")
+    # Scheme args: prefer --schemes for multi-scheme sweeps
+    parser.add_argument("--scheme", type=str, default=None, choices=VALID_SCHEMES,
+                        help="Single utility scheme (legacy; use --schemes for sweeps)")
+    parser.add_argument("--schemes", nargs="+", type=str, default=None,
+                        help="One or more schemes; overrides --scheme")
     parser.add_argument("--gamma", type=float, default=1.0,
                         help="Exponent for Gaussian weight: w = o * det(Sigma)^gamma")
     parser.add_argument("--camera-index", type=int, default=0,
@@ -123,6 +137,25 @@ def main() -> None:
     parser.add_argument("--ascii-ply", action="store_true",
                         help="Write PLY in ASCII instead of binary (larger, human-readable)")
     args = parser.parse_args()
+
+    # Resolve budget list
+    if args.budgets_mb is not None:
+        budget_list = sorted(args.budgets_mb)
+    elif args.budget_mb is not None:
+        budget_list = [args.budget_mb]
+    else:
+        raise ValueError("Either --budgets-mb or --budget-mb must be provided")
+
+    # Resolve scheme list
+    if args.schemes is not None:
+        for s in args.schemes:
+            if s not in VALID_SCHEMES:
+                raise ValueError(f"Unknown scheme '{s}'. Valid: {VALID_SCHEMES}")
+        scheme_list = args.schemes
+    elif args.scheme is not None:
+        scheme_list = [args.scheme]
+    else:
+        raise ValueError("Either --schemes or --scheme must be provided")
 
     logger.remove()
     logger.add(sys.stdout, level="INFO")
@@ -145,9 +178,10 @@ def main() -> None:
     logger.add(str(log_path), level="INFO")
     logger.info("device={}", device)
     logger.info("ply={} output={} trace={}", ply_path, base_output_path, camera_trace)
-    logger.info("grid_shape={} budget_mb={} num_lod={} scheme={}",
-                args.grid_shape, args.budget_mb, args.num_lod, args.scheme)
+    logger.info("grid_shape={} budgets_mb={} num_lod={} schemes={}",
+                args.grid_shape, budget_list, args.num_lod, scheme_list)
 
+    # ---- Shared preprocessing (once per run) ----
     gs = io_3dgs.GaussianModelV2(str(ply_path))
     tile_aabbs, tile_indices, scene_min, scene_max = ggsp_tiling.tiling_uniform_layered_gs([gs], grid_shape=tuple(args.grid_shape))
 
@@ -174,12 +208,9 @@ def main() -> None:
     tile_flat_indices = torch.tensor(flat_indices, dtype=torch.long, device=device)
     W_k, C_k = uc.compute_tile_weights_and_counts(tile_index_offsets, tile_flat_indices, w_gi)
 
-    include_lod = args.scheme != "vd"
-    include_w = args.scheme in ("vd_lod_w", "vd_lod_w_c")
-    include_c = args.scheme in ("vd_lod_c", "vd_lod_w_c")
-
-    budget_bytes = int(args.budget_mb * 1024 * 1024)
     bytes_per_gaussian = _bytes_per_gaussian(gs)
+    max_budget_bytes = int(max(budget_list) * 1024 * 1024)
+
     if args.camera_index < 0:
         camera_indices = list(range(len(cameras)))
     else:
@@ -187,8 +218,10 @@ def main() -> None:
             raise ValueError("camera-index out of range")
         camera_indices = [args.camera_index]
 
-    logger.info("cameras={} selected_indices={}", len(cameras), camera_indices)
+    logger.info("tiles={} cameras={} selected_camera_indices={} bytes_per_gaussian={}",
+                len(index_offsets) - 1, len(cameras), camera_indices, bytes_per_gaussian)
 
+    # ---- Per-camera loop ----
     for camera_index in camera_indices:
         cam = cameras[camera_index]
         distances = uc.calculate_distances(tile_centers, cam.camera_center.to(device))
@@ -196,105 +229,114 @@ def main() -> None:
             min_corners_t, max_corners_t, cam, device=device
         )
 
-        utilities = uc.calculate_utility_param(
-            visibility,
-            distances,
-            num_of_level=args.num_lod,
-            weight_sum_tensor=W_k if include_w else None,
-            complexity_tensor=C_k if include_c else None,
-            include_lod=include_lod,
-            include_w=include_w,
-            include_c=include_c,
-        )
+        # Precompute visibility arrays for NPZ (same for all schemes/budgets of this camera)
+        np_visibility_all = visibility.cpu().numpy() if hasattr(visibility, 'cpu') else np.asarray(visibility)
+        np_distances = distances.cpu().numpy() if hasattr(distances, 'cpu') else np.asarray(distances)
+        cam_w2v = cam.world_view_transform.cpu().numpy()
+        cam_proj = cam.projection_matrix.cpu().numpy()
+        cam_center_np = cam.camera_center.cpu().numpy()
+        meta_positions = [i for i, tk in enumerate(sorted_tile_keys) if len(tile_indices[tk][0]) > 0]
+        visibility_meta = np_visibility_all[meta_positions] if len(meta_positions) > 0 else np.zeros((0,), dtype=bool)
+        tile_centers_np = tile_centers.cpu().numpy()
 
-        top_k = min(20, utilities.shape[0])
-        logger.info("camera_index={} top_utility_pairs (tile_idx, lod): {}", camera_index, utilities[:top_k].tolist())
+        # ---- Per-scheme loop (utilities computed once per scheme, shared across budgets) ----
+        for scheme in scheme_list:
+            include_lod = scheme != "vd"
+            include_w = scheme in ("vd_lod_w", "vd_lod_w_c")
+            include_c = scheme in ("vd_lod_c", "vd_lod_w_c")
 
-        selected_indices, used_bytes = _select_gaussians(
-            utilities,
-            tile_index_offsets,
-            tile_flat_indices,
-            w_gi,
-            bytes_per_gaussian,
-            budget_bytes,
-        )
+            utilities = uc.calculate_utility_param(
+                visibility,
+                distances,
+                num_of_level=args.num_lod,
+                weight_sum_tensor=W_k if include_w else None,
+                complexity_tensor=C_k if include_c else None,
+                include_lod=include_lod,
+                include_w=include_w,
+                include_c=include_c,
+            )
 
-        if args.output_root is not None:
-            camera_dir = _camera_output_dir(Path(args.output_root), args.scheme, camera_index)
-            output_path = camera_dir / "selected.ply"
-        else:
-            legacy_output = Path(args.output)
-            if len(camera_indices) == 1:
-                output_path = legacy_output
-            else:
-                output_path = legacy_output.with_name(f"{legacy_output.stem}_camera_{camera_index:03d}{legacy_output.suffix}")
-            camera_dir = output_path.parent
+            top_k = min(20, utilities.shape[0])
+            logger.info("camera={} scheme={} top_utility_pairs (tile_idx, lod): {}",
+                        camera_index, scheme, utilities[:top_k].tolist())
 
-        camera_dir.mkdir(parents=True, exist_ok=True)
+            # Greedy order once at max budget; subsequent budgets are prefix slices
+            all_ordered = _greedy_order(
+                utilities, tile_index_offsets, tile_flat_indices, w_gi, bytes_per_gaussian, max_budget_bytes
+            )
 
-        try:
-            vis_npz_path = output_path.with_suffix('.vis.npz')
-            np_visibility_all = visibility.cpu().numpy() if hasattr(visibility, 'cpu') else np.asarray(visibility)
-            np_distances = distances.cpu().numpy() if hasattr(distances, 'cpu') else np.asarray(distances)
-            cam_w2v = cam.world_view_transform.cpu().numpy()
-            cam_proj = cam.projection_matrix.cpu().numpy()
-            cam_center = cam.camera_center.cpu().numpy()
+            # ---- Per-budget loop (free: just slice the prefix) ----
+            for budget_mb in budget_list:
+                budget_bytes = int(budget_mb * 1024 * 1024)
+                selected_indices, used_bytes = _select_at_budget(all_ordered, budget_bytes, bytes_per_gaussian)
 
-            meta_positions = [i for i, tk in enumerate(sorted_tile_keys) if len(tile_indices[tk][0]) > 0]
-            visibility_meta = np_visibility_all[meta_positions] if len(meta_positions) > 0 else np.zeros((0,), dtype=bool)
+                if args.output_root is not None:
+                    camera_dir = _camera_output_dir(Path(args.output_root), budget_mb, scheme, camera_index)
+                    output_path = camera_dir / "selected.ply"
+                else:
+                    legacy_output = Path(args.output)
+                    if len(camera_indices) == 1 and len(budget_list) == 1 and len(scheme_list) == 1:
+                        output_path = legacy_output
+                    else:
+                        output_path = legacy_output.with_name(
+                            f"{legacy_output.stem}_{scheme}_{_budget_tag(budget_mb)}_camera_{camera_index:03d}{legacy_output.suffix}"
+                        )
+                    camera_dir = output_path.parent
 
-            np.savez(str(vis_npz_path),
-                     min_corners=min_corners,
-                     max_corners=max_corners,
-                     visibility_all=np_visibility_all,
-                     visibility=visibility_meta,
-                     distances=np_distances,
-                     tile_centers=tile_centers.cpu().numpy(),
-                     camera_center=cam_center,
-                     world_view_transform=cam_w2v,
-                     projection_matrix=cam_proj)
-            logger.info("saved visibility metadata to={}", vis_npz_path)
-        except Exception as e:
-            logger.warning("Failed saving visibility NPZ for camera {}: {}", camera_index, e)
+                camera_dir.mkdir(parents=True, exist_ok=True)
 
-        selected_gs = gs.extract_gaussians(selected_indices)
-        selected_gs.export_gs_to_ply(str(output_path), ascii=args.ascii_ply)
+                vis_npz_path = output_path.with_suffix('.vis.npz')
+                try:
+                    np.savez(str(vis_npz_path),
+                             min_corners=min_corners,
+                             max_corners=max_corners,
+                             visibility_all=np_visibility_all,
+                             visibility=visibility_meta,
+                             distances=np_distances,
+                             tile_centers=tile_centers_np,
+                             camera_center=cam_center_np,
+                             world_view_transform=cam_w2v,
+                             projection_matrix=cam_proj)
+                except Exception as e:
+                    logger.warning("Failed saving visibility NPZ camera={} scheme={} budget={}: {}",
+                                   camera_index, scheme, budget_mb, e)
 
-        npz_output_path = output_path.with_suffix(".npz")
-        ggsp_tiling.save_tiles_to_npz(
-            tile_aabbs,
-            tile_indices,
-            str(npz_output_path),
-            grid_shape=tuple(args.grid_shape),
-            scene_min=scene_min,
-            scene_max=scene_max,
-            layer_idx=0
-        )
+                selected_gs = gs.extract_gaussians(selected_indices)
+                selected_gs.export_gs_to_ply(str(output_path), ascii=args.ascii_ply)
 
-        manifest_path = output_path.with_suffix(".json")
-        manifest = {
-            "scheme": args.scheme,
-            "camera_index": camera_index,
-            "budget_mb": args.budget_mb,
-            "budget_bytes": budget_bytes,
-            "used_bytes": used_bytes,
-            "selected_gaussians": len(selected_indices),
-            "bytes_per_gaussian": bytes_per_gaussian,
-            "output_path": str(output_path),
-            "tiling_metadata_npz": str(npz_output_path),
-            "visibility_npz": str(vis_npz_path),
-            "camera_trace": str(camera_trace),
-            "grid_shape": list(args.grid_shape),
-            "num_lod": args.num_lod,
-        }
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+                npz_output_path = output_path.with_suffix(".npz")
+                ggsp_tiling.save_tiles_to_npz(
+                    tile_aabbs,
+                    tile_indices,
+                    str(npz_output_path),
+                    grid_shape=tuple(args.grid_shape),
+                    scene_min=scene_min,
+                    scene_max=scene_max,
+                    layer_idx=0
+                )
 
-        logger.info("tiles={}", len(index_offsets) - 1)
-        logger.info("selected_gaussians={}", len(selected_indices))
-        logger.info("approx_bytes_used={}/{}", used_bytes, budget_bytes)
-        logger.info("output={}", output_path)
-        logger.info("tiling_metadata_npz={}", npz_output_path)
-        logger.info("manifest={}", manifest_path)
+                manifest_path = output_path.with_suffix(".json")
+                manifest = {
+                    "scheme": scheme,
+                    "camera_index": camera_index,
+                    "budget_mb": budget_mb,
+                    "budget_bytes": budget_bytes,
+                    "used_bytes": used_bytes,
+                    "selected_gaussians": len(selected_indices),
+                    "bytes_per_gaussian": bytes_per_gaussian,
+                    "output_path": str(output_path),
+                    "tiling_metadata_npz": str(npz_output_path),
+                    "visibility_npz": str(vis_npz_path),
+                    "camera_trace": str(camera_trace),
+                    "grid_shape": list(args.grid_shape),
+                    "num_lod": args.num_lod,
+                }
+                manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+                logger.info("camera={} scheme={} budget_mb={} selected={} used={}/{} out={}",
+                            camera_index, scheme, budget_mb, len(selected_indices), used_bytes, budget_bytes, output_path)
+
+    logger.info("done")
 
 
 if __name__ == "__main__":

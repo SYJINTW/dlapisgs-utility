@@ -99,28 +99,47 @@ def calculate_utility_param(
     return result_tensor.cpu().numpy()
 
 
-def compute_gaussian_weights(opacity, scale_0, scale_1, scale_2, gamma=1.0):
+def compute_gaussian_weights(opacity, scale_0, scale_1, scale_2, gamma=1.0,
+                             xyz=None, cam_center=None):
     """
-    Compute individual Gaussian weights: w(g_i) = o_i * det(Sigma_i)^gamma
-    det(Sigma_i) relates to the 3D volume = exp(2 * (scale_0 + scale_1 + scale_2))
-    Opacity o_i = 1 / (1 + exp(-opacity))
-    
-    refer to original 3DGS implementation if anything here seems unclear.
-    
+    Compute individual Gaussian weights.
+
+    View-independent (xyz/cam_center not given):
+        w(g_i) = sigmoid(opacity) * det(Sigma)^gamma
+
+    View-dependent (xyz and cam_center given):
+        w(g_i) = sigmoid(opacity) * det(Sigma)^gamma / d(g_i, cam)^2
+
+    The 1/d^2 term approximates projected pixel footprint: a Gaussian's 2D
+    covariance scales as det(Sigma_3D)/d^2, so distant large Gaussians are
+    correctly down-weighted relative to nearby ones.
+
     Args:
-        opacity (torch.Tensor or np.ndarray): raw opacity values from PLY
-        scale_0, scale_1, scale_2: raw scale values from PLY
-        gamma (float): empirical exponent
+        opacity, scale_0/1/2: raw PLY attributes (Tensor or ndarray)
+        gamma: volume exponent
+        xyz: (N, 3) Gaussian world positions (Tensor or ndarray), optional
+        cam_center: (3,) camera world position (Tensor or ndarray), optional
     """
     if not isinstance(opacity, torch.Tensor):
-        opacity = torch.tensor(opacity, dtype=torch.float32) 
+        opacity = torch.tensor(opacity, dtype=torch.float32)
         scale_0 = torch.tensor(scale_0, dtype=torch.float32)
         scale_1 = torch.tensor(scale_1, dtype=torch.float32)
         scale_2 = torch.tensor(scale_2, dtype=torch.float32)
 
-    o_i = torch.sigmoid(opacity) # activate opacity to [0, 1]
-    det_sigma = torch.exp(2.0 * (scale_0 + scale_1 + scale_2)) # calculate det covariance (volume) from log scales of std
+    o_i = torch.sigmoid(opacity)
+    det_sigma = torch.exp(2.0 * (scale_0 + scale_1 + scale_2))
     w_gi = o_i * (det_sigma ** gamma)
+
+    if xyz is not None and cam_center is not None:
+        if not isinstance(xyz, torch.Tensor):
+            xyz = torch.tensor(xyz, dtype=torch.float32)
+        if not isinstance(cam_center, torch.Tensor):
+            cam_center = torch.tensor(cam_center, dtype=torch.float32)
+        xyz = xyz.to(w_gi.device)
+        cam_center = cam_center.to(w_gi.device)
+        d2 = ((xyz - cam_center.unsqueeze(0)) ** 2).sum(dim=1).clamp(min=1e-6)
+        w_gi = w_gi / d2
+
     return w_gi
 
 
@@ -148,9 +167,11 @@ def compute_tile_weights_and_counts(tile_index_offsets, tile_flat_indices, w_gi)
             W_k[i] = w_gi[indices_for_tile].sum()
             
     # Normalize C_k to be between 0 and 1 or dividing by max
+    
+    # TODO other normalization strategies? e.g. log(1+C_k) or C_k / (C_k + alpha) to prevent outliers dominating
     if C_k.max() > 0:
         C_k = C_k / C_k.max()
-        
+    
     return W_k, C_k
 
 def calculate_distances(tile_centers_tensor, cam_center_tensor):

@@ -19,6 +19,8 @@ Usage:
       --tile-npz output/0507_budget_sweep/budget_100mb/vd_lod_w_c/camera_024/selected.npz \
       [--ply /path/to/point_cloud.ply] \
       --out output/0507_budget_sweep/inspect/debug_cam024.png
+
+## TODO change to interactive view somehow
 """
 from __future__ import annotations
 

@@ -198,16 +198,16 @@ def compute_tile_weights_and_counts(tile_index_offsets, tile_flat_indices, w_gi,
         C_k (torch.Tensor): length-N
     """
     num_tiles = len(tile_index_offsets) - 1
-    W_k = torch.zeros(num_tiles, dtype=torch.float32, device=w_gi.device)
-    C_k = torch.zeros(num_tiles, dtype=torch.float32, device=w_gi.device)
+    sizes = (tile_index_offsets[1:] - tile_index_offsets[:-1])
+    C_k = sizes.float()
 
-    for i in range(num_tiles):
-        start = tile_index_offsets[i]
-        end = tile_index_offsets[i+1]
-        indices_for_tile = tile_flat_indices[start:end]
-        if len(indices_for_tile) > 0:
-            C_k[i] = len(indices_for_tile)
-            W_k[i] = w_gi[indices_for_tile].sum()
+    W_k = torch.zeros(num_tiles, dtype=torch.float32, device=w_gi.device)
+    if tile_flat_indices.numel() > 0:
+        # Build per-GS tile assignment, then scatter-sum weights in one GPU call.
+        segment_ids = torch.repeat_interleave(
+            torch.arange(num_tiles, device=w_gi.device), sizes
+        )
+        W_k.scatter_add_(0, segment_ids, w_gi[tile_flat_indices])
 
     W_k = normalize_term(W_k, w_norm)
     C_k = normalize_term(C_k, c_norm)

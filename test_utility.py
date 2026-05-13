@@ -47,6 +47,7 @@ import numpy as np
 import torch
 import yaml
 from loguru import logger
+from tqdm import tqdm
 
 HERE = Path(__file__).resolve().parent
 WORKSPACE = HERE.parent
@@ -295,6 +296,9 @@ def main() -> None:
                         help="Shared tiling cache npz. If it exists, skip tiling and load from it; "
                              "if it doesn't exist, compute tiling and save it there. "
                              "Use across norm-sweep runs on the same PLY + grid shape.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print the full job matrix (cameras x schemes x budgets -> paths) and exit. "
+                             "No GPU work or disk writes. Shows [x] for outputs that already exist.")
     args = parser.parse_args()
 
     if args.budgets_mb is not None:
@@ -318,7 +322,7 @@ def main() -> None:
         raise ValueError("Either --output-root or --output must be provided")
 
     logger.remove()
-    logger.add(sys.stdout, level="INFO")
+    logger.add(lambda msg: tqdm.write(msg, end=""), level="INFO", colorize=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ply_path = Path(args.ply)
@@ -338,6 +342,39 @@ def main() -> None:
                 args.grid_shape, budget_list, args.num_lod, scheme_list)
     logger.info("w_norm={} c_norm={} packing_mode={} weight_mode={}",
                 args.w_norm, args.c_norm, args.packing_mode, args.weight_mode)
+
+    # ---- Dry-run: print job matrix and exit (no GPU work, no disk writes) ----
+    if args.dry_run:
+        dry_cam_infos = visibility_AABB_pytorch.readCamerasFromTransforms(
+            str(camera_trace), args.img_w, args.img_h
+        )
+        n_cams = len(dry_cam_infos)
+        dry_indices = list(range(n_cams)) if args.camera_index < 0 else [args.camera_index]
+        if args.camera_index >= 0 and args.camera_index >= n_cams:
+            raise ValueError(f"--camera-index {args.camera_index} out of range (trace has {n_cams} cameras)")
+        n_jobs = len(dry_indices) * len(scheme_list) * len(budget_list)
+        tqdm.write(f"dry-run: {len(dry_indices)} cameras x {len(scheme_list)} schemes "
+                   f"x {len(budget_list)} budgets = {n_jobs} PLY writes")
+        for cam_idx in dry_indices:
+            for scheme in scheme_list:
+                for budget_mb in budget_list:
+                    if args.output_root is not None:
+                        out = (base_output_path / "ply"
+                               / f"budget_{_budget_tag(budget_mb)}" / scheme
+                               / f"camera_{cam_idx:03d}.ply")
+                    else:
+                        leg = Path(args.output)
+                        if len(dry_indices) == 1 and len(budget_list) == 1 and len(scheme_list) == 1:
+                            out = leg
+                        else:
+                            out = leg.with_name(
+                                f"{leg.stem}_{scheme}_{_budget_tag(budget_mb)}"
+                                f"_camera_{cam_idx:03d}{leg.suffix}"
+                            )
+                    mark = "[x]" if out.exists() else "[ ]"
+                    tqdm.write(f"  {mark} cam={cam_idx:03d} scheme={scheme:<12} "
+                               f"budget={budget_mb:>6}mb  ->  {out}")
+        sys.exit(0)
 
     # ---- Run-metadata + timings setup ----
     output_root_for_meta = base_output_path if base_output_path.suffix == "" else base_output_path.parent
@@ -424,18 +461,21 @@ def main() -> None:
         shared_tiling_npz = tiling_cache_path
 
     executor = ThreadPoolExecutor(max_workers=args.ply_workers)
+    timings_path = output_root_for_meta / "timings.json"
 
     # ---- Per-camera loop ----
-    for camera_index in camera_indices:
+    cam_pbar = tqdm(camera_indices, desc="cameras", unit="cam")
+    for camera_index in cam_pbar:
         cam = cameras[camera_index]
         cam_futures = []
-
+        cam_pbar.set_postfix(idx=camera_index, stage="visibility")
         with _timed("visibility", timings, camera=camera_index):
             distances = uc.calculate_distances(tile_centers, cam.camera_center.to(device))
             visibility = visibility_AABB_pytorch.batched_check_tiles_visible(
                 min_corners_t, max_corners_t, cam, device=device
             )
 
+        cam_pbar.set_postfix(idx=camera_index, stage="gaussian_weights")
         with _timed("gaussian_weights", timings, camera=camera_index,
                     weight_mode=args.weight_mode):
             cam_center = cam.camera_center.to(device)
@@ -461,6 +501,7 @@ def main() -> None:
                     )
                 w_gi = uc.compute_gaussian_weights_v2(args.weight_mode, **kw).to(device)
 
+        cam_pbar.set_postfix(idx=camera_index, stage="tile_weights")
         with _timed("tile_weights", timings, camera=camera_index,
                     w_norm=args.w_norm, c_norm=args.c_norm):
             W_k, C_k = uc.compute_tile_weights_and_counts(
@@ -490,7 +531,7 @@ def main() -> None:
                      projection_matrix=cam_proj)
 
         # ---- Per-scheme loop ----
-        for scheme in scheme_list:
+        for scheme in tqdm(scheme_list, desc="schemes", leave=False):
             include_lod = scheme != "vd"
             include_w = scheme in ("vd_lod_w", "vd_lod_w_c")
             include_c = scheme in ("vd_lod_c", "vd_lod_w_c")
@@ -525,7 +566,7 @@ def main() -> None:
                             camera_index, scheme, len(all_ordered))
 
             # ---- Per-budget loop: submit PLY writes to thread pool ----
-            for budget_mb in budget_list:
+            for budget_mb in tqdm(budget_list, desc="budgets", leave=False, unit="MB", unit_scale=True):
                 budget_bytes = int(budget_mb * 1024 * 1024)
                 with _timed("select_at_budget", timings, camera=camera_index,
                             scheme=scheme, budget_mb=budget_mb):
@@ -577,6 +618,7 @@ def main() -> None:
                 logger.debug("camera={} scheme={} budget_mb={} selected={} submitted_ply_write",
                              camera_index, scheme, budget_mb, len(selected_indices))
 
+        cam_pbar.set_postfix(idx=camera_index, stage="draining_ply")
         with _timed("ply_writes_drained", timings, camera=camera_index, n=len(cam_futures)):
             per_write_times = []
             for fut, t_submit in cam_futures:
@@ -592,9 +634,10 @@ def main() -> None:
                 "t_sec_total": float(np.sum(per_write_times)),
             })
 
-    executor.shutdown(wait=True)
+        # Flush timings once per camera — ~1 ms, recoverable if run crashes mid-sweep.
+        timings_path.write_text(json.dumps(timings, indent=2), encoding="utf-8")
 
-    timings_path = output_root_for_meta / "timings.json"
+    executor.shutdown(wait=True)
     timings_path.write_text(json.dumps(timings, indent=2), encoding="utf-8")
     logger.info("done; timings -> {}", timings_path)
 

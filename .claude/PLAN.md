@@ -1,6 +1,6 @@
 # Research Plan
 
-## Status: 2026-05-13 — instrumentation + Setup 1/2 plumbing landed
+## Status: 2026-05-13 — instrumentation + Setup 1/2 plumbing landed; DX pass (tqdm, vectorized tile weights)
 
 The 0513 push wired up per-stage timing, machine-readable run metadata, a Plotly Dash debug viewer, three packing modes, four weight modes, and W/C normalization knobs. Smoke-tested across all combinations. Ready for the bigger sweeps and the math-design iteration that prompted this work.
 
@@ -9,29 +9,34 @@ The 0513 push wired up per-stage timing, machine-readable run metadata, a Plotly
 ## Completed
 
 ### Deliverable 1 — Per-stage timing instrumentation
+
 - [x] `_timed(name, store, **labels)` context manager in `test_utility.py` and `experiments/render_metrics.py`
 - [x] Wrapped new spans: `compute_tile_weights_and_counts`, `_select_at_budget` (per scheme/budget), per-PLY-write summary stats (mean/max/total)
 - [x] Dumps `<output_root>/timings.json` and `<output_root>/render_timings.json`
 
 ### Deliverable 2 — `params.yaml` run-metadata dump
+
 - [x] `_dump_run_params` helper in both runners
 - [x] Captures CLI args + timestamp + hostname + device + cuda + torch + python versions
 - [x] `_yaml_safe` recursive coercion (handles torch's str subclasses and Paths)
 - [x] Written as `<output_root>/params.yaml` and `<output_root>/render_params.yaml`
 
 ### Deliverable 3 — Plotly Dash interactive debug viewer
+
 - [x] New script `experiments/debug_viewer_app.py`
 - [x] Widgets: camera-index slider, weight_mode dropdown, w_norm / c_norm dropdowns, GS-subsample slider, overlay checklist
 - [x] Panels: tile utility, per-tile #GS, per-tile W_k, per-Gaussian density (subsample), tile visibility, status text
 - [x] Reuses `_project_points` and the shared normalize/weight helpers from `utility_calculation.py`
 
 ### Deliverable 4a — Setup 1: W/C normalization sweep
+
 - [x] `normalize_term(x, mode)` helper supporting `{none, max, minmax, log1p, sum}`
 - [x] CLI flags `--w-norm` (default `none`) and `--c-norm` (default `max`) — matches pre-0513 behavior when both are at default
 - [x] `experiments/0513/run_setup1_norm_sweep.sh`
 - [x] Manifest fields `w_norm`, `c_norm` added
 
 ### Deliverable 4b — Setup 2: progressive + tile_strict
+
 - [x] `compute_gaussian_weights_v2(weight_mode=...)` with `{volume, volume_over_d2, screen_area}`
 - [x] `project_covariance_2d` helper (EWA Jacobian, pure torch, GPU)
 - [x] CLI flag `--packing-mode {tile_partial, tile_strict, progressive}` (default `tile_partial`)
@@ -41,6 +46,7 @@ The 0513 push wired up per-stage timing, machine-readable run metadata, a Plotly
 - [x] Manifest fields `packing_mode`, `weight_mode`, `gamma` added
 
 ### Smoke tests
+
 - [x] `tile_partial` × `det_gamma_over_d2` (legacy-equivalent path) — produces same selected GS count as before
 - [x] `tile_strict` — drops the overflowing tile (252 840 GS vs 253 687 for partial @ 60 MB)
 - [x] `progressive` × `volume` — sorts globally, same byte count
@@ -48,6 +54,7 @@ The 0513 push wired up per-stage timing, machine-readable run metadata, a Plotly
 - [x] `params.yaml` and `timings.json` (15 spans) verified on a minimal run
 
 ### Naming hygiene
+
 - [x] Renamed `--weight-mode legacy` → `det_gamma_over_d2` (descriptive, not historical)
 - [x] Confirmed `tile_partial` is **our proposed method**, not "legacy"
 
@@ -56,6 +63,7 @@ The 0513 push wired up per-stage timing, machine-readable run metadata, a Plotly
 ## How to use the new pieces
 
 ### Runner — `test_utility.py`
+
 New flags (all backwards-compatible; defaults reproduce pre-0513 behavior):
 
 ```bash
@@ -70,18 +78,22 @@ conda run -n gsquic python test_utility.py \
 ```
 
 Outputs (under `<output_root>`):
+
 - `params.yaml` — run config + execution context
 - `timings.json` — per-stage wall times (one row per span; load into pandas)
 - `tiling.npz`, `camera_viz/*.npz`, `ply/budget_*/<scheme>/camera_*.ply + .json`
 - `utility.log` — same loguru lines as before
 
 ### Render + metrics — `experiments/render_metrics.py`
+
 Same call signature as before. New outputs:
+
 - `<output_root>/render_params.yaml`
 - `<output_root>/render_timings.json`
 - `metrics/summary.csv` now includes `w_norm`, `c_norm`, `packing_mode`, `weight_mode` columns
 
 ### Plotly Dash debug viewer — `experiments/debug_viewer_app.py`
+
 On the server:
 
 ```bash
@@ -102,6 +114,7 @@ ssh -L 8050:localhost:8050 <server>
 Slide the camera index, toggle overlays, change weight_mode / w_norm / c_norm live — no re-run needed. PLY load + tiling happens once at startup.
 
 ### Sweep wrappers — `experiments/0513/`
+
 ```bash
 # W/C normalization sweep (7 pairs by default)
 bash experiments/0513/run_setup1_norm_sweep.sh
@@ -118,28 +131,44 @@ Override via env vars: `OUTPUT_ROOT`, `BUDGET_LIST`, `GRID_SHAPE`, `CAMERA_INDEX
 ## Next session
 
 ### Math design — the real reason this push exists
-1. **Run the Dash viewer first** on the bicycle scene, scrub camera index, and compare what `det_gamma_over_d2` vs `volume` vs `volume_over_d2` vs `screen_area` do to `W_k` distributions across tiles. The hypothesis (per the memory at `project_gamma_default_history.md`) is that γ=1 in the default mode weights by volume² and is the root cause of the "GS weight still sucks" symptom from 0510.
-2. **Setup 1 sweep:** run `run_setup1_norm_sweep.sh`, aggregate metrics, plot PSNR vs budget for each (w_norm, c_norm) pair. The "none × max" cell is the pre-0513 baseline.
-3. **Setup 2 sweep:** run `run_setup2_progressive.sh`. Tells us whether progressive packing or any of the three new weight modes beats `tile_partial × det_gamma_over_d2`.
+
+1. (DONE) **Run the Dash viewer first** on the bicycle scene, scrub camera index, and compare what `det_gamma_over_d2` vs `volume` vs `volume_over_d2` vs `screen_area` do to `W_k` distributions across tiles. The hypothesis (per the memory at `project_gamma_default_history.md`) is that γ=1 in the default mode weights by volume² and is the root cause of the "GS weight still sucks" symptom from 0510.
+2. (RUNNING) **Setup 2 sweep:** run `run_setup2_progressive.sh`. Tells us whether progressive packing or any of the three new weight modes beats `tile_partial × det_gamma_over_d2`.
+3. **Setup 1 sweep:** run `run_setup1_norm_sweep.sh`, aggregate metrics, plot PSNR vs budget for each (w_norm, c_norm) pair. The "none × max" cell is the pre-0513 baseline.
 
 ### Verification tasks not yet done
-- [ ] **Screen-area sanity check** — compare `screen_area` weights against the radii returned by a real render pass on one camera. Expect Spearman ρ > 0.9. If not, the Jacobian implementation in `project_covariance_2d` is wrong.
+
+- [ x ] **Screen-area sanity check** — compare `screen_area` weights against the radii returned by a real render pass on one camera. Expect Spearman ρ > 0.9. If not, the Jacobian implementation in `project_covariance_2d` is wrong.
 - [ ] **Baseline regression** — re-run 0508 budget sweep with `--w-norm none --c-norm max --packing-mode tile_partial --weight-mode det_gamma_over_d2 --gamma 1.0` and confirm PSNR/SSIM are bit-stable vs the pre-0513 run.
 
 ### Backlog (still deferred)
 
+**DX**
+
+- [x] add `tqdm` progress bars (cameras / schemes / budgets) with per-stage postfix so you can see which sub-stage is running
+- [x] loguru routed through `tqdm.write` — no torn output
+- [x] incremental `timings.json` flush once per camera (recoverable on crash; ~1 ms overhead, not per-span)
+- [ ] **Resume/skip-existing** (`--resume` flag): check if `camera_{NNN}.ply` already exists for the first budget/scheme combo, skip that camera. Saves hours on reruns after a mid-sweep crash.
+- [x] **`--dry-run`**: prints full (camera × scheme × budget → path) matrix, marks `[x]` for outputs that already exist, exits; no GPU work, no disk writes.
+- [ ] **GPU memory logging**: append `torch.cuda.max_memory_allocated()` (MB) to each camera's timing rows; zero-cost, catches OOM risk before it strikes.
+- [ ] **`_greedy_order_progressive` scheme-consistency**: it ignores `scheme` entirely and always sorts by `w_gi`. Running it under `vd` vs `vd_lod_w_c` produces identical PLYs — add a `logger.warning` or raise if `scheme != "vd"` when `packing_mode=progressive`.
+
 **Perf / runtime**
-- [ ] Vectorize `compute_tile_weights_and_counts` — replace per-tile Python loop with GPU `scatter_add_` + `bincount`. New timer will tell us if it matters under the larger grids.
+
+- [x] Vectorize `compute_tile_weights_and_counts` — Python loop replaced by `scatter_add_` + `repeat_interleave` (single GPU kernel).
 - [ ] Dedup tile_npz writes (test_utility_fast.py prototype exists)
 
 **Upstream**
+
 - [ ] `tiling_uniform_layered_gs` (GGSP/tiling.py) — triple-nested loop, 64 passes over 6M Gaussians, ~26 s on the smoke test. Fix with single-pass floor-division tile assignment + argsort grouping (~172s → seconds).
 - [ ] `export_gs_to_ply` (GS-Interface/io_3dgs.py) — `list(map(tuple, ...))` allocates a Python tuple per Gaussian.
 
 **Render + metrics**
+
 - [ ] In-memory render pipeline: skip PLY writes entirely, render selected Gaussians directly in-memory → save PNG + metrics only. HDD is the bottleneck (~50 MB/s spinning disk).
 
 **Research follow-ups**
+
 1. Pick the winning (w_norm, c_norm, weight_mode, packing_mode) from the sweeps; lock as project default.
 2. Algorithm design experiments (scheduler variants, LOD strategies once we re-enable num_lod > 1).
 3. Multi-scene testing (beyond bicycle).

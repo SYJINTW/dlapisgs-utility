@@ -59,7 +59,7 @@ import io_3dgs  # type: ignore  # noqa: E402  # pyright: ignore[reportMissingImp
 import utility_calculation as uc  # noqa: E402
 
 import dash  # noqa: E402
-from dash import dcc, html, Input, Output, dash_table  # noqa: E402
+from dash import dcc, html, Input, Output, State, ctx, dash_table  # noqa: E402
 import plotly.graph_objects as go  # noqa: E402
 from plotly.subplots import make_subplots  # noqa: E402
 
@@ -448,7 +448,7 @@ def _build_figure(cam, cam_idx, fields, weight_mode, w_norm, c_norm,
         fig.update_xaxes(showgrid=False, zeroline=False, row=r, col=c)
         fig.update_yaxes(showgrid=False, zeroline=False, row=r, col=c)
     fig.update_layout(
-        height=1000, margin=dict(l=40, r=40, t=60, b=60),
+        height=1000, margin=dict(l=30, r=30, t=30, b=0),
         scene=dict(aspectmode="data"),
     )
     return fig
@@ -490,14 +490,159 @@ def _build_table(fields: dict) -> tuple[list[dict], list[dict]]:
     return rows, columns
 
 
+def _fmt_count(n: int) -> str:
+    """Format a large integer compactly: 5998962 → '6.0M', 2e9 → '2.0G'."""
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.1f}B"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+_WEIGHT_FORMULA = {
+    "det_gamma_over_d2": "sigmoid(o)·det(Σ)^γ / d²",
+    "volume_over_d2":    "sigmoid(o)·vol(Σ) / d²",
+    "volume":            "sigmoid(o)·vol(Σ)",
+    "screen_area":       "screen_area(Σ)",
+}
+
+
+def _build_dist_figure(fields: dict, weight_mode: str = "") -> go.Figure:
+    """Histogram of U_k (per tile) and w(g_i) (all Gaussians — already computed)."""
+    u_np = fields["u"]
+    w_gi_all = fields["w_gi"].cpu().numpy()
+
+    # log10-transform — both span many orders of magnitude
+    w_gi_log = np.log10(w_gi_all + 1e-30)
+    u_log = np.log10(u_np + 1e-30)
+
+    formula = _WEIGHT_FORMULA.get(weight_mode, weight_mode)
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=[
+            f"U_k — log₁₀ histogram ({len(u_np)} tiles)",
+            f"w(g_i) = {formula} — log₁₀ histogram ({_fmt_count(len(w_gi_all))} GS)",
+        ],
+        horizontal_spacing=0.12,
+    )
+    fig.add_trace(go.Histogram(
+        x=u_log, nbinsx=40, name="U_k",
+        marker_color="steelblue", opacity=0.85,
+    ), row=1, col=1)
+    fig.add_trace(go.Histogram(
+        x=w_gi_log, nbinsx=80, name="w(g_i)",
+        marker_color="darkorange", opacity=0.85,
+    ), row=1, col=2)
+
+    fig.update_xaxes(title_text="log₁₀(U_k)", row=1, col=1)
+    fig.update_xaxes(title_text="log₁₀(w(g_i))", row=1, col=2)
+    fig.update_yaxes(title_text="count", row=1, col=1)
+    fig.update_yaxes(title_text="count", row=1, col=2)
+    fig.update_layout(height=300, margin=dict(l=40, r=40, t=50, b=40), showlegend=False)
+    return fig
+
+
 
 def _build_app() -> dash.Dash:
     app = dash.Dash(__name__)
     n_cams = len(STATE["cameras"])
     slider_marks = {i: str(i) for i in range(0, n_cams, max(1, n_cams // 10))}
 
+    _MODAL_HIDDEN = {"display": "none"}
+    _MODAL_SHOWN = {
+        "display": "block", "position": "fixed", "top": 0, "left": 0,
+        "width": "100%", "height": "100%", "backgroundColor": "rgba(0,0,0,0.55)",
+        "zIndex": 1000, "overflowY": "auto",
+    }
+    _INFO_TEXT = """
+LAUNCH
+  conda run -n gsquic python experiments/debug_viewer_app.py \\
+      --ply /path/to/point_cloud.ply \\
+      --camera-trace /path/to/trace.json \\
+      --grid-shape 4 4 4 \\
+      --port 8050 --debug
+
+  VSCode Simple Browser → http://127.0.0.1:8050
+  --debug enables hot-reload (edits reflect on save, no restart).
+
+PANELS (2×3 grid)
+  (1,1) Tile utility U  — log₁₀-normalized for display, raw value in hover
+  (1,2) Per-tile #GS    — raw Gaussian count per tile
+  (1,3) Per-tile W_k    — aggregate Gaussian importance weight per tile
+  (2,1) Per-GS density  — subsampled GS dots colored by w(g_i); fraction set by slider
+  (2,2) Tile visibility — red = visible to this camera, gray = frustum-culled
+  (2,3) 3D scene        — tile AABBs (green=visible, red=culled), gold=camera,
+                          sky-blue=estimated frustum, navy arrow=view direction
+
+  Gold star ★ in panels 1–5 marks the projected camera position.
+
+UTILITY FORMULA
+  U(k) = log(β·(ℓ+1)) · (v_k / d_k) · W_k · C_k
+
+  v_k  — visibility (0/1 from frustum test)
+  d_k  — camera→tile center distance
+  W_k  — sum of w(g_i) over tile k, then normalized by w_norm
+  C_k  — Gaussian count in tile k, normalized by c_norm
+  ℓ    — LOD level (fixed at 1 in norm sweep; log factor is constant)
+
+PER-GAUSSIAN WEIGHT w(g_i)  — set via weight_mode dropdown
+  volume_over_d2    sigmoid(o) · exp(sx+sy+sz) / d²   ← default / recommended
+  det_gamma_over_d2 sigmoid(o) · exp(2γ(sx+sy+sz)) / d²
+  volume            sigmoid(o) · exp(sx+sy+sz)
+  screen_area       projected screen-space area
+
+NORMALIZATION (w_norm / c_norm)
+  none   — identity (unbounded)
+  max    — divide by max → [0, 1]
+  minmax — (x−min)/(max−min) → [0, 1]
+  log1p  — log1p(x)/log1p(max) → [0, 1]
+  sum    — divide by sum → probability mass (default)
+
+DISTRIBUTION HISTOGRAMS (below table)
+  U_k histogram      — one entry per tile (~40 tiles); shows how utility is spread
+  w(g_i) histogram   — all Gaussians; already computed when U_k is computed, no extra cost
+  Both axes are log₁₀ to reveal structure across orders of magnitude.
+
+TABLE
+  Rows sorted by U descending. Visible tiles highlighted yellow.
+  Scrollable — no pagination.
+"""
+
     app.layout = html.Div([
-        html.H3("3DGS tile-utility debug viewer"),
+        html.Div([
+            html.H3("3DGS tile-utility debug viewer",
+                    style={"display": "inline-block", "margin": 0, "marginRight": "10px"}),
+            html.Button("ℹ how to use", id="info-btn", n_clicks=0, style={
+                "fontSize": "13px", "padding": "3px 10px", "cursor": "pointer",
+                "borderRadius": "4px", "border": "1px solid #aaa",
+                "backgroundColor": "#f0f0f0", "verticalAlign": "middle",
+            }),
+        ], style={"display": "flex", "alignItems": "center", "marginBottom": "12px"}),
+        html.Div(id="info-modal", style=_MODAL_HIDDEN, children=[
+            html.Div([
+                html.Div([
+                    html.H4("How to use — 3DGS tile-utility debug viewer",
+                            style={"marginTop": 0, "marginBottom": "12px"}),
+                    html.Pre(_INFO_TEXT, style={
+                        "fontFamily": "monospace", "fontSize": "12px",
+                        "whiteSpace": "pre-wrap", "lineHeight": "1.6",
+                        "backgroundColor": "#f8f8f8", "padding": "12px",
+                        "borderRadius": "4px", "overflowY": "auto", "maxHeight": "60vh",
+                    }),
+                    html.Button("Close", id="info-close-btn", n_clicks=0, style={
+                        "marginTop": "12px", "padding": "6px 20px", "cursor": "pointer",
+                        "borderRadius": "4px", "border": "1px solid #aaa",
+                        "backgroundColor": "#e0e0e0", "fontSize": "13px",
+                    }),
+                ], style={
+                    "backgroundColor": "white", "borderRadius": "8px",
+                    "padding": "24px", "maxWidth": "760px", "margin": "60px auto",
+                    "boxShadow": "0 4px 24px rgba(0,0,0,0.25)",
+                }),
+            ]),
+        ]),
         html.Div([
             html.Label("Camera index"),
             dcc.Slider(id="camera-slider", min=0, max=n_cams - 1, step=1, value=0,
@@ -523,7 +668,7 @@ def _build_app() -> dash.Dash:
                              clearable=False, style={"width": "120px"}),
             ], style={"display": "inline-block", "marginRight": "16px"}),
             html.Div([
-                html.Label("GS subsample fraction"),
+                html.Label("GS subsample fraction (panel 4 scatter only)"),
                 dcc.Slider(id="subsample", min=0.001, max=0.05, step=0.001, value=0.01,
                            tooltip={"placement": "bottom", "always_visible": True}),
             ], style={"display": "inline-block", "width": "260px", "verticalAlign": "top"}),
@@ -553,6 +698,7 @@ def _build_app() -> dash.Dash:
         ], style={"marginBottom": "8px"}),
         dcc.Graph(id="main-figure"),
         html.H4("Per-tile stats — sorted by utility ↓", style={"marginTop": "16px"}),
+        dcc.Graph(id="dist-figure"),
         dash_table.DataTable(
             id="tile-table",
             style_table={"overflowX": "auto", "overflowY": "auto", "maxHeight": "480px"},
@@ -569,10 +715,20 @@ def _build_app() -> dash.Dash:
     ])
 
     @app.callback(
+        Output("info-modal", "style"),
+        Input("info-btn", "n_clicks"),
+        Input("info-close-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def toggle_info_modal(_open, _close):
+        return _MODAL_SHOWN if ctx.triggered_id == "info-btn" else _MODAL_HIDDEN
+
+    @app.callback(
         Output("main-figure", "figure"),
         Output("tile-table", "data"),
         Output("tile-table", "columns"),
         Output("status-text", "children"),
+        Output("dist-figure", "figure"),
         Input("camera-slider", "value"),
         Input("weight-mode", "value"),
         Input("w-norm", "value"),
@@ -589,15 +745,18 @@ def _build_app() -> dash.Dash:
         u = fields["u"]
         vis_np = fields["visibility"].cpu().numpy()
         n_vis = int(vis_np.sum())
+        w_gi_all = fields["w_gi"].cpu().numpy()
         status_children = [
             html.B(f"Cam {cam_idx}"), f"  {n_vis}/{len(vis_np)} tiles visible", html.Br(),
             f"weight: {weight_mode}  w_norm: {w_norm}  c_norm: {c_norm}", html.Br(),
-            f"U   [{u.min():.3g}, {u.max():.3g}]", html.Br(),
-            f"W_k [{float(fields['W_k'].min()):.3g}, {float(fields['W_k'].max()):.3g}]", html.Br(),
-            f"C_k [{float(fields['C_k'].min()):.3g}, {float(fields['C_k'].max()):.3g}]", html.Br(),
-            f"#GS {len(STATE['gs_xyz'])}",
+            f"U      [{u.min():.3g}, {u.max():.3g}]", html.Br(),
+            f"W_k    [{float(fields['W_k'].min()):.3g}, {float(fields['W_k'].max()):.3g}]", html.Br(),
+            f"C_k    [{float(fields['C_k'].min()):.3g}, {float(fields['C_k'].max()):.3g}]", html.Br(),
+            f"w(g_i) [{float(w_gi_all.min()):.3g}, {float(w_gi_all.max()):.3g}]", html.Br(),
+            f"#GS {_fmt_count(len(STATE['gs_xyz']))}",
         ]
-        return fig, table_data, table_cols, status_children
+        dist_fig = _build_dist_figure(fields, weight_mode)
+        return fig, table_data, table_cols, status_children, dist_fig
 
     return app
 

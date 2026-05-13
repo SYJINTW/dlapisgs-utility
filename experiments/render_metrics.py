@@ -13,14 +13,64 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime as _dt
 import json
 import os
+import platform
+import socket
 import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import torch
+import yaml
 from loguru import logger
+
+
+@contextmanager
+def _timed(name: str, store: list, **labels):
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        dt = time.perf_counter() - t0
+        label_str = " ".join(f"{k}={v}" for k, v in labels.items())
+        logger.info("{} stage={} t={:.3f}s", label_str, name, dt)
+        row = {"stage": name, "t_sec": dt}
+        row.update(labels)
+        store.append(row)
+
+
+def _yaml_safe(obj):
+    if isinstance(obj, dict):
+        return {str(k): _yaml_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_yaml_safe(v) for v in obj]
+    if obj is None or isinstance(obj, bool) or isinstance(obj, (int, float)):
+        return obj
+    return str(obj)
+
+
+def _dump_render_params(output_root: Path, args: argparse.Namespace) -> None:
+    payload = {
+        "run": {
+            "timestamp": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "hostname": socket.gethostname(),
+            "device": "cuda" if torch.cuda.is_available() else "cpu",
+            "python": platform.python_version(),
+            "torch": torch.__version__,
+            "cwd": os.getcwd(),
+            "script": str(Path(__file__).resolve()),
+        },
+        "args": vars(args),
+    }
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "render_params.yaml").write_text(
+        yaml.safe_dump(_yaml_safe(payload), sort_keys=False, default_flow_style=False),
+        encoding="utf-8",
+    )
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 RENDERER_ROOT = WORKSPACE_ROOT / "LapisGS-object-based-renderer"
@@ -107,34 +157,40 @@ def main() -> None:
     logger.add(str(log_path), level="INFO")
     logger.info("output_root={} gt_ply={} trace={}", output_root, gt_ply, trace_path)
 
+    _dump_render_params(output_root, args)
+    timings: list = []
+
     render_dir: Path | None = Path(args.render_dir) if args.render_dir else None
     if render_dir is not None:
         render_dir.mkdir(parents=True, exist_ok=True)
 
-    frames  = _load_trace(trace_path)
-    cameras = [_build_camera(f, args.width, args.height) for f in frames]
+    with _timed("camera_load", timings):
+        frames  = _load_trace(trace_path)
+        cameras = [_build_camera(f, args.width, args.height) for f in frames]
     logger.info("Loaded {} cameras from {}", len(cameras), trace_path)
 
     # Pre-render ground truth
     logger.info("Rendering GT from {} ...", gt_ply)
-    gt_gaussians = GaussianModel(args.sh_degree)
-    gt_gaussians.load_ply(str(gt_ply))
-    gt_gs_res = torch.ones(len(gt_gaussians.get_xyz), device="cuda")
+    with _timed("gt_ply_load", timings):
+        gt_gaussians = GaussianModel(args.sh_degree)
+        gt_gaussians.load_ply(str(gt_ply))
+        gt_gs_res = torch.ones(len(gt_gaussians.get_xyz), device="cuda")
     bg = [1, 1, 1] if args.white_bg else [0, 0, 0]
     gt_renders: list[torch.Tensor] = []
-    with torch.no_grad():
-        for idx, cam in enumerate(cameras):
-            bg_color = torch.tensor(bg, dtype=torch.float32, device="cuda").view(3, 1, 1)
-            bg_color = bg_color.expand(3, cam.image_height, cam.image_width)
-            bg_depth = torch.zeros(1, cam.image_height, cam.image_width, device="cuda")
-            result = render(cam, gt_gaussians, PIPELINE, bg_color, bg_depth, gs_res=gt_gs_res)
-            frame_tensor = result["render"].clamp(0.0, 1.0)
-            gt_renders.append(frame_tensor)
-            if render_dir is not None:
-                import torchvision
-                gt_frame_path = render_dir / "ground_truth" / f"{idx:05d}.png"
-                gt_frame_path.parent.mkdir(parents=True, exist_ok=True)
-                torchvision.utils.save_image(frame_tensor, str(gt_frame_path))
+    with _timed("gt_render_all", timings, n=len(cameras)):
+        with torch.no_grad():
+            for idx, cam in enumerate(cameras):
+                bg_color = torch.tensor(bg, dtype=torch.float32, device="cuda").view(3, 1, 1)
+                bg_color = bg_color.expand(3, cam.image_height, cam.image_width)
+                bg_depth = torch.zeros(1, cam.image_height, cam.image_width, device="cuda")
+                result = render(cam, gt_gaussians, PIPELINE, bg_color, bg_depth, gs_res=gt_gs_res)
+                frame_tensor = result["render"].clamp(0.0, 1.0)
+                gt_renders.append(frame_tensor)
+                if render_dir is not None:
+                    import torchvision
+                    gt_frame_path = render_dir / "ground_truth" / f"{idx:05d}.png"
+                    gt_frame_path.parent.mkdir(parents=True, exist_ok=True)
+                    torchvision.utils.save_image(frame_tensor, str(gt_frame_path))
     logger.success("GT rendered: {} frames", len(gt_renders))
     del gt_gaussians
 
@@ -156,15 +212,19 @@ def main() -> None:
             logger.warning("SKIP (PLY missing): {}", selected_ply)
             continue
 
-        rendered = _render_ply(selected_ply, cameras[cam_idx], args.sh_degree, args.white_bg)
-        m = _compute_metrics(rendered, gt_renders[cam_idx])
+        labels = dict(camera=cam_idx, scheme=scheme, budget_mb=budget_mb)
+        with _timed("render_selected", timings, **labels):
+            rendered = _render_ply(selected_ply, cameras[cam_idx], args.sh_degree, args.white_bg)
+        with _timed("metrics", timings, **labels):
+            m = _compute_metrics(rendered, gt_renders[cam_idx])
 
         if render_dir is not None:
             import torchvision
             rel = selected_ply.relative_to(output_root)
             out_png = render_dir / rel.with_suffix(".png")
             out_png.parent.mkdir(parents=True, exist_ok=True)
-            torchvision.utils.save_image(rendered, str(out_png))
+            with _timed("png_write", timings, **labels):
+                torchvision.utils.save_image(rendered, str(out_png))
 
         row: dict[str, Any] = {
             "budget_mb":          budget_mb,
@@ -175,6 +235,10 @@ def main() -> None:
             "used_bytes":         int(manifest.get("used_bytes", 0)),
             "selected_gaussians": int(manifest.get("selected_gaussians", 0)),
             "ply_bytes":          int(selected_ply.stat().st_size),
+            "w_norm":             manifest.get("w_norm"),
+            "c_norm":             manifest.get("c_norm"),
+            "packing_mode":       manifest.get("packing_mode"),
+            "weight_mode":        manifest.get("weight_mode"),
         }
         rows.append(row)
 
@@ -195,11 +259,15 @@ def main() -> None:
             writer = csv.DictWriter(fp, fieldnames=list(rows[0].keys()))
             writer.writeheader()
             writer.writerows(rows)
-        logger.info("Wrote {} rows → {}", len(rows), csv_path)
+        logger.info("Wrote {} rows -> {}", len(rows), csv_path)
 
     json_path = metrics_dir / "summary.json"
     json_path.write_text(json.dumps({"rows": rows}, indent=2))
-    logger.info("Wrote summary → {}", json_path)
+    logger.info("Wrote summary -> {}", json_path)
+
+    timings_path = output_root / "render_timings.json"
+    timings_path.write_text(json.dumps(timings, indent=2), encoding="utf-8")
+    logger.info("Wrote timings -> {}", timings_path)
 
 
 if __name__ == "__main__":

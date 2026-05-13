@@ -194,10 +194,12 @@ def main() -> None:
     logger.success("GT rendered: {} frames", len(gt_renders))
     del gt_gaussians
 
-    # Iterate manifests
-    manifests = sorted((output_root / "ply").glob("**/camera_*.json")
-                       if (output_root / "ply").exists()
-                       else output_root.glob("**/selected.json"))
+    # Probe layouts in priority order (lists, so empty list is falsy)
+    manifests = (
+        sorted(output_root.glob("*/ply/**/camera_*.json"))  # weight_mode/ply/…
+        or sorted(output_root.glob("ply/**/camera_*.json"))  # legacy ply/…
+        or sorted(output_root.glob("**/selected.json"))       # oldest layout
+    )
     logger.info("Found {} manifests under {}", len(manifests), output_root)
 
     rows: list[dict[str, Any]] = []
@@ -250,6 +252,10 @@ def main() -> None:
         )
         logger.success("[{}/{}/camera_{:03d}]  PSNR={:.2f}  SSIM={:.4f}",
                        budget_tag, scheme, cam_idx, m["psnr"], m["ssim"])
+
+    if not rows:
+        logger.error("No metric rows collected — did test_utility.py run first?")
+        raise SystemExit(1)
 
     rows.sort(key=lambda r: (r["budget_mb"], r["scheme"], r["camera_index"]))
 

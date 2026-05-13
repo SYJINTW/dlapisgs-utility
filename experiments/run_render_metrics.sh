@@ -77,6 +77,10 @@ LAPISGS_DUMMY_IMAGE="$DUMMY_IMAGE" conda run -n "$RENDER_CONDA_ENV" python3 \
 
 echo ""
 echo "[2/2] Plotting PSNR / SSIM curves (group-by=$PLOT_GROUP_BY) ..."
+if [ ! -f "$METRICS_DIR/summary.csv" ]; then
+    echo "ERROR: summary.csv not found — render_metrics.py produced no rows. Did test_utility.py run first?"
+    exit 1
+fi
 conda run -n "$PLOT_CONDA_ENV" python3 \
     "$SCRIPT_DIR/plot_metrics.py" \
     --summary-csv "$METRICS_DIR/summary.csv" \

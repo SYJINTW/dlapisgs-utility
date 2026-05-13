@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Setup 2: per-Gaussian progressive packing with three weight modes.
-# Also runs tile_strict and tile_partial for comparison under the same weight.
+# Setup 2: progressive packing across four weight modes — isolates w(g_i) formula quality.
 set -euo pipefail
 
 ROOT="/mnt/data1/samk/gs-quic/cs5262_tile_quic"
@@ -8,24 +7,24 @@ PLY="${PLY:-$ROOT/exp-dataset/bicycle/point_cloud.ply}"
 TRACE="${TRACE:-$ROOT/Frustum-for-3DGS/sample_data/camera_trace/trace1.json}"
 OUT_BASE="${OUTPUT_ROOT:-$ROOT/dlapisgs-utility/output/0513_setup2_progressive}"
 CONDA_ENV="${CONDA_ENV:-gsquic}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
-BUDGET_LIST="${BUDGET_LIST:-20 60 100 200 500}"
+BUDGET_LIST="${BUDGET_LIST:-20 60 100 200 500 700 1000}"
 GRID_SHAPE="${GRID_SHAPE:-8 8 8}"
 NUM_LOD="${NUM_LOD:-1}"
-CAMERA_INDEX="${CAMERA_INDEX:--1}"
+CAMERA_INDEX="${CAMERA_INDEX:--1}" # -1 means all cameras
 SCHEMES=("vd_lod_w_c")
 
 # Each cell is "<packing_mode> <weight_mode>".
 COMBOS=(
+    "progressive det_gamma_over_d2"
     "progressive volume"
     "progressive volume_over_d2"
     "progressive screen_area"
-    "tile_strict  volume_over_d2"
-    "tile_partial volume_over_d2"
 )
 
 echo "=========================================="
-echo "Setup 2 — progressive / tile_strict (0513)"
+echo "Setup 2 — weight mode sweep, progressive packing (0513)"
 echo "=========================================="
 echo "Output root  : $OUT_BASE"
 echo "Grid shape   : $GRID_SHAPE"
@@ -55,8 +54,8 @@ for combo in "${COMBOS[@]}"; do
         --camera-index "$CAMERA_INDEX" \
         --packing-mode "$PACKING_MODE" \
         --weight-mode "$WEIGHT_MODE" \
-        --w-norm max \
-        --c-norm max
+        --w-norm sum \
+        --c-norm sum
 done
 
 echo ""

@@ -668,7 +668,7 @@ TABLE
                              clearable=False, style={"width": "120px"}),
             ], style={"display": "inline-block", "marginRight": "16px"}),
             html.Div([
-                html.Label("GS subsample fraction (panel 4 scatter only)"),
+                html.Label("GS subsample fraction"),
                 dcc.Slider(id="subsample", min=0.001, max=0.05, step=0.001, value=0.01,
                            tooltip={"placement": "bottom", "always_visible": True}),
             ], style={"display": "inline-block", "width": "260px", "verticalAlign": "top"}),
@@ -750,8 +750,8 @@ TABLE
             html.B(f"Cam {cam_idx}"), f"  {n_vis}/{len(vis_np)} tiles visible", html.Br(),
             f"weight: {weight_mode}  w_norm: {w_norm}  c_norm: {c_norm}", html.Br(),
             f"U      [{u.min():.3g}, {u.max():.3g}]", html.Br(),
-            f"W_k    [{float(fields['W_k'].min()):.3g}, {float(fields['W_k'].max()):.3g}]", html.Br(),
             f"C_k    [{float(fields['C_k'].min()):.3g}, {float(fields['C_k'].max()):.3g}]", html.Br(),
+            f"W_k    [{float(fields['W_k'].min()):.3g}, {float(fields['W_k'].max()):.3g}]", html.Br(),
             f"w(g_i) [{float(w_gi_all.min()):.3g}, {float(w_gi_all.max()):.3g}]", html.Br(),
             f"#GS {_fmt_count(len(STATE['gs_xyz']))}",
         ]

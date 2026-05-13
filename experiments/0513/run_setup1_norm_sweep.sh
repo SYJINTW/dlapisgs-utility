@@ -9,6 +9,7 @@ PLY="${PLY:-$ROOT/exp-dataset/bicycle/point_cloud.ply}"
 TRACE="${TRACE:-$ROOT/Frustum-for-3DGS/sample_data/camera_trace/trace1.json}"
 OUT_BASE="${OUTPUT_ROOT:-$ROOT/dlapisgs-utility/output/0513_setup1_norm_sweep}"
 CONDA_ENV="${CONDA_ENV:-gsquic}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
 BUDGET_LIST="${BUDGET_LIST:-20 60 100 200 500}"
 GRID_SHAPE="${GRID_SHAPE:-8 8 8}"

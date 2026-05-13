@@ -32,7 +32,9 @@ def normalize_term(x, mode="none", eps=1e-12):
       - "max":    x / max(x)
       - "minmax": (x - min) / (max - min)
       - "log1p":  log(1 + x)
-      - "sum":    x / sum(x)
+      - "sum":    x / sum(x) 
+      
+    just use sum
     """
     if mode == "none" or x is None:
         return x
@@ -215,7 +217,7 @@ def compute_tile_weights_and_counts(tile_index_offsets, tile_flat_indices, w_gi,
 def project_covariance_2d(xyz, scale_0, scale_1, scale_2,
                           rot_0, rot_1, rot_2, rot_3,
                           world_view, proj, img_w, img_h,
-                          fov_x=None, fov_y=None):
+                          fov_x=None, fov_y=None, near_plane: float = 0.2):
     """Project 3D Gaussian covariances to 2D screen-space covariances.
 
     Mirrors the math in 3DGS's forward.cu / EWA splatting:
@@ -258,10 +260,13 @@ def project_covariance_2d(xyz, scale_0, scale_1, scale_2,
     ones = torch.ones((N, 1), device=device, dtype=dtype)
     p_h = torch.cat([xyz, ones], dim=1)
     p_view = p_h @ world_view  # (N, 4)
-    tz = p_view[:, 2].clamp(min=1e-6)
+    # near_plane must be consistent: in_front and tz clamp must agree.
+    # Clamping tz to 1e-6 while marking anything > 0 as in_front means nearly-behind
+    # Gaussians get in_front=True with a Jacobian of focal/1e-6 ≈ 7e6, blowing up cov2d.
+    in_front = p_view[:, 2] > near_plane
+    tz = p_view[:, 2].clamp(min=near_plane)
     tx = p_view[:, 0]
     ty = p_view[:, 1]
-    in_front = p_view[:, 2] > 0
 
     # Focal lengths in pixels. If fov_x/fov_y given, derive; else assume
     # the projection matrix follows the 3DGS convention where focal_x =
@@ -269,10 +274,21 @@ def project_covariance_2d(xyz, scale_0, scale_1, scale_2,
     if fov_x is not None and fov_y is not None:
         focal_x = 0.5 * img_w / math.tan(0.5 * fov_x)
         focal_y = 0.5 * img_h / math.tan(0.5 * fov_y)
+        tan_fovx = math.tan(0.5 * fov_x)
+        tan_fovy = math.tan(0.5 * fov_y)
     else:
         # proj is row-major, pre-transposed; the (0,0) entry encodes 1/tan(fov_x/2).
         focal_x = 0.5 * img_w * float(proj[0, 0].item())
         focal_y = 0.5 * img_h * float(proj[1, 1].item())
+        tan_fovx = 1.0 / float(proj[0, 0].item())
+        tan_fovy = 1.0 / float(proj[1, 1].item())
+
+    # Clamp off-axis projection angle before computing J — mirrors forward.cu:82-87.
+    # Without this, Gaussians far off-screen get large tx/tz ratios → huge J off-diagonal.
+    lim_x = 1.3 * tan_fovx
+    lim_y = 1.3 * tan_fovy
+    tx = (tx / tz).clamp(-lim_x, lim_x) * tz
+    ty = (ty / tz).clamp(-lim_y, lim_y) * tz
 
     # Jacobian J of the projection at (tx, ty, tz). 2x3.
     J = torch.zeros((N, 2, 3), device=device, dtype=dtype)
@@ -347,6 +363,8 @@ def compute_gaussian_weights_v2(weight_mode, *, opacity, scale_0, scale_1, scale
         # Area of 1-sigma footprint = π · √det(Σ_2D). Hide back-of-camera Gaussians.
         area = math.pi * torch.sqrt(det2d.clamp(min=0.0))
         area = torch.where(in_front, area, torch.zeros_like(area))
+        # Hard cap: projected area cannot exceed the full image (catches any remaining outliers)
+        area = area.clamp(max=float(img_w * img_h))
         return o_i * area
 
     raise ValueError(f"unknown weight_mode '{weight_mode}'; valid: {WEIGHT_MODES}")

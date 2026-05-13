@@ -88,6 +88,89 @@ def _project_points(points_world: np.ndarray, world_view: np.ndarray, proj: np.n
     return ndc, in_front
 
 
+def _normalize(v: np.ndarray):
+    n = np.linalg.norm(v)
+    return v / n if n >= 1e-8 else None
+
+
+def _estimate_camera_frame(camera_center, tile_centers, visibility):
+    """Estimate camera forward/right/up from mean of visible tile centers."""
+    visible_mask = np.asarray(visibility).astype(bool)
+    if visible_mask.size == 0 or not np.any(visible_mask):
+        return None, None, None
+    vis_centers = np.asarray(tile_centers)[visible_mask]
+    forward = _normalize(np.mean(vis_centers, axis=0) - camera_center)
+    if forward is None:
+        return None, None, None
+    world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    if abs(np.dot(forward, world_up)) > 0.95:
+        world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    right = _normalize(np.cross(forward, world_up))
+    if right is None:
+        return None, None, None
+    up = _normalize(np.cross(right, forward))
+    return forward, right, up
+
+
+def _get_aabb_edges(mn, mx):
+    """12 edges of an AABB as list of (p1, p2) vertex pairs."""
+    v = np.array([
+        [mn[0], mn[1], mn[2]], [mx[0], mn[1], mn[2]],
+        [mx[0], mx[1], mn[2]], [mn[0], mx[1], mn[2]],
+        [mn[0], mn[1], mx[2]], [mx[0], mn[1], mx[2]],
+        [mx[0], mx[1], mx[2]], [mn[0], mx[1], mx[2]],
+    ])
+    return [(v[i], v[j]) for i, j in
+            [(0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7)]]
+
+
+def _frustum_lines(cam_center, tile_centers, vis_np, min_corners, max_corners):
+    """Build frustum line segments (None-separated x/y/z lists) for Scatter3d."""
+    forward, right, up = _estimate_camera_frame(cam_center, tile_centers, vis_np)
+    if forward is None:
+        return None, None, None
+    scene_diag = float(np.linalg.norm(np.max(max_corners, axis=0) - np.min(min_corners, axis=0)))
+    if scene_diag < 1e-8:
+        return None, None, None
+    near_d = max(0.02 * scene_diag, 1e-3)
+    far_d = max(0.22 * scene_diag, near_d * 3.0)
+    vis_centers = tile_centers[vis_np]
+    tan_h, tan_v = 0.35, 0.28
+    if vis_centers.shape[0] > 0:
+        rel = vis_centers - cam_center
+        proj_f = rel @ forward
+        mask = proj_f > 1e-6
+        rel, proj_f = rel[mask], proj_f[mask]
+        if rel.shape[0] > 0:
+            tan_h = float(np.clip(np.percentile(np.abs((rel @ right) / proj_f), 90), 0.08, 1.2))
+            tan_v = float(np.clip(np.percentile(np.abs((rel @ up) / proj_f), 90), 0.08, 1.0))
+    near_c, far_c = cam_center + forward * near_d, cam_center + forward * far_d
+    near_pts = np.array([
+        near_c + right * near_d * tan_h + up * near_d * tan_v,
+        near_c - right * near_d * tan_h + up * near_d * tan_v,
+        near_c - right * near_d * tan_h - up * near_d * tan_v,
+        near_c + right * near_d * tan_h - up * near_d * tan_v,
+    ])
+    far_pts = np.array([
+        far_c + right * far_d * tan_h + up * far_d * tan_v,
+        far_c - right * far_d * tan_h + up * far_d * tan_v,
+        far_c - right * far_d * tan_h - up * far_d * tan_v,
+        far_c + right * far_d * tan_h - up * far_d * tan_v,
+    ])
+    xs, ys, zs = [], [], []
+    for i in range(4):  # camera to far corners
+        xs += [cam_center[0], far_pts[i, 0], None]
+        ys += [cam_center[1], far_pts[i, 1], None]
+        zs += [cam_center[2], far_pts[i, 2], None]
+    for ring in (near_pts, far_pts):  # near and far rectangles
+        for i in range(4):
+            j = (i + 1) % 4
+            xs += [ring[i, 0], ring[j, 0], None]
+            ys += [ring[i, 1], ring[j, 1], None]
+            zs += [ring[i, 2], ring[j, 2], None]
+    return xs, ys, zs
+
+
 def _load_state(ply_path: Path, camera_trace: Path, grid_shape: tuple[int, int, int],
                 img_w: int, img_h: int, device: str) -> None:
     """Populate STATE with everything that doesn't change between camera/widget updates."""
@@ -198,36 +281,59 @@ def _build_figure(cam, cam_idx, fields, weight_mode, w_norm, c_norm,
     s = STATE
     fig = make_subplots(
         rows=2, cols=3,
+        specs=[
+            [{"type": "xy"}, {"type": "xy"}, {"type": "xy"}],
+            [{"type": "xy"}, {"type": "xy"}, {"type": "scene"}],
+        ],
         subplot_titles=[
             f"Tile utility U (scheme={scheme})",
             "Per-tile #GS (raw count)",
             f"Per-tile W_k (w_norm={w_norm})",
             f"Per-GS weight density (subsampled, {weight_mode})",
-            "Scene overview — tile centers in world XZ (★=camera)",
-            "Status",
+            "Tiles in NDC (red=visible, gray=culled)",
+            "3D scene — tile AABBs, camera, frustum",
         ],
         horizontal_spacing=0.14, vertical_spacing=0.22,
     )
 
     wv = cam.world_view_transform.detach().cpu().numpy()
     pj = cam.projection_matrix.detach().cpu().numpy()
+    cam_center_np = cam.camera_center.cpu().numpy().ravel().astype(np.float64)
 
     tile_centers = s["tile_centers"].detach().cpu().numpy()
     ndc_tiles, tiles_in_front = _project_points(tile_centers, wv, pj)
     vis_np = fields["visibility"].detach().cpu().numpy()
 
+    # Project camera center into the same projected space for the reference star
+    ndc_cam, _ = _project_points(cam_center_np.reshape(1, 3), wv, pj)
+    cam_px, cam_py = float(ndc_cam[0, 0]), float(ndc_cam[0, 1])
+    cam_proj_valid = np.isfinite(cam_px) and np.isfinite(cam_py)
+
     u = fields["u"]
+
+    # Colorbars: use coloraxis references so positions are layout-level, not trace-level.
+    # With horizontal_spacing=0.14, 3 cols: col domains ≈ [0,0.24], [0.38,0.62], [0.76,1.0]
+    # Row domains (vertical_spacing=0.22): row1 ≈ [0.61,1.0], row2 ≈ [0.0,0.39]
+    fig.update_layout(
+        coloraxis1=dict(colorscale="Viridis",
+                        colorbar=dict(title="U",    x=0.26, y=0.80, len=0.38, thickness=12)),
+        coloraxis2=dict(colorscale="Cividis",
+                        colorbar=dict(title="#GS",  x=0.64, y=0.80, len=0.38, thickness=12)),
+        coloraxis3=dict(colorscale="Magma",
+                        colorbar=dict(title="W_k",  x=1.01, y=0.80, len=0.38, thickness=12)),
+        coloraxis4=dict(colorscale="Plasma",
+                        colorbar=dict(title="w_gi", x=0.26, y=0.20, len=0.38, thickness=12)),
+    )
 
     # ---- panel (0,0): tile utility ----
     if "utility" in overlays:
+        u_disp = np.log1p(u) / (np.log1p(u.max()) + 1e-12)  # log1p to spread skewed distribution
         fig.add_trace(
             go.Scatter(
                 x=ndc_tiles[:, 0], y=ndc_tiles[:, 1], mode="markers",
-                marker=dict(size=18, color=u, colorscale="Viridis",
-                            colorbar=dict(title="U", x=0.30, y=0.80, len=0.40)),
+                marker=dict(size=18, color=u_disp, coloraxis="coloraxis1"),
                 text=[f"tile {i}: U={ui:.3g}" for i, ui in enumerate(u)],
-                hoverinfo="text",
-                showlegend=False,
+                hoverinfo="text", showlegend=False,
             ), row=1, col=1,
         )
 
@@ -237,25 +343,21 @@ def _build_figure(cam, cam_idx, fields, weight_mode, w_norm, c_norm,
         fig.add_trace(
             go.Scatter(
                 x=ndc_tiles[:, 0], y=ndc_tiles[:, 1], mode="markers",
-                marker=dict(size=18, color=c_raw, colorscale="Cividis",
-                            colorbar=dict(title="#GS", x=0.64, y=0.80, len=0.40)),
+                marker=dict(size=18, color=c_raw, coloraxis="coloraxis2"),
                 text=[f"tile {i}: {int(c)} GS" for i, c in enumerate(c_raw)],
-                hoverinfo="text",
-                showlegend=False,
+                hoverinfo="text", showlegend=False,
             ), row=1, col=2,
         )
 
-    # ---- panel (0,2): per-tile W_k under chosen normalization ----
+    # ---- panel (0,2): per-tile W_k ----
     if "wk" in overlays:
         w_np = fields["W_k"].detach().cpu().numpy()
         fig.add_trace(
             go.Scatter(
                 x=ndc_tiles[:, 0], y=ndc_tiles[:, 1], mode="markers",
-                marker=dict(size=18, color=w_np, colorscale="Magma",
-                            colorbar=dict(title="W_k", x=0.99, y=0.80, len=0.40)),
+                marker=dict(size=18, color=w_np, coloraxis="coloraxis3"),
                 text=[f"tile {i}: W_k={wi:.3g}" for i, wi in enumerate(w_np)],
-                hoverinfo="text",
-                showlegend=False,
+                hoverinfo="text", showlegend=False,
             ), row=1, col=3,
         )
 
@@ -269,77 +371,86 @@ def _build_figure(cam, cam_idx, fields, weight_mode, w_norm, c_norm,
         ndc_gs, gs_in_front = _project_points(sub_xyz, wv, pj)
         w_gi_np = fields["w_gi"][torch.as_tensor(idx, device=s["device"])].detach().cpu().numpy()
         mask = gs_in_front
+        w_gi_sub = w_gi_np[mask]
+        w_gi_disp = np.log1p(w_gi_sub) / (np.log1p(w_gi_sub.max()) + 1e-12)  # log1p to spread skewed distribution
         fig.add_trace(
             go.Scatter(
                 x=ndc_gs[mask, 0], y=ndc_gs[mask, 1], mode="markers",
-                marker=dict(size=2, color=w_gi_np[mask], colorscale="Plasma",
-                            opacity=0.5,
-                            colorbar=dict(title="w_gi", x=0.30, y=0.22, len=0.40)),
-                hoverinfo="skip",
-                showlegend=False,
+                marker=dict(size=2, color=w_gi_disp, coloraxis="coloraxis4", opacity=0.5),
+                hoverinfo="skip", showlegend=False,
             ), row=2, col=1,
         )
 
-    # ---- panel (1,1): bird's-eye scene overview in world XZ ----
+    # ---- panel (1,1): tiles in NDC colored by visibility ----
     if "tiles_vis" in overlays:
-        tile_centers_np = s["tile_centers"].detach().cpu().numpy()
-        cam_center_np = cam.camera_center.detach().cpu().numpy()
-        gs_counts_np = fields["C_k_raw"].detach().cpu().numpy()
-        marker_colors = ["#e74c3c" if v else "#aaaaaa" for v in vis_np]
-        marker_sizes = 10 + 20 * (gs_counts_np / gs_counts_np.max().clip(min=1))
+        colors = np.where(vis_np, 1.0, 0.0)
         fig.add_trace(
             go.Scatter(
-                x=tile_centers_np[:, 0], y=tile_centers_np[:, 2],
-                mode="markers+text",
-                marker=dict(size=marker_sizes, color=marker_colors, opacity=0.85,
-                            line=dict(color="white", width=1)),
-                text=[str(i) for i in range(len(tile_centers_np))],
-                textposition="top center",
-                textfont=dict(size=8, color="black"),
-                hovertext=[f"tile {i}  vis={bool(vis_np[i])}  U={u[i]:.3g}  #GS={int(gs_counts_np[i])}"
-                           for i in range(len(tile_centers_np))],
-                hoverinfo="text",
-                showlegend=False,
-            ), row=2, col=2,
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=[cam_center_np[0]], y=[cam_center_np[2]],
-                mode="markers",
-                marker=dict(symbol="star", size=22, color="gold",
-                            line=dict(color="black", width=1)),
-                hovertext=f"camera ({cam_center_np[0]:.1f}, {cam_center_np[1]:.1f}, {cam_center_np[2]:.1f})",
-                hoverinfo="text",
-                showlegend=False,
+                x=ndc_tiles[:, 0], y=ndc_tiles[:, 1], mode="markers",
+                marker=dict(size=18, color=colors,
+                            colorscale=[[0, "lightgray"], [1, "crimson"]], showscale=False),
+                text=[f"tile {i}: vis={bool(v)}" for i, v in enumerate(vis_np)],
+                hoverinfo="text", showlegend=False,
             ), row=2, col=2,
         )
 
-    # ---- panel (1,2): status ----
-    n_vis_tiles = int(vis_np.sum())
-    status = (
-        f"<b>Camera</b>: {cam_idx}<br>"
-        f"<b>Visible tiles</b>: {n_vis_tiles} / {len(vis_np)}<br>"
-        f"<b>w_norm</b>: {w_norm}<br>"
-        f"<b>c_norm</b>: {c_norm}<br>"
-        f"<b>weight_mode</b>: {weight_mode}<br>"
-        f"<b>U range</b>: [{u.min():.3g}, {u.max():.3g}]<br>"
-        f"<b>W_k range</b>: [{float(fields['W_k'].min()):.3g}, {float(fields['W_k'].max()):.3g}]<br>"
-        f"<b>C_k range</b>: [{float(fields['C_k'].min()):.3g}, {float(fields['C_k'].max()):.3g}]<br>"
-        f"<b>#GS total</b>: {len(s['gs_xyz'])}"
+    # Camera star marker in all 5 projected 2D panels
+    if cam_proj_valid:
+        for _r, _c in [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2)]:
+            fig.add_trace(go.Scatter(
+                x=[cam_px], y=[cam_py], mode="markers",
+                marker=dict(symbol="star", size=16, color="gold",
+                            line=dict(color="darkorange", width=1.5)),
+                hovertext="camera", hoverinfo="text", showlegend=False,
+            ), row=_r, col=_c)
+
+    # ---- panel (2,3): 3D scene — tile AABBs, camera, frustum ----
+    vis_x, vis_y, vis_z = [], [], []
+    cul_x, cul_y, cul_z = [], [], []
+    for i, (mn, mx) in enumerate(zip(s["min_corners"], s["max_corners"])):
+        tx, ty, tz = (vis_x, vis_y, vis_z) if vis_np[i] else (cul_x, cul_y, cul_z)
+        for p1, p2 in _get_aabb_edges(mn, mx):
+            tx += [p1[0], p2[0], None]
+            ty += [p1[1], p2[1], None]
+            tz += [p1[2], p2[2], None]
+    if vis_x:
+        fig.add_trace(go.Scatter3d(
+            x=vis_x, y=vis_y, z=vis_z, mode="lines",
+            line=dict(color="limegreen", width=2), hoverinfo="skip", showlegend=False,
+        ), row=2, col=3)
+    if cul_x:
+        fig.add_trace(go.Scatter3d(
+            x=cul_x, y=cul_y, z=cul_z, mode="lines",
+            line=dict(color="crimson", width=1), opacity=0.35, hoverinfo="skip", showlegend=False,
+        ), row=2, col=3)
+    fig.add_trace(go.Scatter3d(
+        x=[cam_center_np[0]], y=[cam_center_np[1]], z=[cam_center_np[2]],
+        mode="markers", marker=dict(size=8, color="gold", symbol="diamond"),
+        hoverinfo="skip", showlegend=False,
+    ), row=2, col=3)
+    fx, fy, fz = _frustum_lines(cam_center_np, tile_centers, vis_np, s["min_corners"], s["max_corners"])
+    if fx is not None:
+        fig.add_trace(go.Scatter3d(
+            x=fx, y=fy, z=fz, mode="lines",
+            line=dict(color="deepskyblue", width=2), hoverinfo="skip", showlegend=False,
+        ), row=2, col=3)
+        forward, _, _ = _estimate_camera_frame(cam_center_np, tile_centers, vis_np)
+        if forward is not None:
+            scene_diag = float(np.linalg.norm(np.max(s["max_corners"], axis=0) - np.min(s["min_corners"], axis=0)))
+            tip = cam_center_np + forward * 0.12 * scene_diag
+            fig.add_trace(go.Scatter3d(
+                x=[cam_center_np[0], tip[0]], y=[cam_center_np[1], tip[1]], z=[cam_center_np[2], tip[2]],
+                mode="lines+markers", line=dict(color="navy", width=4),
+                marker=dict(size=[0, 5], color="navy"), hoverinfo="skip", showlegend=False,
+            ), row=2, col=3)
+
+    for r, c in [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2)]:
+        fig.update_xaxes(showgrid=False, zeroline=False, row=r, col=c)
+        fig.update_yaxes(showgrid=False, zeroline=False, row=r, col=c)
+    fig.update_layout(
+        height=1000, margin=dict(l=40, r=40, t=60, b=60),
+        scene=dict(aspectmode="data"),
     )
-    fig.add_trace(go.Scatter(x=[0], y=[0], mode="text",
-                             text=[status], textposition="middle center",
-                             showlegend=False, hoverinfo="skip"),
-                  row=2, col=3)
-
-    # NDC panels: fixed [-1.1, 1.1] range
-    for r, c in [(1, 1), (1, 2), (1, 3), (2, 1), (2, 3)]:
-        fig.update_xaxes(range=[-1.1, 1.1], showgrid=False, zeroline=False, row=r, col=c)
-        fig.update_yaxes(range=[-1.1, 1.1], showgrid=False, zeroline=False, row=r, col=c)
-    # Bird's-eye panel (2,2): world coords, let Plotly auto-range
-    fig.update_xaxes(showgrid=True, zeroline=False, title_text="X (world)", row=2, col=2)
-    fig.update_yaxes(showgrid=True, zeroline=False, title_text="Z (world)", row=2, col=2)
-    fig.update_layout(height=1000, margin=dict(l=40, r=40, t=60, b=60))
     return fig
 
 
@@ -379,6 +490,7 @@ def _build_table(fields: dict) -> tuple[list[dict], list[dict]]:
     return rows, columns
 
 
+
 def _build_app() -> dash.Dash:
     app = dash.Dash(__name__)
     n_cams = len(STATE["cameras"])
@@ -400,13 +512,13 @@ def _build_app() -> dash.Dash:
             ], style={"display": "inline-block", "marginRight": "16px"}),
             html.Div([
                 html.Label("w_norm"),
-                dcc.Dropdown(id="w-norm", value="none",
+                dcc.Dropdown(id="w-norm", value="sum",
                              options=[{"label": m, "value": m} for m in uc.NORM_MODES],
                              clearable=False, style={"width": "120px"}),
             ], style={"display": "inline-block", "marginRight": "16px"}),
             html.Div([
                 html.Label("c_norm"),
-                dcc.Dropdown(id="c-norm", value="max",
+                dcc.Dropdown(id="c-norm", value="sum",
                              options=[{"label": m, "value": m} for m in uc.NORM_MODES],
                              clearable=False, style={"width": "120px"}),
             ], style={"display": "inline-block", "marginRight": "16px"}),
@@ -417,33 +529,42 @@ def _build_app() -> dash.Dash:
             ], style={"display": "inline-block", "width": "260px", "verticalAlign": "top"}),
         ], style={"marginBottom": "12px"}),
         html.Div([
-            html.Label("Overlays"),
-            dcc.Checklist(
-                id="overlays",
-                options=[
-                    {"label": " tile utility",           "value": "utility"},
-                    {"label": " per-tile #GS",           "value": "ck"},
-                    {"label": " per-tile W_k",           "value": "wk"},
-                    {"label": " per-Gaussian density",   "value": "gs_density"},
-                    {"label": " tile visibility",        "value": "tiles_vis"},
-                ],
-                value=["utility", "ck", "wk", "gs_density", "tiles_vis"],
-                inline=True,
-            ),
+            html.Div([
+                html.Label("Overlays"),
+                dcc.Checklist(
+                    id="overlays",
+                    options=[
+                        {"label": " tile utility",           "value": "utility"},
+                        {"label": " per-tile #GS",           "value": "ck"},
+                        {"label": " per-tile W_k",           "value": "wk"},
+                        {"label": " per-Gaussian density",   "value": "gs_density"},
+                        {"label": " tile visibility",        "value": "tiles_vis"},
+                    ],
+                    value=["utility", "ck", "wk", "gs_density", "tiles_vis"],
+                    inline=True,
+                ),
+            ], style={"display": "inline-block", "verticalAlign": "top", "marginRight": "24px"}),
+            html.Div(id="status-text", style={
+                "display": "inline-block", "verticalAlign": "top",
+                "fontFamily": "monospace", "fontSize": "12px",
+                "backgroundColor": "#f5f5f5", "padding": "6px 12px",
+                "borderRadius": "4px", "lineHeight": "1.7",
+            }),
         ], style={"marginBottom": "8px"}),
         dcc.Graph(id="main-figure"),
         html.H4("Per-tile stats — sorted by utility ↓", style={"marginTop": "16px"}),
         dash_table.DataTable(
             id="tile-table",
-            style_table={"overflowX": "auto"},
+            style_table={"overflowX": "auto", "overflowY": "auto", "maxHeight": "480px"},
             style_cell={"textAlign": "right", "fontFamily": "monospace", "fontSize": "12px",
                         "padding": "4px 10px"},
-            style_header={"fontWeight": "bold", "textAlign": "center"},
+            style_header={"fontWeight": "bold", "textAlign": "center", "position": "sticky", "top": 0,
+                          "backgroundColor": "white", "zIndex": 1},
             style_data_conditional=[
                 {"if": {"filter_query": '{visible} = "yes"'},
                  "backgroundColor": "#fef9ec"},
             ],
-            page_size=30,
+            page_action="none",
         ),
     ])
 
@@ -451,6 +572,7 @@ def _build_app() -> dash.Dash:
         Output("main-figure", "figure"),
         Output("tile-table", "data"),
         Output("tile-table", "columns"),
+        Output("status-text", "children"),
         Input("camera-slider", "value"),
         Input("weight-mode", "value"),
         Input("w-norm", "value"),
@@ -464,7 +586,18 @@ def _build_app() -> dash.Dash:
         fig = _build_figure(cam, int(cam_idx), fields, weight_mode, w_norm, c_norm,
                             float(subsample), overlays or [])
         table_data, table_cols = _build_table(fields)
-        return fig, table_data, table_cols
+        u = fields["u"]
+        vis_np = fields["visibility"].cpu().numpy()
+        n_vis = int(vis_np.sum())
+        status_children = [
+            html.B(f"Cam {cam_idx}"), f"  {n_vis}/{len(vis_np)} tiles visible", html.Br(),
+            f"weight: {weight_mode}  w_norm: {w_norm}  c_norm: {c_norm}", html.Br(),
+            f"U   [{u.min():.3g}, {u.max():.3g}]", html.Br(),
+            f"W_k [{float(fields['W_k'].min()):.3g}, {float(fields['W_k'].max()):.3g}]", html.Br(),
+            f"C_k [{float(fields['C_k'].min()):.3g}, {float(fields['C_k'].max()):.3g}]", html.Br(),
+            f"#GS {len(STATE['gs_xyz'])}",
+        ]
+        return fig, table_data, table_cols, status_children
 
     return app
 

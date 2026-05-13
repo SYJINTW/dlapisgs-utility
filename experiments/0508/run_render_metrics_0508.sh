@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+EXP_NAME="0508_vd_weight_sweep"
 ROOT="/mnt/data1/samk/gs-quic/cs5262_tile_quic"
 SCRIPT_DIR="$ROOT/dlapisgs-utility/experiments"
 CONDA_ENV="${CONDA_ENV:-gaussian_splatting}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-$ROOT/dlapisgs-utility/output/0508_budget_sweep}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$ROOT/dlapisgs-utility/output/$EXP_NAME}"
 GT_PLY="${GT_PLY:-$ROOT/exp-dataset/bicycle/point_cloud.ply}"
 TRACE="${TRACE:-$ROOT/Frustum-for-3DGS/sample_data/camera_trace/trace1.json}"
 IMG_WIDTH="${IMG_WIDTH:-800}"
@@ -18,7 +19,6 @@ if [ ! -f "$GT_PLY" ]; then echo "ERROR: GT PLY not found: $GT_PLY"; exit 1; fi
 if [ ! -f "$TRACE" ];   then echo "ERROR: Trace not found: $TRACE";   exit 1; fi
 if [ ! -d "$OUTPUT_ROOT" ]; then
     echo "ERROR: Output root not found: $OUTPUT_ROOT"
-    echo "Run selection first: bash experiments/run_budget_sweep_0508.sh"
     exit 1
 fi
 
@@ -27,7 +27,7 @@ EXTRA_ARGS=""
 [ "$SAVE_RENDERS" = "1" ] && EXTRA_ARGS="$EXTRA_ARGS --render-dir $OUTPUT_ROOT/renders"
 
 echo "=========================================="
-echo "Render + Metrics — 0508 Budget Sweep"
+echo "Render + Metrics — $EXP_NAME"
 echo "=========================================="
 echo "Output root : $OUTPUT_ROOT"
 echo "GT PLY      : $GT_PLY"

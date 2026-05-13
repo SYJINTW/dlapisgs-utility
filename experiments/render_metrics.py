@@ -139,7 +139,9 @@ def main() -> None:
     del gt_gaussians
 
     # Iterate manifests
-    manifests = sorted(output_root.glob("**/selected.json"))
+    manifests = sorted((output_root / "ply").glob("**/camera_*.json")
+                       if (output_root / "ply").exists()
+                       else output_root.glob("**/selected.json"))
     logger.info("Found {} manifests under {}", len(manifests), output_root)
 
     rows: list[dict[str, Any]] = []
@@ -159,8 +161,8 @@ def main() -> None:
 
         if render_dir is not None:
             import torchvision
-            rel = selected_ply.parent.relative_to(output_root)
-            out_png = render_dir / rel.parent / f"{rel.name}.png"
+            rel = selected_ply.relative_to(output_root)
+            out_png = render_dir / rel.with_suffix(".png")
             out_png.parent.mkdir(parents=True, exist_ok=True)
             torchvision.utils.save_image(rendered, str(out_png))
 

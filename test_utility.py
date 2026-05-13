@@ -291,6 +291,10 @@ def main() -> None:
                              "volume: sigmoid(o)*det(Σ)^0.5 (true volume proxy s_x·s_y·s_z). "
                              "volume_over_d2: same / d^2. "
                              "screen_area: sigmoid(o)*π·sqrt(det(Σ_2D)) (true projected footprint).")
+    parser.add_argument("--tiling-cache", type=str, default=None,
+                        help="Shared tiling cache npz. If it exists, skip tiling and load from it; "
+                             "if it doesn't exist, compute tiling and save it there. "
+                             "Use across norm-sweep runs on the same PLY + grid shape.")
     args = parser.parse_args()
 
     if args.budgets_mb is not None:
@@ -344,16 +348,35 @@ def main() -> None:
     with _timed("ply_load", timings):
         gs = io_3dgs.GaussianModelV2(str(ply_path))
 
-    with _timed("tiling", timings):
-        tile_aabbs, tile_indices, scene_min, scene_max = ggsp_tiling.tiling_uniform_layered_gs(
-            [gs], grid_shape=tuple(args.grid_shape)
-        )
-        min_corners, max_corners, index_offsets, flat_indices, sorted_tile_keys = _build_tile_arrays(
-            tile_aabbs, tile_indices, layer_idx=0
-        )
-        min_corners_t = torch.tensor(min_corners, dtype=torch.float32, device=device)
-        max_corners_t = torch.tensor(max_corners, dtype=torch.float32, device=device)
-        tile_centers = (min_corners_t + max_corners_t) / 2.0
+    tiling_cache_path = Path(args.tiling_cache) if args.tiling_cache else None
+    tile_aabbs = tile_indices = None  # only set when computing fresh (needed for save_tiles_to_npz)
+
+    if tiling_cache_path is not None and tiling_cache_path.exists():
+        with _timed("tiling_cache_load", timings):
+            logger.info("tiling cache hit: {}", tiling_cache_path)
+            _tc = np.load(str(tiling_cache_path))
+            min_corners = _tc["min_corners"]
+            max_corners = _tc["max_corners"]
+            index_offsets = _tc["index_offsets"]
+            flat_indices = _tc["flat_indices"]
+    else:
+        with _timed("tiling", timings):
+            tile_aabbs, tile_indices, scene_min, scene_max = ggsp_tiling.tiling_uniform_layered_gs(
+                [gs], grid_shape=tuple(args.grid_shape)
+            )
+            min_corners, max_corners, index_offsets, flat_indices, _sorted_tile_keys = _build_tile_arrays(
+                tile_aabbs, tile_indices, layer_idx=0
+            )
+        if tiling_cache_path is not None:
+            tiling_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez(str(tiling_cache_path),
+                     min_corners=min_corners, max_corners=max_corners,
+                     index_offsets=index_offsets, flat_indices=flat_indices)
+            logger.info("tiling cache saved: {}", tiling_cache_path)
+
+    min_corners_t = torch.tensor(min_corners, dtype=torch.float32, device=device)
+    max_corners_t = torch.tensor(max_corners, dtype=torch.float32, device=device)
+    tile_centers = (min_corners_t + max_corners_t) / 2.0
 
     with _timed("camera_load", timings):
         cam_infos = visibility_AABB_pytorch.readCamerasFromTransforms(
@@ -388,14 +411,17 @@ def main() -> None:
     logger.info("tiles={} cameras={} selected_camera_indices={} bytes_per_gaussian={}",
                 len(index_offsets) - 1, len(cameras), camera_indices, bytes_per_gaussian)
 
-    # ---- tiling.npz: write once per run ----
-    with _timed("tile_npz", timings):
-        shared_tiling_npz = base_output_path / "tiling.npz"
-        shared_tiling_npz.parent.mkdir(parents=True, exist_ok=True)
-        ggsp_tiling.save_tiles_to_npz(
-            tile_aabbs, tile_indices, str(shared_tiling_npz),
-            grid_shape=tuple(args.grid_shape), scene_min=scene_min, scene_max=scene_max, layer_idx=0
-        )
+    # ---- tiling.npz: write once per run (skip when loaded from shared cache) ----
+    if tile_aabbs is not None:
+        with _timed("tile_npz", timings):
+            shared_tiling_npz = base_output_path / "tiling.npz"
+            shared_tiling_npz.parent.mkdir(parents=True, exist_ok=True)
+            ggsp_tiling.save_tiles_to_npz(
+                tile_aabbs, tile_indices, str(shared_tiling_npz),
+                grid_shape=tuple(args.grid_shape), scene_min=scene_min, scene_max=scene_max, layer_idx=0
+            )
+    else:
+        shared_tiling_npz = tiling_cache_path
 
     executor = ThreadPoolExecutor(max_workers=args.ply_workers)
 
@@ -448,7 +474,7 @@ def main() -> None:
         cam_w2v = cam.world_view_transform.cpu().numpy()
         cam_proj = cam.projection_matrix.cpu().numpy()
         cam_center_np = cam.camera_center.cpu().numpy()
-        meta_positions = [i for i, tk in enumerate(sorted_tile_keys) if len(tile_indices[tk][0]) > 0]
+        meta_positions = [i for i in range(len(index_offsets) - 1) if index_offsets[i + 1] - index_offsets[i] > 0]
         visibility_meta = np_visibility_all[meta_positions] if len(meta_positions) > 0 else np.zeros((0,), dtype=bool)
         tile_centers_np = tile_centers.cpu().numpy()
 

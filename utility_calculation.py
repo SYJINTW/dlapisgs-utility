@@ -46,7 +46,9 @@ def normalize_term(x, mode="none", eps=1e-12):
         span = hi - lo
         return (x - lo) / span if span > eps else torch.zeros_like(x)
     if mode == "log1p":
-        return torch.log1p(x)
+        lx = torch.log1p(x)
+        m = lx.max()
+        return lx / m if m > 0 else lx
     if mode == "sum":
         s = x.sum()
         return x / s if s > 0 else x

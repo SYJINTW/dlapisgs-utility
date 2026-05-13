@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Setup 1: tile-level selection with W_k / C_k normalization sweep.
 # Scheme fixed to vd_lod_w_c (full model) so we can see the W and C levers act.
-# Packing mode stays at tile_partial (the proposed method).
+# weight_mode=volume_over_d2 (sigmoid(o)*vol/d^2); packing=tile_strict for clean tile attribution.
 set -euo pipefail
 
 ROOT="/mnt/data1/samk/gs-quic/cs5262_tile_quic"
@@ -15,17 +15,18 @@ GRID_SHAPE="${GRID_SHAPE:-8 8 8}"
 NUM_LOD="${NUM_LOD:-1}"
 CAMERA_INDEX="${CAMERA_INDEX:--1}"
 SCHEMES=("vd_lod_w_c")
-PACKING_MODE="${PACKING_MODE:-tile_partial}"
+PACKING_MODE="${PACKING_MODE:-tile_strict}"
+WEIGHT_MODE="${WEIGHT_MODE:-volume_over_d2}"
 
-# Pairs of (w_norm, c_norm) to try. Tweak this list as we learn more.
+# Symmetric pairs only: both terms in [0,1] so neither dominates by scale.
+# none/max = 0508 baseline (W unbounded); none/none = fully unbounded reference.
 PAIRS=(
-    "none max"      # baseline (pre-0513 default)
-    "max max"
-    "minmax minmax"
-    "log1p max"
-    "sum max"
-    "log1p log1p"
-    "none none"
+    "none max"      # 0508 baseline: W unbounded, C in [0,1]
+    "none none"     # unbounded reference
+    "max max"       # [0,1] / [0,1]
+    "minmax minmax" # [0,1] / [0,1], zero-shifted
+    "log1p log1p"   # [0,1] / [0,1], log-compressed (fixed: log1p(x)/log1p(max))
+    "sum sum"       # probability mass per tile, sums to 1
 )
 
 echo "=========================================="
@@ -36,10 +37,12 @@ echo "Grid shape   : $GRID_SHAPE"
 echo "Budgets MB   : $BUDGET_LIST"
 echo "Schemes      : ${SCHEMES[*]}"
 echo "Packing mode : $PACKING_MODE"
+echo "Weight mode  : $WEIGHT_MODE"
 echo "Pairs        : ${#PAIRS[@]} (w_norm, c_norm) combos"
 echo "=========================================="
 
 mkdir -p "$OUT_BASE"
+TILING_CACHE="$OUT_BASE/shared_tiling_cache.npz"
 
 for pair in "${PAIRS[@]}"; do
     read -r W_NORM C_NORM <<< "$pair"
@@ -59,8 +62,8 @@ for pair in "${PAIRS[@]}"; do
         --num-lod "$NUM_LOD" \
         --camera-index "$CAMERA_INDEX" \
         --packing-mode "$PACKING_MODE" \
-        --weight-mode det_gamma_over_d2 \
-        --gamma 1.0 \
+        --weight-mode "$WEIGHT_MODE" \
+        --tiling-cache "$TILING_CACHE" \
         --w-norm "$W_NORM" \
         --c-norm "$C_NORM"
 done

@@ -4,15 +4,23 @@
 Runs as a Plotly Dash app. Launch on the server, port-forward, open in a
 local browser:
 
-    conda run -n gsquic python experiments/debug_viewer_app.py \\
-        --ply /path/to/point_cloud.ply \\
-        --camera-trace /path/to/trace.json \\
-        --grid-shape 4 4 4 \\
+    conda run -n gsquic python experiments/debug_viewer_app.py \
+        --ply /path/to/point_cloud.ply \
+        --camera-trace /path/to/trace.json \
+        --grid-shape 4 4 4 \
         --port 8050
 
     # then on your laptop:
     ssh -L 8050:localhost:8050 <server>
     # open http://localhost:8050
+    
+    example:
+    
+conda run -n gsquic python experiments/debug_viewer_app.py \
+        --ply /mnt/data1/samk/gs-quic/cs5262_tile_quic/exp-dataset/bicycle/point_cloud.ply \
+        --camera-trace /mnt/data1/samk/gs-quic/cs5262_tile_quic/Frustum-for-3DGS/sample_data/camera_trace/trace1.json\
+        --grid-shape 4 4 4 \
+        --port 8050 --debug
 
 Widgets:
   - Camera-index slider               -> change viewport
@@ -51,7 +59,7 @@ import io_3dgs  # type: ignore  # noqa: E402  # pyright: ignore[reportMissingImp
 import utility_calculation as uc  # noqa: E402
 
 import dash  # noqa: E402
-from dash import dcc, html, Input, Output  # noqa: E402
+from dash import dcc, html, Input, Output, dash_table  # noqa: E402
 import plotly.graph_objects as go  # noqa: E402
 from plotly.subplots import make_subplots  # noqa: E402
 
@@ -175,28 +183,30 @@ def _compute_per_camera(cam, weight_mode: str, w_norm: str, c_norm: str, gamma: 
         s["tile_index_offsets"], s["tile_flat_indices"], w_gi,
         w_norm=w_norm, c_norm=c_norm,
     )
-    # Also keep raw C_k for the #GS-per-tile heatmap.
     sizes = (s["tile_index_offsets"][1:] - s["tile_index_offsets"][:-1]).to(torch.float32)
+    base = (torch.where(visibility, 1.0, uc.INVISIBLE_PRIORITY_EPS)
+            / (distances + uc.DISTANCE_EPS))
+    u = (base * W_k * C_k).detach().cpu().numpy()
     return dict(
         distances=distances, visibility=visibility, w_gi=w_gi,
-        W_k=W_k, C_k=C_k, C_k_raw=sizes,
+        W_k=W_k, C_k=C_k, C_k_raw=sizes, u=u,
     )
 
 
-def _build_figure(cam, fields, weight_mode, w_norm, c_norm,
+def _build_figure(cam, cam_idx, fields, weight_mode, w_norm, c_norm,
                   subsample_frac: float, overlays: list[str], scheme: str = "vd_lod_w_c") -> go.Figure:
     s = STATE
     fig = make_subplots(
         rows=2, cols=3,
         subplot_titles=[
-            f"Tile utility ({scheme})",
-            "Per-tile #GS (raw C_k)",
-            f"Per-tile W_k (norm={w_norm})",
-            f"Per-GS density (subsample, w_gi via {weight_mode})",
-            "Tiles in NDC (visibility-coloured)",
+            f"Tile utility U (scheme={scheme})",
+            "Per-tile #GS (raw count)",
+            f"Per-tile W_k (w_norm={w_norm})",
+            f"Per-GS weight density (subsampled, {weight_mode})",
+            "Scene overview — tile centers in world XZ (★=camera)",
             "Status",
         ],
-        horizontal_spacing=0.06, vertical_spacing=0.10,
+        horizontal_spacing=0.14, vertical_spacing=0.22,
     )
 
     wv = cam.world_view_transform.detach().cpu().numpy()
@@ -206,23 +216,14 @@ def _build_figure(cam, fields, weight_mode, w_norm, c_norm,
     ndc_tiles, tiles_in_front = _project_points(tile_centers, wv, pj)
     vis_np = fields["visibility"].detach().cpu().numpy()
 
+    u = fields["u"]
+
     # ---- panel (0,0): tile utility ----
     if "utility" in overlays:
-        utilities = uc.calculate_utility_param(
-            fields["visibility"], fields["distances"], num_of_level=1,
-            weight_sum_tensor=fields["W_k"], complexity_tensor=fields["C_k"],
-            include_lod=True, include_w=True, include_c=True,
-        )
-        # `utilities` is (N,2) of (tile_idx, lod=0) sorted desc — recover scalar utility.
-        # Easier: recompute the scalar directly.
-        base = (torch.where(fields["visibility"], 1.0, uc.INVISIBLE_PRIORITY_EPS)
-                / (fields["distances"] + uc.DISTANCE_EPS))
-        u = (base * fields["W_k"] * fields["C_k"]).detach().cpu().numpy()
-        del utilities
         fig.add_trace(
             go.Scatter(
                 x=ndc_tiles[:, 0], y=ndc_tiles[:, 1], mode="markers",
-                marker=dict(size=12, color=u, colorscale="Viridis",
+                marker=dict(size=18, color=u, colorscale="Viridis",
                             colorbar=dict(title="U", x=0.30, y=0.80, len=0.40)),
                 text=[f"tile {i}: U={ui:.3g}" for i, ui in enumerate(u)],
                 hoverinfo="text",
@@ -236,7 +237,7 @@ def _build_figure(cam, fields, weight_mode, w_norm, c_norm,
         fig.add_trace(
             go.Scatter(
                 x=ndc_tiles[:, 0], y=ndc_tiles[:, 1], mode="markers",
-                marker=dict(size=12, color=c_raw, colorscale="Cividis",
+                marker=dict(size=18, color=c_raw, colorscale="Cividis",
                             colorbar=dict(title="#GS", x=0.64, y=0.80, len=0.40)),
                 text=[f"tile {i}: {int(c)} GS" for i, c in enumerate(c_raw)],
                 hoverinfo="text",
@@ -250,7 +251,7 @@ def _build_figure(cam, fields, weight_mode, w_norm, c_norm,
         fig.add_trace(
             go.Scatter(
                 x=ndc_tiles[:, 0], y=ndc_tiles[:, 1], mode="markers",
-                marker=dict(size=12, color=w_np, colorscale="Magma",
+                marker=dict(size=18, color=w_np, colorscale="Magma",
                             colorbar=dict(title="W_k", x=0.99, y=0.80, len=0.40)),
                 text=[f"tile {i}: W_k={wi:.3g}" for i, wi in enumerate(w_np)],
                 hoverinfo="text",
@@ -279,15 +280,35 @@ def _build_figure(cam, fields, weight_mode, w_norm, c_norm,
             ), row=2, col=1,
         )
 
-    # ---- panel (1,1): tiles in NDC, colored by visibility ----
+    # ---- panel (1,1): bird's-eye scene overview in world XZ ----
     if "tiles_vis" in overlays:
-        colors = np.where(vis_np, 1.0, 0.0)
+        tile_centers_np = s["tile_centers"].detach().cpu().numpy()
+        cam_center_np = cam.camera_center.detach().cpu().numpy()
+        gs_counts_np = fields["C_k_raw"].detach().cpu().numpy()
+        marker_colors = ["#e74c3c" if v else "#aaaaaa" for v in vis_np]
+        marker_sizes = 10 + 20 * (gs_counts_np / gs_counts_np.max().clip(min=1))
         fig.add_trace(
             go.Scatter(
-                x=ndc_tiles[:, 0], y=ndc_tiles[:, 1], mode="markers",
-                marker=dict(size=10, color=colors, colorscale=[[0, "lightgray"], [1, "crimson"]],
-                            showscale=False),
-                text=[f"tile {i}: vis={bool(v)}" for i, v in enumerate(vis_np)],
+                x=tile_centers_np[:, 0], y=tile_centers_np[:, 2],
+                mode="markers+text",
+                marker=dict(size=marker_sizes, color=marker_colors, opacity=0.85,
+                            line=dict(color="white", width=1)),
+                text=[str(i) for i in range(len(tile_centers_np))],
+                textposition="top center",
+                textfont=dict(size=8, color="black"),
+                hovertext=[f"tile {i}  vis={bool(vis_np[i])}  U={u[i]:.3g}  #GS={int(gs_counts_np[i])}"
+                           for i in range(len(tile_centers_np))],
+                hoverinfo="text",
+                showlegend=False,
+            ), row=2, col=2,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[cam_center_np[0]], y=[cam_center_np[2]],
+                mode="markers",
+                marker=dict(symbol="star", size=22, color="gold",
+                            line=dict(color="black", width=1)),
+                hovertext=f"camera ({cam_center_np[0]:.1f}, {cam_center_np[1]:.1f}, {cam_center_np[2]:.1f})",
                 hoverinfo="text",
                 showlegend=False,
             ), row=2, col=2,
@@ -296,11 +317,12 @@ def _build_figure(cam, fields, weight_mode, w_norm, c_norm,
     # ---- panel (1,2): status ----
     n_vis_tiles = int(vis_np.sum())
     status = (
-        f"<b>Camera</b>: index in trace<br>"
+        f"<b>Camera</b>: {cam_idx}<br>"
         f"<b>Visible tiles</b>: {n_vis_tiles} / {len(vis_np)}<br>"
         f"<b>w_norm</b>: {w_norm}<br>"
         f"<b>c_norm</b>: {c_norm}<br>"
         f"<b>weight_mode</b>: {weight_mode}<br>"
+        f"<b>U range</b>: [{u.min():.3g}, {u.max():.3g}]<br>"
         f"<b>W_k range</b>: [{float(fields['W_k'].min()):.3g}, {float(fields['W_k'].max()):.3g}]<br>"
         f"<b>C_k range</b>: [{float(fields['C_k'].min()):.3g}, {float(fields['C_k'].max()):.3g}]<br>"
         f"<b>#GS total</b>: {len(s['gs_xyz'])}"
@@ -310,10 +332,51 @@ def _build_figure(cam, fields, weight_mode, w_norm, c_norm,
                              showlegend=False, hoverinfo="skip"),
                   row=2, col=3)
 
-    fig.update_xaxes(range=[-1.1, 1.1], showgrid=False, zeroline=False)
-    fig.update_yaxes(range=[-1.1, 1.1], showgrid=False, zeroline=False, scaleanchor="x", scaleratio=1)
-    fig.update_layout(height=820, margin=dict(l=20, r=20, t=50, b=20))
+    # NDC panels: fixed [-1.1, 1.1] range
+    for r, c in [(1, 1), (1, 2), (1, 3), (2, 1), (2, 3)]:
+        fig.update_xaxes(range=[-1.1, 1.1], showgrid=False, zeroline=False, row=r, col=c)
+        fig.update_yaxes(range=[-1.1, 1.1], showgrid=False, zeroline=False, row=r, col=c)
+    # Bird's-eye panel (2,2): world coords, let Plotly auto-range
+    fig.update_xaxes(showgrid=True, zeroline=False, title_text="X (world)", row=2, col=2)
+    fig.update_yaxes(showgrid=True, zeroline=False, title_text="Z (world)", row=2, col=2)
+    fig.update_layout(height=1000, margin=dict(l=40, r=40, t=60, b=60))
     return fig
+
+
+def _build_table(fields: dict) -> tuple[list[dict], list[dict]]:
+    """Build per-tile stats table sorted by utility descending."""
+    s = STATE
+    sizes = (s["tile_index_offsets"][1:] - s["tile_index_offsets"][:-1]).cpu().numpy()
+    vis_np = fields["visibility"].cpu().numpy()
+    dist_np = fields["distances"].cpu().numpy()
+    w_np = fields["W_k"].cpu().numpy()
+    c_np = fields["C_k"].cpu().numpy()
+    u_np = fields["u"]
+    order = np.argsort(u_np)[::-1]
+    rows = [
+        {
+            "rank": int(rank + 1),
+            "tile": int(i),
+            "visible": "yes" if vis_np[i] else "no",
+            "dist": f"{dist_np[i]:.2f}",
+            "gs": int(sizes[i]),
+            "W_k": f"{w_np[i]:.4f}",
+            "C_k": f"{c_np[i]:.4f}",
+            "U": f"{u_np[i]:.4g}",
+        }
+        for rank, i in enumerate(order)
+    ]
+    columns = [
+        {"name": "Rank", "id": "rank"},
+        {"name": "Tile", "id": "tile"},
+        {"name": "Visible", "id": "visible"},
+        {"name": "Dist", "id": "dist"},
+        {"name": "#GS", "id": "gs"},
+        {"name": "W_k", "id": "W_k"},
+        {"name": "C_k", "id": "C_k"},
+        {"name": "U", "id": "U"},
+    ]
+    return rows, columns
 
 
 def _build_app() -> dash.Dash:
@@ -369,10 +432,25 @@ def _build_app() -> dash.Dash:
             ),
         ], style={"marginBottom": "8px"}),
         dcc.Graph(id="main-figure"),
+        html.H4("Per-tile stats — sorted by utility ↓", style={"marginTop": "16px"}),
+        dash_table.DataTable(
+            id="tile-table",
+            style_table={"overflowX": "auto"},
+            style_cell={"textAlign": "right", "fontFamily": "monospace", "fontSize": "12px",
+                        "padding": "4px 10px"},
+            style_header={"fontWeight": "bold", "textAlign": "center"},
+            style_data_conditional=[
+                {"if": {"filter_query": '{visible} = "yes"'},
+                 "backgroundColor": "#fef9ec"},
+            ],
+            page_size=30,
+        ),
     ])
 
     @app.callback(
         Output("main-figure", "figure"),
+        Output("tile-table", "data"),
+        Output("tile-table", "columns"),
         Input("camera-slider", "value"),
         Input("weight-mode", "value"),
         Input("w-norm", "value"),
@@ -383,8 +461,10 @@ def _build_app() -> dash.Dash:
     def update(cam_idx, weight_mode, w_norm, c_norm, subsample, overlays):
         cam = STATE["cameras"][int(cam_idx)]
         fields = _compute_per_camera(cam, weight_mode, w_norm, c_norm)
-        return _build_figure(cam, fields, weight_mode, w_norm, c_norm,
-                             float(subsample), overlays or [])
+        fig = _build_figure(cam, int(cam_idx), fields, weight_mode, w_norm, c_norm,
+                            float(subsample), overlays or [])
+        table_data, table_cols = _build_table(fields)
+        return fig, table_data, table_cols
 
     return app
 
@@ -405,8 +485,8 @@ def main() -> None:
     _load_state(Path(args.ply), Path(args.camera_trace), tuple(args.grid_shape),
                 args.img_w, args.img_h, device)
     app = _build_app()
-    logger.info("Serving on http://{}:{} (ssh -L {0}:localhost:{0} to forward)",
-                args.host, args.port)
+    logger.info("Serving on http://{host}:{port} — forward: ssh -L {port}:localhost:{port} <server>",
+                host=args.host, port=args.port)
     app.run(host=args.host, port=args.port, debug=args.debug)
 
 

@@ -121,6 +121,19 @@ def _build_camera(frame: dict, width: int, height: int):
     return load_camera_from_streaming_config(frame, width=width, height=height)
 
 
+def _infer_scene(gt_ply: Path) -> str:
+    """Infer scene name from PLY path.
+
+    Handles two layouts in this repo:
+      - <root>/<scene>/point_cloud.ply                                          (mipnerf360)
+      - <root>/<scene>/checkpoint/point_cloud/iteration_NNNNN/point_cloud.ply   (nerf synthetic)
+    """
+    parts = gt_ply.resolve().parts
+    if "checkpoint" in parts:
+        return parts[parts.index("checkpoint") - 1]
+    return gt_ply.resolve().parent.name
+
+
 def _compute_metrics(rendered: torch.Tensor, gt: torch.Tensor) -> dict[str, float]:
     r, g = rendered.unsqueeze(0), gt.unsqueeze(0)
     return {
@@ -142,7 +155,10 @@ def main() -> None:
     parser.add_argument("--sh-degree", type=int, default=3)
     parser.add_argument("--white-bg",  action="store_true")
     parser.add_argument("--render-dir", default=None,
-                        help="Where to save GT and per-selection PNG renders (optional)")
+                        help="Where to save per-selection PNG renders (optional)")
+    parser.add_argument("--scene", default=None,
+                        help="Scene name tag emitted into summary.csv. "
+                             "Defaults to gt-ply's parent directory name.")
     args = parser.parse_args()
 
     output_root = Path(args.output_root)
@@ -150,6 +166,9 @@ def main() -> None:
     trace_path  = Path(args.trace)
     metrics_dir = output_root / "metrics"
     metrics_dir.mkdir(parents=True, exist_ok=True)
+    gt_render_dir = output_root / "gt_renders"
+    gt_render_dir.mkdir(parents=True, exist_ok=True)
+    scene_tag = args.scene or _infer_scene(gt_ply)
 
     logger.remove()
     logger.add(sys.stdout, level="INFO")
@@ -175,22 +194,24 @@ def main() -> None:
         gt_gaussians = GaussianModel(args.sh_degree)
         gt_gaussians.load_ply(str(gt_ply))
         gt_gs_res = torch.ones(len(gt_gaussians.get_xyz), device="cuda")
+    import torchvision
     bg = [1, 1, 1] if args.white_bg else [0, 0, 0]
     gt_renders: list[torch.Tensor] = []
     with _timed("gt_render_all", timings, n=len(cameras)):
         with torch.no_grad():
             for idx, cam in enumerate(cameras):
+                gt_persistent_path = gt_render_dir / f"camera_{idx:03d}.png"
+                if gt_persistent_path.exists():
+                    frame_tensor = torchvision.io.read_image(str(gt_persistent_path)).float().cuda() / 255.0
+                    gt_renders.append(frame_tensor)
+                    continue
                 bg_color = torch.tensor(bg, dtype=torch.float32, device="cuda").view(3, 1, 1)
                 bg_color = bg_color.expand(3, cam.image_height, cam.image_width)
                 bg_depth = torch.zeros(1, cam.image_height, cam.image_width, device="cuda")
                 result = render(cam, gt_gaussians, PIPELINE, bg_color, bg_depth, gs_res=gt_gs_res)
                 frame_tensor = result["render"].clamp(0.0, 1.0)
                 gt_renders.append(frame_tensor)
-                if render_dir is not None:
-                    import torchvision
-                    gt_frame_path = render_dir / "ground_truth" / f"{idx:05d}.png"
-                    gt_frame_path.parent.mkdir(parents=True, exist_ok=True)
-                    torchvision.utils.save_image(frame_tensor, str(gt_frame_path))
+                torchvision.utils.save_image(frame_tensor, str(gt_persistent_path))
     logger.success("GT rendered: {} frames", len(gt_renders))
     del gt_gaussians
 
@@ -221,7 +242,6 @@ def main() -> None:
             m = _compute_metrics(rendered, gt_renders[cam_idx])
 
         if render_dir is not None:
-            import torchvision
             rel = selected_ply.relative_to(output_root)
             out_png = render_dir / rel.with_suffix(".png")
             out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -229,6 +249,7 @@ def main() -> None:
                 torchvision.utils.save_image(rendered, str(out_png))
 
         row: dict[str, Any] = {
+            "scene":              scene_tag,
             "budget_mb":          budget_mb,
             "scheme":             scheme,
             "camera_index":       cam_idx,

@@ -66,6 +66,34 @@ For paper figures, point `plotting/paper_plot_metrics.ipynb`'s `SUMMARY_CSV` at 
 
 ---
 
+## Trace visualization
+
+`experiments/visualize_trace_views.py` renders the 100 cameras as a 3D scatter + forward-direction arrows, overlaid on either tile AABBs (if `--tiling-npz` provided) or a single scene AABB (`--ply`). Reuses `headless_visualize_tiles.draw_aabb`/`set_axes_equal` from `dlapisgs-tiling`.
+
+```bash
+# bicycle — falls back to scene-AABB from PLY
+python experiments/visualize_trace_views.py \
+    --trace ../exp-dataset/bicycle/sparse_views_100.json \
+    --ply   ../exp-dataset/bicycle/point_cloud.ply \
+    --out   plotting/traces/bicycle_views.png
+
+# hotdog — uses the tiling.npz dropped by Exp1 smoke (shows all 274 tile AABBs as context)
+python experiments/visualize_trace_views.py \
+    --trace ../exp-dataset/hotdog/checkpoint/point_cloud/iteration_30000/sparse_views_100.json \
+    --tiling-npz output/0514/exp1_gs_weight/hotdog/volume_over_d2/tiling.npz \
+    --out plotting/traces/hotdog_views.png
+
+# ship — no tiling cache yet, fall back to PLY AABB
+python experiments/visualize_trace_views.py \
+    --trace ../exp-dataset/ship/checkpoint/point_cloud/iteration_30000/sparse_views_100.json \
+    --ply   ../exp-dataset/ship/checkpoint/point_cloud/iteration_30000/point_cloud.ply \
+    --out   plotting/traces/ship_views.png
+```
+
+Already rendered: `plotting/traces/{bicycle,hotdog,ship}_views.png`.
+
+---
+
 ## Side note on the new traces
 
 The three already-generated `sparse_views_100.json` files don't carry the new `generation` metadata block (created before that change, and you asked not to touch them). Any future regenerations will include `generated_at`, hostname, full args, scene AABB, acceptance rate, FoV — all in a `generation` field that downstream readers ignore (only `camera_angle_x` + `frames` are consumed).

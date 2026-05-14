@@ -24,7 +24,7 @@ CONDA_ENV="${CONDA_ENV:-gsquic}"               # selection (test_utility.py)
 RENDER_ENV="${RENDER_ENV:-gaussian_splatting}" # rasterization (render_metrics.py + downstream)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
-SCENES="${SCENES:-bicycle hotdog ship}"
+SCENES="${SCENES:-hotdog ship bicycle}"
 BUDGET_PCTS="${BUDGET_PCTS:-10 25 40 55 70 85 100}"
 WEIGHT_MODES="${WEIGHT_MODES:-volume volume_over_d2 screen_area}"
 GRID_SHAPE="${GRID_SHAPE:-8 8 8}"

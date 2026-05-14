@@ -121,6 +121,11 @@ def _build_camera(frame: dict, width: int, height: int):
     return load_camera_from_streaming_config(frame, width=width, height=height)
 
 
+def _budget_tag(budget_mb: float) -> str:
+    """Matches test_utility.py's on-disk budget directory naming."""
+    return f"{budget_mb:g}".replace(".", "p") + "mb"
+
+
 def _infer_scene(gt_ply: Path) -> str:
     """Infer scene name from PLY path.
 
@@ -265,7 +270,7 @@ def main() -> None:
         }
         rows.append(row)
 
-        budget_tag = f"budget_{int(budget_mb)}mb"
+        budget_tag = f"budget_{_budget_tag(budget_mb)}"
         per_json_dir = metrics_dir / budget_tag / scheme
         per_json_dir.mkdir(parents=True, exist_ok=True)
         (per_json_dir / f"camera_{cam_idx:03d}.json").write_text(

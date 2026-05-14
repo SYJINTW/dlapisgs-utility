@@ -20,7 +20,8 @@ ROOT="/mnt/data1/samk/gs-quic/cs5262_tile_quic"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UTIL_DIR="$ROOT/dlapisgs-utility"
 
-CONDA_ENV="${CONDA_ENV:-gsquic}"
+CONDA_ENV="${CONDA_ENV:-gsquic}"               # selection (test_utility.py)
+RENDER_ENV="${RENDER_ENV:-gaussian_splatting}" # rasterization (render_metrics.py + downstream)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
 SCENES="${SCENES:-bicycle hotdog ship}"
@@ -130,7 +131,7 @@ for scene in $SCENES; do
         fi
 
         # Render + metrics for this (scene, weight_mode) cell
-        conda run -n "$CONDA_ENV" python "$UTIL_DIR/experiments/render_metrics.py" \
+        conda run -n "$RENDER_ENV" python "$UTIL_DIR/experiments/render_metrics.py" \
             --output-root "$OUT_DIR" \
             --gt-ply "$PLY" \
             --trace "$TRACE" \

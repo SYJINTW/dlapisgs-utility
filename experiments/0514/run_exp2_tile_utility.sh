@@ -18,6 +18,7 @@ ROOT="/mnt/data1/samk/gs-quic/cs5262_tile_quic"
 UTIL_DIR="$ROOT/dlapisgs-utility"
 
 CONDA_ENV="${CONDA_ENV:-gsquic}"
+RENDER_ENV="${RENDER_ENV:-gaussian_splatting}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
 
 SCENE="${SCENE:-bicycle}"
@@ -90,7 +91,7 @@ for wm in $WEIGHT_MODES; do
 
     if [[ "${DRY_RUN:-0}" == "1" || "${SKIP_RENDER:-0}" == "1" ]]; then continue; fi
 
-    conda run -n "$CONDA_ENV" python "$UTIL_DIR/experiments/render_metrics.py" \
+    conda run -n "$RENDER_ENV" python "$UTIL_DIR/experiments/render_metrics.py" \
         --output-root "$OUT_DIR" \
         --gt-ply "$PLY" \
         --trace "$TRACE" \

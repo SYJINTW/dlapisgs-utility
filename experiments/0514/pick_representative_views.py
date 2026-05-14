@@ -27,6 +27,11 @@ import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 
 
+def _budget_tag(budget_mb: float) -> str:
+    """Matches test_utility.py's on-disk budget directory naming."""
+    return f"{budget_mb:g}".replace(".", "p") + "mb"
+
+
 def _imshow_or_blank(ax, path: Path, title: str) -> None:
     if path.exists():
         ax.imshow(mpimg.imread(str(path)))
@@ -68,7 +73,7 @@ def main() -> None:
         median = cell_rows[len(cell_rows) // 2]
         best   = cell_rows[-1]
 
-        budget_tag = f"budget_{int(budget_mb)}mb"
+        budget_tag = f"budget_{_budget_tag(budget_mb)}"
         fig, axes = plt.subplots(3, 2, figsize=(8.0, 11.0))
         fig.suptitle(f"{scene}  {args.group_by}={group_val}  {budget_tag}", fontsize=12)
 

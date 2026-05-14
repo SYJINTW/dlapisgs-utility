@@ -19,8 +19,10 @@ readCamerasFromTransforms() then flips Y/Z to COLMAP for downstream use.
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import json
 import math
+import socket
 from pathlib import Path
 
 import numpy as np
@@ -187,6 +189,25 @@ def main() -> None:
     args.out.write_text(json.dumps({
         "camera_angle_x": fov_x,
         "frames": frames,
+        "generation": {
+            "generated_at": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "hostname": socket.gethostname(),
+            "script": str(Path(__file__).resolve()),
+            "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+            "scene_aabb": {
+                "centroid": center.tolist(),
+                "radius": radius,
+                "subsample_n": int(len(xyz)),
+            },
+            "stats": {
+                "proposals": proposals,
+                "accepted": accepted,
+                "accept_rate": accept_rate,
+                "image_size": [args.width, args.height],
+                "fov_x_rad": fov_x,
+                "fov_y_rad": fov_y,
+            },
+        },
     }, indent=2))
     print(f"[gen_sparse_views] wrote {args.out}")
 

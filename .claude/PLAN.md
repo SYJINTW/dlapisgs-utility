@@ -1,5 +1,45 @@
 # Research Plan
 
+## Status: 2026-05-14 — 0514 sweep scaffolded (Exp 1 GS-weight × 3 scenes; Exp 2 tile-utility × 2 weight modes)
+
+New artifacts (implemented this session):
+
+- `experiments/gen_sparse_views.py` — generates 100-view Blender-format trace alongside each PLY, with frustum-based void rejection (min subsampled-Gaussian visibility threshold).
+- `experiments/0514/run_exp1_gs_weight.sh` — Exp 1: progressive packing × {volume, volume_over_d2, screen_area} on bicycle/hotdog/ship at 10/25/40/55/70/85/100 % budget tiers (default `CUDA_VISIBLE_DEVICES=2`).
+- `experiments/0514/run_exp2_tile_utility.sh` — Exp 2: bicycle only, `tile_strict` packing, two sub-sweeps (weight-mode ∈ {volume_over_d2, screen_area}) × 4 schemes × 7 budgets (default `CUDA_VISIBLE_DEVICES=3`).
+- `experiments/0514/pick_representative_views.py` — symlinks worst / median / best PSNR cameras per cell (+ GT counterpart) into `<output_root>/representative/`.
+- `experiments/aggregate_timings.py` — turns the per-stage `timings.json`/`render_timings.json` into a readable `timings_summary.csv` with mean / std / 95 % CI / p50 / p95 / total and a `_per_camera_e2e` row.
+- `experiments/render_metrics.py` edits: emits a persistent `<output_root>/gt_renders/camera_NNN.png` (idempotent, reused on rerun) and adds a `scene` column to `summary.csv`.
+
+Run order:
+
+```bash
+# Phase B — generate per-scene traces (CPU only, ~minutes)
+python experiments/gen_sparse_views.py --ply exp-dataset/bicycle/point_cloud.ply \
+    --scene-type mipnerf360 --n-views 100 \
+    --out exp-dataset/bicycle/sparse_views_100.json
+python experiments/gen_sparse_views.py --ply exp-dataset/hotdog/checkpoint/point_cloud/iteration_30000/point_cloud.ply \
+    --scene-type synthetic --n-views 100 \
+    --out exp-dataset/hotdog/checkpoint/point_cloud/iteration_30000/sparse_views_100.json
+python experiments/gen_sparse_views.py --ply exp-dataset/ship/checkpoint/point_cloud/iteration_30000/point_cloud.ply \
+    --scene-type synthetic --n-views 100 \
+    --out exp-dataset/ship/checkpoint/point_cloud/iteration_30000/sparse_views_100.json
+
+# Phase B' — dry-run to verify dir layout
+DRY_RUN=1 bash experiments/0514/run_exp1_gs_weight.sh
+DRY_RUN=1 bash experiments/0514/run_exp2_tile_utility.sh
+
+# Phase C — smoke (one camera, smallest budget)
+CAMERA_INDEX=0 BUDGET_PCTS=10 bash experiments/0514/run_exp1_gs_weight.sh
+CAMERA_INDEX=0 BUDGET_PCTS=10 bash experiments/0514/run_exp2_tile_utility.sh
+
+# Phase D — full sweep, parallel
+CUDA_VISIBLE_DEVICES=2 bash experiments/0514/run_exp1_gs_weight.sh
+CUDA_VISIBLE_DEVICES=3 bash experiments/0514/run_exp2_tile_utility.sh
+```
+
+---
+
 ## Status: 2026-05-13 — instrumentation + Setup 1/2 plumbing landed; DX pass (tqdm, vectorized tile weights)
 
 The 0513 push wired up per-stage timing, machine-readable run metadata, a Plotly Dash debug viewer, three packing modes, four weight modes, and W/C normalization knobs. Smoke-tested across all combinations. Ready for the bigger sweeps and the math-design iteration that prompted this work.

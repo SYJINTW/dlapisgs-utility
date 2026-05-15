@@ -57,12 +57,17 @@ def _aggregate(rows: list[dict], group_by: str) -> dict[str, dict[float, dict]]:
         for budget_mb, entries in budgets.items():
             psnr_vals = np.array([float(e["psnr"]) for e in entries])
             ssim_vals = np.array([float(e["ssim"]) for e in entries])
+            n = len(entries)
+            # 95% CI on the mean: ±1.96·σ/√n. Tight when n is large; this is the
+            # right bar for "is method A's mean above method B's mean?"
+            # std would answer "how variable is a single camera?" — not what we want.
+            ci = 1.96 / max(np.sqrt(n), 1.0)
             result[key][budget_mb] = {
                 "psnr_mean": float(psnr_vals.mean()),
-                "psnr_std":  float(psnr_vals.std()),
+                "psnr_ci95": float(psnr_vals.std(ddof=1) * ci) if n > 1 else 0.0,
                 "ssim_mean": float(ssim_vals.mean()),
-                "ssim_std":  float(ssim_vals.std()),
-                "n":         len(entries),
+                "ssim_ci95": float(ssim_vals.std(ddof=1) * ci) if n > 1 else 0.0,
+                "n":         n,
             }
     return result
 
@@ -91,7 +96,7 @@ def _plot(agg: dict[str, dict[float, dict]], order: list[str], labels: dict[str,
         pts = sorted(agg[key].items())
         x   = [p[0] for p in pts]
         y   = [p[1][f"{metric}_mean"] for p in pts]
-        err = [p[1][f"{metric}_std"]  for p in pts]
+        err = [p[1][f"{metric}_ci95"] for p in pts]
         ax.errorbar(x, y, yerr=err, marker=marker, color=color,
                     linewidth=1.8, markersize=6, capsize=3,
                     label=labels.get(key, key))
@@ -136,11 +141,11 @@ def main() -> None:
     n_groups = len([k for k in order if k in agg])
 
     _plot(agg, order, labels, "psnr", "PSNR (dB)",
-          f"PSNR vs Budget — {n_groups} {args.group_by}s (mean ± std, {n_views} views){suffix}",
+          f"PSNR vs Budget — {n_groups} {args.group_by}s (mean ± 95% CI, {n_views} views){suffix}",
           out_dir / "psnr_vs_budget.png")
 
     _plot(agg, order, labels, "ssim", "SSIM",
-          f"SSIM vs Budget — {n_groups} {args.group_by}s (mean ± std, {n_views} views){suffix}",
+          f"SSIM vs Budget — {n_groups} {args.group_by}s (mean ± 95% CI, {n_views} views){suffix}",
           out_dir / "ssim_vs_budget.png")
 
 

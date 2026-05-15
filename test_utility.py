@@ -156,25 +156,34 @@ def _budget_tag(budget_mb: float) -> str:
 
 def _greedy_order_progressive(visibility_tile, tile_index_offsets, tile_flat_indices,
                               w_gi, bytes_per_gaussian, max_budget_bytes):
-    """Mode `progressive`: flatten visible-tile GS, sort by w_gi, trim to budget.
+    """Mode `progressive`: visible-tile GS first (sorted by w_gi), then invisible.
 
-    `visibility_tile` is a length-num_tiles bool tensor. Returns a numpy int64
-    array of Gaussian indices in priority order, same shape as the other
-    packers' outputs.
+    Two-pass selection: visible-tile Gaussians always outrank invisible-tile
+    Gaussians, but if budget remains after the visible pool is drained, the
+    invisible pool fills it (sorted by w_gi descending). Multiplicative ε
+    softening doesn't work here because w(g_i) spans ~30 orders of magnitude
+    (see output/0513_histogram_bicycle/*.png) — a two-tier sort is the only
+    numerically clean way to guarantee identity at byte_budget ≥ scene_size.
     """
     max_count = max_budget_bytes // bytes_per_gaussian
     device = w_gi.device
     vis = visibility_tile.to(device=device, dtype=torch.bool)
     sizes = tile_index_offsets[1:] - tile_index_offsets[:-1]
     per_gs_vis = torch.repeat_interleave(vis, sizes)
-    if per_gs_vis.numel() == 0 or not per_gs_vis.any():
+    if per_gs_vis.numel() == 0:
         return np.empty(0, dtype=np.int64)
+
     visible_gs = tile_flat_indices[per_gs_vis]
-    visible_w = w_gi[visible_gs]
-    order = torch.argsort(visible_w, descending=True)
-    ordered = visible_gs[order]
-    take = int(min(ordered.numel(), max_count))
-    return ordered[:take].detach().cpu().numpy().astype(np.int64, copy=False)
+    visible_sorted = visible_gs[torch.argsort(w_gi[visible_gs], descending=True)]
+
+    if visible_sorted.numel() >= max_count:
+        return visible_sorted[:max_count].detach().cpu().numpy().astype(np.int64, copy=False)
+
+    invisible_gs = tile_flat_indices[~per_gs_vis]
+    invisible_sorted = invisible_gs[torch.argsort(w_gi[invisible_gs], descending=True)]
+    remaining = max_count - int(visible_sorted.numel())
+    ordered = torch.cat([visible_sorted, invisible_sorted[:remaining]])
+    return ordered.detach().cpu().numpy().astype(np.int64, copy=False)
 
 
 def _greedy_order_tile_strict(order_pairs, tile_index_offsets, tile_flat_indices,

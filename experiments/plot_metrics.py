@@ -57,6 +57,7 @@ def _aggregate(rows: list[dict], group_by: str) -> dict[str, dict[float, dict]]:
         for budget_mb, entries in budgets.items():
             psnr_vals = np.array([float(e["psnr"]) for e in entries])
             ssim_vals = np.array([float(e["ssim"]) for e in entries])
+            ngs_vals  = np.array([float(e.get("selected_gaussians", 0)) for e in entries])
             n = len(entries)
             # 95% CI on the mean: ±1.96·σ/√n. Tight when n is large; this is the
             # right bar for "is method A's mean above method B's mean?"
@@ -67,6 +68,8 @@ def _aggregate(rows: list[dict], group_by: str) -> dict[str, dict[float, dict]]:
                 "psnr_ci95": float(psnr_vals.std(ddof=1) * ci) if n > 1 else 0.0,
                 "ssim_mean": float(ssim_vals.mean()),
                 "ssim_ci95": float(ssim_vals.std(ddof=1) * ci) if n > 1 else 0.0,
+                "ngs_mean":  float(ngs_vals.mean()),
+                "ngs_ci95":  float(ngs_vals.std(ddof=1) * ci) if n > 1 else 0.0,
                 "n":         n,
             }
     return result
@@ -88,7 +91,9 @@ def _resolve_order_and_labels(agg: dict, group_by: str) -> tuple[list[str], dict
 
 
 def _plot(agg: dict[str, dict[float, dict]], order: list[str], labels: dict[str, str],
-          metric: str, ylabel: str, title: str, out_path: Path) -> None:
+          metric: str, ylabel: str, title: str, out_path: Path,
+          hline: tuple[float, str] | None = None) -> None:
+    """Generic group-keyed line plot with optional horizontal reference line."""
     fig, ax = plt.subplots(figsize=(8.5, 5.2))
     for key, marker, color in zip(order, MARKERS, COLORS):
         if key not in agg:
@@ -104,11 +109,10 @@ def _plot(agg: dict[str, dict[float, dict]], order: list[str], labels: dict[str,
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_title(title, fontsize=13)
     ax.grid(alpha=0.25)
-    # Saturation guide for PSNR plots only: 60 dB ⇒ MSE < 10⁻⁶ ⇒ visually identical
-    # even before 8-bit PNG quantization (which itself sits around 48 dB).
-    if metric == "psnr":
-        ax.axhline(60.0, color="gray", linestyle=":", linewidth=1.2, zorder=0)
-        ax.text(ax.get_xlim()[1], 60.0, " saturated (≥60 dB)",
+    if hline is not None:
+        y_ref, hlabel = hline
+        ax.axhline(y_ref, color="gray", linestyle=":", linewidth=1.2, zorder=0)
+        ax.text(ax.get_xlim()[1], y_ref, f" {hlabel}",
                 fontsize=9, color="gray", va="bottom", ha="right")
     ax.legend(fontsize=10)
     fig.tight_layout()
@@ -146,9 +150,23 @@ def main() -> None:
     suffix  = f" — {args.title_suffix}" if args.title_suffix else ""
     n_groups = len([k for k in order if k in agg])
 
+    # Scene-N reference for the gaussian-count plot: max selected_gaussians observed
+    # across the whole CSV. Reaches true N only when at least one (group, budget)
+    # cell saturates (i.e. budget >= scene size). Otherwise it's a lower bound.
+    scene_n_gs = max(
+        (v["ngs_mean"] for s in agg.values() for v in s.values()),
+        default=0.0,
+    )
+
     _plot(agg, order, labels, "psnr", "PSNR (dB)",
           f"PSNR vs Budget — {n_groups} {args.group_by}s (mean ± 95% CI, {n_views} views){suffix}",
-          out_dir / "psnr_vs_budget.png")
+          out_dir / "psnr_vs_budget.png",
+          hline=(60.0, "saturated (≥60 dB)"))
+
+    _plot(agg, order, labels, "ngs", "# selected Gaussians",
+          f"# Gaussians vs Budget — {n_groups} {args.group_by}s (mean ± 95% CI, {n_views} views){suffix}",
+          out_dir / "ngs_vs_budget.png",
+          hline=(scene_n_gs, f"full scene (≈{int(scene_n_gs):,} GS)") if scene_n_gs > 0 else None)
 
     _plot(agg, order, labels, "ssim", "SSIM",
           f"SSIM vs Budget — {n_groups} {args.group_by}s (mean ± 95% CI, {n_views} views){suffix}",

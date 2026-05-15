@@ -30,10 +30,11 @@ Both auto-trigger `render_metrics.py --delete-ply` per cell, so PLYs are removed
 | ↳ hotdog (small) | ≈ 17 min |
 | ↳ ship (mid) | ≈ 35 min |
 | ↳ bicycle (large) + 3× tiling setup | ≈ 5.5 h |
-| **Exp 2** total | **≈ 14 h** |
-| ↳ bicycle × 2 weight modes × 4 schemes × 7 budgets × 100 cams | ≈ 14 h (tiling cached after run 1) |
+| **Exp 2** total | **≈ 14.8 h** |
+| ↳ hotdog × 2 weight modes × 4 schemes × 7 budgets × 100 cams | ≈ 47 min |
+| ↳ bicycle × 2 weight modes × 4 schemes × 7 budgets × 100 cams | ≈ 14 h |
 
-Exp 2 can be halved by dropping one weight mode: `WEIGHT_MODES="volume_over_d2" bash …`.
+Exp 2 can be halved by dropping one weight mode: `WEIGHT_MODES="volume_over_d2" bash …`. Hotdog runs first so the cheap synthetic baseline lands early — bicycle results trail by ~14 h.
 
 ### Peak disk estimate (with `--delete-ply` default-on)
 

@@ -36,6 +36,10 @@ OUT_BASE="${OUTPUT_ROOT:-$UTIL_DIR/output/0514/exp1_gs_weight}"
 DRY_RUN_FLAG=""
 [[ "${DRY_RUN:-0}" == "1" ]] && DRY_RUN_FLAG="--dry-run"
 
+# Default ON: disk peak otherwise hits ~500GB/cell on bicycle. Override KEEP_PLY=1 to retain.
+DELETE_PLY_FLAG="--delete-ply"
+[[ "${KEEP_PLY:-0}" == "1" ]] && DELETE_PLY_FLAG=""
+
 # Per-scene config: (PLY path, full-size MB, scene-type for view generator).
 scene_ply() {
     case "$1" in
@@ -136,7 +140,8 @@ for scene in $SCENES; do
             --gt-ply "$PLY" \
             --trace "$TRACE" \
             --scene "$scene" \
-            --render-dir "$OUT_DIR/renders"
+            --render-dir "$OUT_DIR/renders" \
+            $DELETE_PLY_FLAG
 
         # Timing aggregate
         conda run -n "$CONDA_ENV" python "$UTIL_DIR/experiments/aggregate_timings.py" \

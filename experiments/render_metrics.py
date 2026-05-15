@@ -8,6 +8,18 @@ Strategy:
   - For each selected.json manifest under --output-root, render its
     selected.ply at only the matching camera_index and compare to GT.
   - Write per-(budget, scheme, camera) JSON and a combined summary CSV.
+
+Re-rendering a single (view, budget) on demand:
+  Selection PLYs follow a predictable layout
+    <output_root>/ply/budget_<MB>mb/<scheme>/camera_<NNN>.ply
+  so a one-off inspection takes <5 s with:
+    conda run -n gaussian_splatting python experiments/render_metrics.py \\
+      --output-root <cell> --gt-ply <full.ply> --trace <trace.json> \\
+      --render-dir <cell>/renders
+  scoped to whichever single manifest you point it at. With --delete-ply
+  the source PLYs are removed after first render, so to re-inspect after a
+  sweep, regenerate just the target (camera, budget) cell via test_utility.py
+  with --camera-index N --budgets-mb B (fast; one camera × one budget).
 """
 from __future__ import annotations
 
@@ -161,6 +173,11 @@ def main() -> None:
     parser.add_argument("--white-bg",  action="store_true")
     parser.add_argument("--render-dir", default=None,
                         help="Where to save per-selection PNG renders (optional)")
+    parser.add_argument("--delete-ply", action="store_true",
+                        help="Unlink each selected.ply right after its render+metrics row "
+                             "is written. Cuts peak disk by ~99%% on large sweeps. "
+                             "Re-inspect a (camera, budget) by re-running test_utility.py "
+                             "with --camera-index N --budgets-mb B (a few seconds).")
     parser.add_argument("--scene", default=None,
                         help="Scene name tag emitted into summary.csv. "
                              "Defaults to gt-ply's parent directory name.")
@@ -278,6 +295,13 @@ def main() -> None:
         )
         logger.success("[{}/{}/camera_{:03d}]  PSNR={:.2f}  SSIM={:.4f}",
                        budget_tag, scheme, cam_idx, m["psnr"], m["ssim"])
+
+        if args.delete_ply:
+            try:
+                selected_ply.unlink()
+                manifest_path.unlink()
+            except OSError as e:
+                logger.warning("delete-ply failed for {}: {}", selected_ply, e)
 
     if not rows:
         logger.error("No metric rows collected — did test_utility.py run first?")

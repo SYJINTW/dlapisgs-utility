@@ -37,6 +37,10 @@ OUT_BASE="${OUTPUT_ROOT:-$UTIL_DIR/output/0514/exp2_tile_utility}"
 DRY_RUN_FLAG=""
 [[ "${DRY_RUN:-0}" == "1" ]] && DRY_RUN_FLAG="--dry-run"
 
+# Default ON: bicycle PLYs are huge. Override KEEP_PLY=1 to retain.
+DELETE_PLY_FLAG="--delete-ply"
+[[ "${KEEP_PLY:-0}" == "1" ]] && DELETE_PLY_FLAG=""
+
 # Convert percentages to absolute MB
 BUDGETS=""
 for p in $BUDGET_PCTS; do
@@ -96,7 +100,8 @@ for wm in $WEIGHT_MODES; do
         --gt-ply "$PLY" \
         --trace "$TRACE" \
         --scene "$SCENE" \
-        --render-dir "$OUT_DIR/renders"
+        --render-dir "$OUT_DIR/renders" \
+        $DELETE_PLY_FLAG
 
     conda run -n "$CONDA_ENV" python "$UTIL_DIR/experiments/aggregate_timings.py" \
         --output-root "$OUT_DIR" || true

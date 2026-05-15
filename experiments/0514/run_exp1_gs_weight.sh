@@ -40,7 +40,8 @@ DRY_RUN_FLAG=""
 DELETE_PLY_FLAG="--delete-ply"
 [[ "${KEEP_PLY:-0}" == "1" ]] && DELETE_PLY_FLAG=""
 
-# Per-scene config: (PLY path, full-size MB, scene-type for view generator).
+# Per-scene config: PLY path only. Absolute budget MB is resolved inside
+# test_utility.py from N * bytes_per_gaussian (see --budget-pct).
 scene_ply() {
     case "$1" in
         bicycle) echo "$ROOT/exp-dataset/bicycle/point_cloud.ply" ;;
@@ -49,30 +50,9 @@ scene_ply() {
         *) echo "" ;;
     esac
 }
-scene_full_mb() {
-    case "$1" in
-        bicycle) echo 1418.8 ;;
-        hotdog)  echo 35.2 ;;
-        ship)    echo 76.9 ;;
-        *) echo 0 ;;
-    esac
-}
 scene_trace() {
     local ply; ply="$(scene_ply "$1")"
     echo "$(dirname "$ply")/sparse_views_100.json"
-}
-
-budget_list_for_scene() {
-    local full="$1"
-    local pcts="$2"
-    local out=""
-    for p in $pcts; do
-        # bash math is integer only — use python for the multiply
-        local mb
-        mb=$(python -c "print(f'{$full * $p / 100:.1f}')")
-        out="$out $mb"
-    done
-    echo "$out"
 }
 
 echo "=========================================="
@@ -92,7 +72,6 @@ mkdir -p "$OUT_BASE"
 
 for scene in $SCENES; do
     PLY="$(scene_ply "$scene")"
-    FULL_MB="$(scene_full_mb "$scene")"
     TRACE="$(scene_trace "$scene")"
 
     if [[ -z "$PLY" || ! -f "$PLY" ]]; then
@@ -102,7 +81,6 @@ for scene in $SCENES; do
         echo "[skip] $scene: trace not found at $TRACE  (run gen_sparse_views.py first)"; continue
     fi
 
-    BUDGETS="$(budget_list_for_scene "$FULL_MB" "$BUDGET_PCTS")"
     TILING_CACHE="$OUT_BASE/$scene/.tiling_cache.npz"
     mkdir -p "$(dirname "$TILING_CACHE")"
 
@@ -110,7 +88,7 @@ for scene in $SCENES; do
         TAG="$wm"
         OUT_DIR="$OUT_BASE/$scene/$TAG"
         echo ""
-        echo "---- [$scene] weight_mode=$wm  budgets=[$BUDGETS] ----"
+        echo "---- [$scene] weight_mode=$wm  budget_pcts=[$BUDGET_PCTS] ----"
         echo "     OUT_DIR=$OUT_DIR"
         mkdir -p "$OUT_DIR"
 
@@ -119,7 +97,7 @@ for scene in $SCENES; do
             --output-root "$OUT_DIR" \
             --camera-trace "$TRACE" \
             --grid-shape $GRID_SHAPE \
-            --budgets-mb $BUDGETS \
+            --budget-pct $BUDGET_PCTS \
             --schemes "$SCHEME" \
             --num-lod "$NUM_LOD" \
             --camera-index "$CAMERA_INDEX" \

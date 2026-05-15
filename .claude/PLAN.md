@@ -1,5 +1,23 @@
 # Research Plan
 
+## Status: 2026-05-15 — 0514 sweep restarted on a clean slate after three correctness fixes
+
+The first 0514 run on 2026-05-14 died mid-sweep at cam 31 (disk full) with only hotdog + ship (Exp 1) and a partial bicycle/volume completed. While investigating, three issues surfaced — all now patched. `output/0514/` was wiped to ~3 TB free; the rerun uses the patched code.
+
+**0515 patches (all landed):**
+
+1. **Two-pass `progressive` packer.** Old `_greedy_order_progressive` hard-masked invisible-tile Gaussians, capping selection at the visible-tile pool. So "100 % byte budget" never reached identity — we observed a 70 dB ceiling on hotdog. Fix is a two-tier sort: visible-tile GS sorted by w_gi, then (if budget remains) invisible-tile GS sorted by w_gi. Guarantees identity at byte_budget ≥ scene_size; mid-budget behavior unchanged (invisible never beats visible). Multiplicative ε softening was ruled out — `w(g_i)` spans ~30 orders of magnitude on bicycle (see `output/0513_histogram_bicycle/*.png`), no ε partitions cleanly. (`test_utility.py:_greedy_order_progressive`)
+2. **`--budget-pct` flag.** Replaces hand-coded per-scene MB tables in both wrappers. Inside `test_utility.py`, percentages resolve against `N * bytes_per_gaussian` (exact full-scene byte size, not the rounded one-decimal MB number we previously baked into the wrappers). So `--budget-pct 100` strictly satisfies `max_count = N` and saturation is exact. Wrappers no longer carry `scene_full_mb()` tables.
+3. **`render_metrics.py --delete-ply`.** Unlinks each `selected.ply` (and its sibling manifest) immediately after the metrics row is written. Default-on in both 0514 wrappers (override with `KEEP_PLY=1`). Without this, bicycle alone hit 511 GB per (scene, weight_mode) cell. With it, peak PLY disk is at most one camera × #budgets in flight (a few GB).
+
+**Other plotter/methodology cleanups:**
+
+- `experiments/plot_metrics.py` now plots **95 % CI on the mean** (`±1.96·σ/√n`, ddof=1), not `±std`. With n=100 cameras, CI bars are ~20× tighter than the old std bars; method-vs-method differences become visually unambiguous.
+- PSNR plots gain a dotted **60 dB saturation guide** (MSE < 10⁻⁶ ⇒ visually identical even before 8-bit PNG quantization at ≈48 dB). Use this, not SSIM, as the saturation criterion. SSIM hits 1.0000 well before identity.
+- Discovered: tile AABBs in GGSP are pure grid-cell boxes on Gaussian *centers* — no footprint inflation. So a Gaussian whose center is in a culled tile but whose splat extends into view will leak. This is why the old `progressive` packer's hard mask broke identity. The two-pass fix routes around it at the candidate-pool level; we explicitly chose not to inflate AABBs (would defeat directional culling — see chat 2026-05-15 for the rationale).
+
+**Pre-fix Exp 1 results (hotdog + ship, kept as a reference)** — `screen_area` dominated every non-saturated budget on both scenes by 1.6–5.4 PSNR over `volume_over_d2` and 3.6–7.5 over `volume`. The ranking is expected to be preserved post-fix (the second pass only fires near saturation; mid-budget signal is unaffected). Bicycle was not in the dataset and is the most informative scene — that's the headline value of the rerun.
+
 ## Status: 2026-05-14 — 0514 sweep scaffolded (Exp 1 GS-weight × 3 scenes; Exp 2 tile-utility × 2 weight modes)
 
 New artifacts (implemented this session):

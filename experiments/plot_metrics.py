@@ -104,6 +104,12 @@ def _plot(agg: dict[str, dict[float, dict]], order: list[str], labels: dict[str,
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_title(title, fontsize=13)
     ax.grid(alpha=0.25)
+    # Saturation guide for PSNR plots only: 60 dB ⇒ MSE < 10⁻⁶ ⇒ visually identical
+    # even before 8-bit PNG quantization (which itself sits around 48 dB).
+    if metric == "psnr":
+        ax.axhline(60.0, color="gray", linestyle=":", linewidth=1.2, zorder=0)
+        ax.text(ax.get_xlim()[1], 60.0, " saturated (≥60 dB)",
+                fontsize=9, color="gray", va="bottom", ha="right")
     ax.legend(fontsize=10)
     fig.tight_layout()
     fig.savefig(out_path, dpi=220)

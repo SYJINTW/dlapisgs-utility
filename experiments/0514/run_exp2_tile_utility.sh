@@ -23,7 +23,6 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
 
 SCENE="${SCENE:-bicycle}"
 PLY="${PLY:-$ROOT/exp-dataset/bicycle/point_cloud.ply}"
-FULL_MB="${FULL_MB:-1418.8}"
 TRACE="${TRACE:-$(dirname "$PLY")/sparse_views_100.json}"
 
 BUDGET_PCTS="${BUDGET_PCTS:-10 25 40 55 70 85 100}"
@@ -41,13 +40,6 @@ DRY_RUN_FLAG=""
 DELETE_PLY_FLAG="--delete-ply"
 [[ "${KEEP_PLY:-0}" == "1" ]] && DELETE_PLY_FLAG=""
 
-# Convert percentages to absolute MB
-BUDGETS=""
-for p in $BUDGET_PCTS; do
-    mb=$(python -c "print(f'{$FULL_MB * $p / 100:.1f}')")
-    BUDGETS="$BUDGETS $mb"
-done
-
 echo "=========================================="
 echo "0514 Exp 2 — Tile utility sweep (bicycle, tile_strict)"
 echo "=========================================="
@@ -55,7 +47,7 @@ echo "OUTPUT_ROOT   : $OUT_BASE"
 echo "SCENE         : $SCENE"
 echo "PLY           : $PLY"
 echo "TRACE         : $TRACE"
-echo "BUDGETS_MB    :$BUDGETS"
+echo "BUDGET_PCTS   :$BUDGET_PCTS"
 echo "SCHEMES       : $SCHEMES_LIST"
 echo "WEIGHT_MODES  : $WEIGHT_MODES"
 echo "GRID_SHAPE    : $GRID_SHAPE"
@@ -74,7 +66,7 @@ for wm in $WEIGHT_MODES; do
     TAG="$wm"
     OUT_DIR="$OUT_BASE/$TAG"
     echo ""
-    echo "---- weight_mode=$wm  schemes=[$SCHEMES_LIST]  budgets=[$BUDGETS] ----"
+    echo "---- weight_mode=$wm  schemes=[$SCHEMES_LIST]  budget_pcts=[$BUDGET_PCTS] ----"
     mkdir -p "$OUT_DIR"
 
     conda run -n "$CONDA_ENV" python "$UTIL_DIR/test_utility.py" \
@@ -82,7 +74,7 @@ for wm in $WEIGHT_MODES; do
         --output-root "$OUT_DIR" \
         --camera-trace "$TRACE" \
         --grid-shape $GRID_SHAPE \
-        --budgets-mb $BUDGETS \
+        --budget-pct $BUDGET_PCTS \
         --schemes $SCHEMES_LIST \
         --num-lod "$NUM_LOD" \
         --camera-index "$CAMERA_INDEX" \

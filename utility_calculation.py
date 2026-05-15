@@ -82,7 +82,7 @@ def calculate_utility_baseline(visibility_mask_tensor, tile_distances_tensor):
 
 # Our method with configurable factors and LOD consideration
 def calculate_utility_param(
-    visibility_mask_tensor, # [TODO] change to probability in [0,1] later
+    visibility_mask_tensor, # [TODO] change to probability in [0,1] later if using predicted visibility
     tile_distances_tensor,
     num_of_level,
     weight_sum_tensor=None,

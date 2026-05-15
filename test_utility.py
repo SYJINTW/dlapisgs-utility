@@ -21,13 +21,6 @@ Output layout (--output-root mode):
   ├── camera_viz/{NNN}.npz
   └── ply/budget_{B}mb/{scheme}/camera_{NNN}.ply + .json
 
-
-[TODO]
-- test utility scoring scheme
-- test scheduler without GS-level or without Tile-level vs. Ours Full
-(pure progressive vs. pure adaptive vs. our two-level design)
-
-
 """
 
 
@@ -267,6 +260,9 @@ def main() -> None:
                         help="Single byte budget in MB (legacy; use --budgets-mb for sweeps)")
     parser.add_argument("--budgets-mb", nargs="+", type=float, default=None,
                         help="One or more budgets in MB; overrides --budget-mb")
+    parser.add_argument("--budget-pct", nargs="+", type=float, default=None,
+                        help="One or more budgets as percent of full-scene size "
+                             "(N * bytes_per_gaussian). 100 → exact identity at saturation.")
     parser.add_argument("--num-lod", type=int, default=1,
                         help="Number of LOD layers (1 means plain 3DGS)")
     parser.add_argument("--scheme", type=str, default=None, choices=VALID_SCHEMES,
@@ -285,10 +281,10 @@ def main() -> None:
                         help="Write PLY in ASCII instead of binary (larger, human-readable)")
     parser.add_argument("--ply-workers", type=int, default=PLY_WORKERS,
                         help="Thread pool size for concurrent PLY writes")
-    parser.add_argument("--w-norm", type=str, default="none", choices=list(uc.NORM_MODES),
-                        help="Normalization for W_k (tile aggregate weight). Default: none (legacy).")
-    parser.add_argument("--c-norm", type=str, default="max", choices=list(uc.NORM_MODES),
-                        help="Normalization for C_k (tile complexity). Default: max (legacy).")
+    parser.add_argument("--w-norm", type=str, default="sum", choices=list(uc.NORM_MODES),
+                        help="Normalization for W_k (tile aggregate weight). Default: sum.")
+    parser.add_argument("--c-norm", type=str, default="sum", choices=list(uc.NORM_MODES),
+                        help="Normalization for C_k (tile complexity). Default: sum.")
     parser.add_argument("--packing-mode", type=str, default="tile_partial",
                         choices=["tile_partial", "tile_strict", "progressive"],
                         help="tile_partial (proposed, default): tile-greedy + partial last tile. "
@@ -310,12 +306,16 @@ def main() -> None:
                              "No GPU work or disk writes. Shows [x] for outputs that already exist.")
     args = parser.parse_args()
 
-    if args.budgets_mb is not None:
+    # budget_list is resolved later once we know bytes_per_gaussian and N (for --budget-pct).
+    # For --budgets-mb / --budget-mb we can resolve now.
+    if args.budget_pct is not None:
+        budget_list = None  # deferred; computed after GS load
+    elif args.budgets_mb is not None:
         budget_list = sorted(args.budgets_mb)
     elif args.budget_mb is not None:
         budget_list = [args.budget_mb]
     else:
-        raise ValueError("Either --budgets-mb or --budget-mb must be provided")
+        raise ValueError("One of --budget-pct, --budgets-mb, --budget-mb must be provided")
 
     if args.schemes is not None:
         for s in args.schemes:
@@ -347,10 +347,23 @@ def main() -> None:
     logger.add(str(log_path), level="INFO")
     logger.info("device={} ply_workers={}", device, args.ply_workers)
     logger.info("ply={} output={} trace={}", ply_path, base_output_path, camera_trace)
-    logger.info("grid_shape={} budgets_mb={} num_lod={} schemes={}",
-                args.grid_shape, budget_list, args.num_lod, scheme_list)
+    logger.info("grid_shape={} budgets_mb={} budget_pct={} num_lod={} schemes={}",
+                args.grid_shape, budget_list, args.budget_pct, args.num_lod, scheme_list)
     logger.info("w_norm={} c_norm={} packing_mode={} weight_mode={}",
                 args.w_norm, args.c_norm, args.packing_mode, args.weight_mode)
+
+    # If --budget-pct, resolve to MB by loading PLY (cheap; needed for paths even in dry-run).
+    if budget_list is None:
+        _gs_for_budget = io_3dgs.GaussianModelV2(str(ply_path))
+        _bpg = _bytes_per_gaussian(_gs_for_budget)
+        _n = len(_gs_for_budget.data["x"]["data"])
+        _full_bytes = _bpg * _n
+        budget_list = sorted(
+            (p / 100.0) * _full_bytes / (1024 * 1024) for p in args.budget_pct
+        )
+        logger.info("budget_pct={} resolved -> budgets_mb={} (full={} B, N={}, bpg={})",
+                    args.budget_pct, [f"{b:.4f}" for b in budget_list], _full_bytes, _n, _bpg)
+        del _gs_for_budget
 
     # ---- Dry-run: print job matrix and exit (no GPU work, no disk writes) ----
     if args.dry_run:

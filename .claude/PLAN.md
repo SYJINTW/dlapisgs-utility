@@ -1,5 +1,68 @@
 # Research Plan
 
+## Next session — analyze 0514 rerun, scope Exp 3 / Exp 4
+
+Sweeps launched on GPUs 2 (Exp 1) and 3 (Exp 2; now hotdog + bicycle, smallest first). When they finish, the next session should:
+
+### 1. Look at the results
+
+- `output/0514/exp1_gs_weight/<scene>/plots/{psnr,ngs,ssim}_vs_budget.png` — grouped by `weight_mode`. Confirm bicycle reproduces or modifies the hotdog/ship finding (`screen_area` > `volume_over_d2` > `volume`). The `ngs_vs_budget.png` line should sit on or near the budget line for all three modes (progressive packing → ~100 % byte-utilization).
+- `output/0514/exp2_tile_utility/<scene>/<weight_mode>/plots/{psnr,ngs,ssim}_vs_budget.png` — grouped by `scheme`. Watch for: (a) does `vd_lod_w_c` beat `vd_lod` (do W_k + C_k earn their keep at the tile level?); (b) does the ngs curve drop below budget for `tile_strict` (waste due to dropped overflowing tiles)?
+
+### 2. Possibly refine the hypothesis
+
+The pre-fix Exp 1 results suggested `screen_area` is the right per-Gaussian weight. If bicycle confirms this, lock it as default; if bicycle contradicts (real-world scenes have very different σ distributions vs synthetic), reopen the choice. Either way, the `det_gamma_over_d2` legacy mode should be retired from future sweeps.
+
+### 3. Exp 3 — packing-mode ablation (scaffold next session)
+
+Compare `progressive` vs `tile_partial` vs `tile_strict` head-to-head with all other factors fixed at the best Exp 1/2 setting. Headline plot: `ngs_vs_budget.png` grouped by `packing_mode` — `tile_strict` will visibly leave bytes on the table at small-mid budgets, the other two will saturate. PSNR is the corroborating metric.
+
+```
+fixed:  scheme=vd_lod_w_c, weight_mode=<winner of Exp 1>, w_norm=sum, c_norm=sum
+sweep:  packing_mode ∈ {progressive, tile_partial, tile_strict} × 7 budgets × 100 cams
+scenes: bicycle (primary), hotdog (cheap synthetic baseline)
+ETA:    ≈ 5.3 h bicycle + 17 min hotdog = ≈ 5.5 h
+```
+
+### 4. Exp 4 — non-greedy selection (the knapsack question)
+
+The user's analysis is right:
+
+- **GS level** (`progressive`): uniform cost (`bytes_per_gaussian` per Gaussian) → 0-1 knapsack with uniform costs → greedy by w_gi is optimal. Nothing to test here.
+- **Tile level** (`tile_partial`/`tile_strict`): heterogeneous cost (`#GS_in_tile × bytes_per_gaussian`) and heterogeneous value (U_k) → genuine 0-1 knapsack. Greedy by U_k is **not** optimal; greedy by `U_k / cost_k` (marginal utility per byte) is optimal for the LP relaxation and within 2× of integer optimal. Worth testing as `tile_partial_density` / `tile_strict_density` variants. Beyond that:
+  - **DP**: exact 0-1 knapsack on the (~hundreds of tiles, ~thousands of buckets) instance is cheap (~ms per camera). Gives the true ceiling.
+  - **LP relaxation**: gives an upper bound on achievable U; gap to DP tells you how slack the integer constraint is in practice.
+  - **Random-restart baseline**: sanity floor.
+
+#### The deeper concern: how do we know tile-utility is sensibly designed when its evaluation is entangled with the packer?
+
+Yes, this conflation is real. Two ways to decouple, both worth doing:
+
+(a) **Hold packing constant, sweep utility**: fix packer to optimal (DP), sweep tile-utility formulas. Measures: how close is the chosen subset to argmax-over-all-subsets-by-PSNR? If even with optimal packing the utility formula doesn't track PSNR, the formula is the problem.
+
+(b) **Hold utility constant, sweep packing**: replace U_k with an **oracle** built by ablation rendering — for each tile, measure the actual ΔPSNR it contributes by rendering with/without it. Then sweep packers. Measures: given perfect tile values, how much PSNR does the greedy packer lose vs. DP? If gap is small, packer is fine and the design effort belongs on the utility formula; if gap is large, the design effort belongs on the packer.
+
+Oracle ΔPSNR rendering is expensive (one extra render per tile per camera, ~512 × 100 = 51k extra renders for bicycle) but worth doing on a 10-camera subset first to estimate.
+
+#### LOD note
+
+Greedy marginal-utility = LP-knapsack optimal only when items are independent. With LOD layers ≥ 2, picking layer ℓ of tile k makes layers < ℓ partially redundant (or required-precursor, depending on encoding). That introduces precedence constraints → it's no longer a vanilla knapsack but a more constrained selection problem (closer to a "tree-knapsack" with precedence). For LOD=1 there are no precedence constraints; that's the right setting to validate the knapsack hypothesis cleanly before re-enabling LOD.
+
+### 5. Packet overhead in the cost model — defer
+
+Your back-of-envelope is right: MTU ≈ 1500 B, IP+UDP+QUIC overhead ≈ 50 B, payload ≈ 1450 B. GS = 248 B as written (236 B if nx/ny/nz are stripped — they're unused by the 3DGS rasterizer and are a free ~5 % bandwidth win; file this as a backlog item). 1450 / 248 = 5.85 → 5 GS/packet at ~83 % packet utilization, OR 6 GS spanning two packets. Pick one convention and stick with it.
+
+For now, selection-side cost stays `N × bytes_per_gaussian` and the packet overhead is tracked separately at the streaming layer (factor ≈ 1.03–1.20 depending on packing convention). Building it into the knapsack now would couple two independent design questions; defer to the QUIC streaming experiments.
+
+### 6. Backlog from these analyses
+
+- [ ] Strip nx/ny/nz from emitted PLYs — ~5 % free bandwidth win, no quality impact.
+- [ ] Retire `det_gamma_over_d2` weight mode from sweeps and CLI default if bicycle confirms `screen_area` is the winner.
+- [ ] If Exp 3 shows `tile_strict` materially under-utilizes the budget but loses negligible PSNR vs `tile_partial`, that's an argument for `tile_partial` as default; if it costs PSNR too, that's an argument for fixing the packer (Exp 4 territory).
+- [ ] If Exp 4's oracle-ΔPSNR experiment shows DP ≪ greedy gap is small → packer is fine, double down on utility formula design.
+
+---
+
 ## Status: 2026-05-15 — 0514 sweep restarted on a clean slate after three correctness fixes
 
 The first 0514 run on 2026-05-14 died mid-sweep at cam 31 (disk full) with only hotdog + ship (Exp 1) and a partial bicycle/volume completed. While investigating, three issues surfaced — all now patched. `output/0514/` was wiped to ~3 TB free; the rerun uses the patched code.

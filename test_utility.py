@@ -235,6 +235,17 @@ def _greedy_order(order_pairs, tile_index_offsets, tile_flat_indices, w_gi, byte
 def _select_at_budget(all_ordered, budget_bytes, bytes_per_gaussian):
     count = budget_bytes // bytes_per_gaussian
     selected = all_ordered[:count]
+    # Sort ascending to enforce source-PLY order in the output PLY. This is a
+    # *reproducibility* policy, not a transport-ordering decision:
+    # diff_gaussian_rasterization_lapisgs is order-sensitive (depth-sort
+    # tie-breaking + non-associative alpha blending), so two PLYs with the same
+    # gaussian SET in different orders render to slightly different pixels.
+    # Without this sort, the inf-rate at 100% budget varied by scheme on hotdog
+    # (vd_lod 28/100, vd_lod_w 23, vd_lod_c 22, vd_lod_w_c 21) and mid-budget
+    # cross-scheme PSNR mixed "set chosen" with "ordering noise". Sorting source-
+    # ascending decouples those signals. Selection rank-order is preserved inside
+    # _greedy_order_* for any consumer (priority streaming, logging) that needs it.
+    selected = np.sort(selected)
     return selected, len(selected) * bytes_per_gaussian
 
 

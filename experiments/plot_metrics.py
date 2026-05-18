@@ -39,6 +39,12 @@ _WEIGHT_MODE_LABELS = {
 MARKERS = ["s", "^", "D", "o", "v", "P"]
 COLORS  = ["#4878CF", "#6ACC65", "#D65F5F", "#B47CC7", "#FF8C00", "#00CED1"]
 
+# Clamp ceiling for per-camera PSNR. The rasterizer can hit MSE=0 → PSNR=inf
+# (byte-identical to GT). One inf in `psnr_vals` poisons the mean and matplotlib
+# silently drops inf y-values from line plots, so we clamp pre-mean. 60 dB
+# matches the existing saturation guide drawn at hline=(60, "saturated (≥60 dB)").
+PSNR_SATURATION_DB = 60.0
+
 
 def _read_csv(path: Path) -> list[dict]:
     with path.open(newline="") as f:
@@ -55,7 +61,10 @@ def _aggregate(rows: list[dict], group_by: str) -> dict[str, dict[float, dict]]:
     for key, budgets in buckets.items():
         result[key] = {}
         for budget_mb, entries in budgets.items():
-            psnr_vals = np.array([float(e["psnr"]) for e in entries])
+            psnr_vals = np.minimum(
+                np.array([float(e["psnr"]) for e in entries]),
+                PSNR_SATURATION_DB,
+            )
             ssim_vals = np.array([float(e["ssim"]) for e in entries])
             ngs_vals  = np.array([float(e.get("selected_gaussians", 0)) for e in entries])
             n = len(entries)
@@ -109,6 +118,12 @@ def _plot(agg: dict[str, dict[float, dict]], order: list[str], labels: dict[str,
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_title(title, fontsize=13)
     ax.grid(alpha=0.25)
+    xmax = max(
+        (p[0] for key in order if key in agg for p in agg[key].items()),
+        default=None,
+    )
+    if xmax is not None:
+        ax.set_xlim(right=xmax * 1.05)
     if hline is not None:
         y_ref, hlabel = hline
         ax.axhline(y_ref, color="gray", linestyle=":", linewidth=1.2, zorder=0)

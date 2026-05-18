@@ -24,8 +24,8 @@ CONDA_ENV="${CONDA_ENV:-gsquic}"
 RENDER_ENV="${RENDER_ENV:-gaussian_splatting}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
 
-SCENES="${SCENES:-hotdog bicycle}"
-BUDGET_PCTS="${BUDGET_PCTS:-10 25 40 55 70 85 100}"
+SCENES="${SCENES:-chair drums ficus hotdog materials mic ship bicycle}"
+BUDGET_PCTS="${BUDGET_PCTS:-10 25 40 55 70 85 99 100}"
 WEIGHT_MODES="${WEIGHT_MODES:-volume_over_d2 screen_area}"
 SCHEMES_LIST="${SCHEMES_LIST:-vd_lod vd_lod_w vd_lod_c vd_lod_w_c}"
 GRID_SHAPE="${GRID_SHAPE:-8 8 8}"
@@ -44,9 +44,14 @@ DELETE_PLY_FLAG="--delete-ply"
 # test_utility.py from N * bytes_per_gaussian (see --budget-pct).
 scene_ply() {
     case "$1" in
-        bicycle) echo "$ROOT/exp-dataset/bicycle/point_cloud.ply" ;;
-        hotdog)  echo "$ROOT/exp-dataset/hotdog/checkpoint/point_cloud/iteration_30000/point_cloud.ply" ;;
-        ship)    echo "$ROOT/exp-dataset/ship/checkpoint/point_cloud/iteration_30000/point_cloud.ply" ;;
+        bicycle)   echo "$ROOT/exp-dataset/bicycle/point_cloud.ply" ;;
+        chair)     echo "$ROOT/exp-dataset/chair/checkpoint/point_cloud/iteration_30000/point_cloud.ply" ;;
+        drums)     echo "$ROOT/exp-dataset/drums/checkpoint/point_cloud/iteration_30000/point_cloud.ply" ;;
+        ficus)     echo "$ROOT/exp-dataset/ficus/checkpoint/point_cloud/iteration_30000/point_cloud.ply" ;;
+        hotdog)    echo "$ROOT/exp-dataset/hotdog/checkpoint/point_cloud/iteration_30000/point_cloud.ply" ;;
+        materials) echo "$ROOT/exp-dataset/materials/checkpoint/point_cloud/iteration_30000/point_cloud.ply" ;;
+        mic)       echo "$ROOT/exp-dataset/mic/checkpoint/point_cloud/iteration_30000/point_cloud.ply" ;;
+        ship)      echo "$ROOT/exp-dataset/ship/checkpoint/point_cloud/iteration_30000/point_cloud.ply" ;;
         *) echo "" ;;
     esac
 }

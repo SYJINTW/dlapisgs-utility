@@ -4,6 +4,10 @@
 
 Sweeps launched on GPUs 2 (Exp 1) and 3 (Exp 2; now hotdog + bicycle, smallest first). When they finish, the next session should:
 
+### 0. If time permits
+
+clear old backlogs. drop obsolete ones and do important and urgent ones.
+
 ### 1. Look at the results
 
 - `output/0514/exp1_gs_weight/<scene>/plots/{psnr,ngs,ssim}_vs_budget.png` — grouped by `weight_mode`. Confirm bicycle reproduces or modifies the hotdog/ship finding (`screen_area` > `volume_over_d2` > `volume`). The `ngs_vs_budget.png` line should sit on or near the budget line for all three modes (progressive packing → ~100 % byte-utilization).
@@ -36,13 +40,38 @@ The user's analysis is right:
 
 #### The deeper concern: how do we know tile-utility is sensibly designed when its evaluation is entangled with the packer?
 
-Yes, this conflation is real. Two ways to decouple, both worth doing:
+Yes, this conflation is real. Build a **ground-truth tile value** by ablation rendering, then both axes can be decoupled.
 
-(a) **Hold packing constant, sweep utility**: fix packer to optimal (DP), sweep tile-utility formulas. Measures: how close is the chosen subset to argmax-over-all-subsets-by-PSNR? If even with optimal packing the utility formula doesn't track PSNR, the formula is the problem.
+##### Oracle ΔQ — empirical tile value
 
-(b) **Hold utility constant, sweep packing**: replace U_k with an **oracle** built by ablation rendering — for each tile, measure the actual ΔPSNR it contributes by rendering with/without it. Then sweep packers. Measures: given perfect tile values, how much PSNR does the greedy packer lose vs. DP? If gap is small, packer is fine and the design effort belongs on the utility formula; if gap is large, the design effort belongs on the packer.
+For each (camera c, tile k), define
 
-Oracle ΔPSNR rendering is expensive (one extra render per tile per camera, ~512 × 100 = 51k extra renders for bicycle) but worth doing on a 10-camera subset first to estimate.
+```
+ΔQ_k(c) = Q( render(full_scene, c) ) - Q( render(full_scene \ tile_k, c) )
+```
+
+where Q is some quality metric against the full-scene render as reference (PSNR or 1/MSE work; MSE is the cleaner choice because it composes additively — PSNR is `−10·log₁₀(MSE)` so MSE-deltas avoid log nonlinearity). Bigger ΔQ_k ⇒ tile k matters more from that camera. No formula, no heuristic — purely a measurement of what removing the tile costs.
+
+This gives a ground-truth ranking of tiles per camera. Every proposed U_k formula can then be scored by
+
+```
+Spearman ρ ( U_k(c) , ΔQ_k(c) )    averaged over cameras
+```
+
+— a single number that says "does this utility formula correctly rank tiles by how much they actually contribute to the image?" Completely independent of which packer you use downstream.
+
+##### Decoupling experiments
+
+(a) **Hold packing constant, sweep utility**: fix the packer to DP-optimal, sweep U_k formulas (including ΔQ_k itself as the ceiling). Measures: among proposed formulas, which lands closest to oracle? Gap to oracle = formula error.
+
+(b) **Hold utility constant, sweep packing**: plug ΔQ_k into the packer as the value vector. Compare DP / marginal-utility-greedy / `tile_partial` / `tile_strict` / `progressive`. Measures: given perfect values, how much PSNR does the greedy packer lose vs. DP? Gap = packer error.
+
+If formula error ≫ packer error → invest in U_k design. If packer error ≫ formula error → invest in non-greedy selection (Exp 4 proper).
+
+##### Caveats
+
+- **Leave-one-out misses interactions.** Tile A and tile B individually might each have small ΔQ but together cover a big region. For LOD=1 with our tile sizes this is probably second-order, but the principled fix is Shapley-style sampling (drop random k-subsets, regress) — expensive.
+- **Compute.** One extra render per tile per camera. Bicycle at 8×8×8 ≈ 512 tiles, ~1 s/render → ~8.5 min per camera. A 10-camera subset is ~85 min — affordable as a first cut. Full 100 cameras ≈ 14 h, run once and cache to `<scene>/oracle_dq.npz` keyed by (camera, tile).
 
 #### LOD note
 
@@ -54,12 +83,95 @@ Your back-of-envelope is right: MTU ≈ 1500 B, IP+UDP+QUIC overhead ≈ 50 B, p
 
 For now, selection-side cost stays `N × bytes_per_gaussian` and the packet overhead is tracked separately at the streaming layer (factor ≈ 1.03–1.20 depending on packing convention). Building it into the knapsack now would couple two independent design questions; defer to the QUIC streaming experiments.
 
-### 6. Backlog from these analyses
+### 6. Known limitation — tile independence assumption
+
+Every tile-level scoring and packing formulation we use (U_k, marginal-utility greedy, LOO ΔQ as oracle) **assumes tiles are independent contributors to the rendered image**. This is the implicit model:
+
+```
+Q(selected_set S) ≈ Σ_{k ∈ S} contribution(k)
+```
+
+It is empirically false in at least two regimes:
+
+- **Overlapping-footprint redundancy** — adjacent tiles whose Gaussian splats cover the same screen-space pixels (e.g. two tiles meeting at a depth boundary). Dropping one alone changes the render very little because the other covers; dropping both is catastrophic. Naive marginal value (ours) and LOO ΔQ both _underestimate_ these tiles' importance; a smart packer that picks exactly one of `{A, B}` looks lucky rather than correct.
+- **Occlusion stacking** — a near-camera tile fully occludes farther tiles. The occluded tiles have near-zero ΔQ when present alongside the near tile, but become essential once the near tile is dropped. Independent scoring can't represent this conditional dependency.
+
+**Implications:**
+
+- Pointwise rank-correlation ρ(U_k, ΔQ_k_LOO) may understate the quality of U_k when redundancy is present. Set-level metrics (top-K rank correlation, or PSNR-of-greedy-with-U directly) are more honest evaluators.
+- LOO ΔQ is the _cheap_ oracle. The honest oracle for interaction-aware evaluation is Shapley ΔQ (cost: ~50–100× LOO).
+- The tile-as-independent-unit assumption is what makes the problem tractable (0-1 knapsack solves in polynomial time). Removing it pushes us into submodular/supermodular optimization, where the right structural assumption (diminishing-returns vs. complementarity) determines tractability.
+
+**Future work directions** (in increasing cost / decreasing likelihood of getting to it):
+
+1. **LOO ΔQ oracle** (cheap, first step if Exp 4 even happens). Per-tile leave-one-out ablation render. ~1.4 h pilot / ~14 h full on bicycle. Captures occlusion correctly; blind to redundancy.
+
+2. **AOI ΔQ as cheap complement to LOO** (same compute as LOO, possibly faster per render because rendering one tile uses ~5k–15k GS vs. N−5k for LOO). `AOI_k = Q({k}) − Q(∅)`: how much does k contribute when *nothing else* is present.
+   - LOO is the marginal at the near-saturation end of the RD curve; AOI is the marginal at the near-empty end.
+   - LOO captures occlusion; AOI captures redundancy. Neither alone captures both.
+   - The per-tile pair (AOI_k, LOO_k) classifies tiles by interaction regime:
+     - both high → uniquely important.
+     - both low → genuinely unimportant.
+     - AOI high, LOO low → participates in redundancy (packer needs one of this group).
+     - AOI low, LOO high → occlusion-tier role (filler alone, but removal lets occluded content leak through).
+   - The gap `AOI − LOO` is a cheap proxy for "how much redundancy this tile participates in" without paying for Shapley.
+   - This is ~3 steps into the future — wait for LOO results first, then decide whether to run AOI on the same pilot cameras for a paired comparison.
+
+3. **Shapley ΔQ** (expensive, only if LOO+AOI disagree materially with U_k rankings). Truncated permutation sampling on a 10-camera pilot ≈ 28 h overnight. Plot Shapley vs. LOO per tile — if scatter is near-diagonal, independence is approximately satisfied; if wide, redundancy / occlusion are first-order.
+
+4. **Submodular formulations** — if ΔQ is submodular in S (diminishing returns), greedy by marginal gain has a 1−1/e ≈ 63 % approximation guarantee for budget-constrained maximization (Sviridenko / Nemhauser). U_k becomes a one-shot proxy for the first-step marginal.
+
+5. **Group-based scoring** — score connected tile groups (e.g. depth-clustered or BFS-on-adjacency) rather than individual tiles. Reduces the unit of redundancy.
+
+6. **Coverage-aware utility** — augment U_k with a penalty proportional to overlap with already-selected tiles' screen footprints. Effectively a determinantal-point-process-style diversification term.
+
+**Action for the immediate paper:**
+
+- State the tile-independence assumption explicitly in the methods section.
+- Report top-K rank correlation in addition to full-list ρ; the gap is informative.
+- Run the Shapley pilot as a sanity check, present the LOO-vs-Shapley scatter as evidence for or against the assumption holding in our setting.
+- If LOO is approximately right (scatter near-diagonal), our results stand. If LOO is materially off, frame interaction-aware utility as the obvious next step.
+
+### 7. Backlog from these analyses
 
 - [ ] Strip nx/ny/nz from emitted PLYs — ~5 % free bandwidth win, no quality impact.
 - [ ] Retire `det_gamma_over_d2` weight mode from sweeps and CLI default if bicycle confirms `screen_area` is the winner.
 - [ ] If Exp 3 shows `tile_strict` materially under-utilizes the budget but loses negligible PSNR vs `tile_partial`, that's an argument for `tile_partial` as default; if it costs PSNR too, that's an argument for fixing the packer (Exp 4 territory).
 - [ ] If Exp 4's oracle-ΔPSNR experiment shows DP ≪ greedy gap is small → packer is fine, double down on utility formula design.
+- [ ] **Expand real-world scene coverage.** Today bicycle is our only real-world scene (MipNeRF-360). Fetch siblings from the same dataset (bonsai, counter, garden, kitchen, room, stump, treehill, flowers) so we have ≥3 indoor + ≥3 outdoor real-world scenes to test against the 7 NeRF-Synthetic scenes. Also pull Tanks & Temples (Truck, Train, Barn, Caterpillar, Family) for a third dataset family — different capture conditions expose whether `screen_area` and our packers generalize across distributions. Pipeline: train with lapis-gs (existing), then `experiments/gen_sparse_views.py --scene-type mipnerf360` (or `--scene-type tnt` if it exists; otherwise extend gen_sparse_views.py to handle T&T's `images/` + `pose_bounds.npy` format).
+
+---
+
+## Status: 2026-05-18 — full-set ≠ identity: tile-strict / tile-partial packers reorder gaussians
+
+Counterpart to the 0515 progressive packer fix. While debugging a "missing last point" in `output/0514/exp2_tile_utility/hotdog/screen_area/plots/psnr_vs_budget.png`, found that `tile_strict` and `tile_partial` packing modes still fail to render bit-identically to GT even when the full scene is selected.
+
+**Diagnosis on hotdog @ 100% budget (35.19 MiB, all four schemes select N=148,783 = full scene):**
+
+| scheme       | inf views / 100 |
+|--------------|-----------------|
+| vd_lod       | 28              |
+| vd_lod_w     | 23              |
+| vd_lod_c     | 22              |
+| vd_lod_w_c   | 21              |
+
+Same gaussian *set*, different inf rate — the only differentiator is the output PLY's gaussian *order*. `_greedy_order_tile_strict` writes tiles in utility rank, sorting within each tile by `w_gi` (test_utility.py:182–206); `_greedy_order` (tile_partial) does the same. The downstream `diff_gaussian_rasterization_lapisgs` is order-sensitive due to depth-sort tie-breaking + non-associative alpha compositing.
+
+`_greedy_order_progressive` was patched on 2026-05-15 to guarantee identity at saturation (two-pass visible/invisible sort). The tile-level packers were missed.
+
+**Companion plot bug:** `experiments/plot_metrics.py` averaged `inf` PSNR values directly, so `np.mean([…, inf, …]) = inf`, and matplotlib drops `inf` y-values from line plots. The 60 dB saturation guide was decorative. One inf view on `vd_lod` at 29.9 MiB hid the entire data point.
+
+**Fix landed:** plotter clamps per-camera PSNR to 60 dB before averaging; `test_utility.py:_select_at_budget` sorts the selected index array ascending before PLY write. **The sort is a reproducibility policy, not a transport decision** — the rasterizer is order-sensitive, so without it, cross-scheme PSNR differences mix "set chosen" with "ordering noise." Selection rank-order is preserved inside the `_greedy_order_*` functions for any downstream consumer (priority streaming, logging) that genuinely needs it; only the final PLY-write index list is sorted.
+
+**Counter-intuitive finding to investigate (hotdog @ 85% budget, all schemes selected exactly 126,465 gaussians but different subsets):** median PSNR — vd_lod **62.79 dB**, vd_lod_w 43.45, vd_lod_c 24.27, vd_lod_w_c 32.99. Baseline beats all W/C-augmented schemes despite identical count.
+
+Hypothesis (unverified, from code inspection of `utility_calculation.py:188–214` and `_compute_base_scores`): with `w_norm=sum`/`c_norm=sum`, `W_k` and `C_k` are probability distributions summing to 1. Multiplying them into `base_scores = (v_k/d_k)` deflates visible-tile scores into the range of invisible-tile scores (`INVISIBLE_PRIORITY_EPS=1e-2 / d_k`). `vd_lod_w_c` lets low-W·C visible tiles drop below high-W·C invisible tiles → tile_strict fills budget with invisible content → holes in visible region. `tile_strict` lacks utility-per-byte (knapsack-ratio) normalization (see §4 Exp 4 above), compounding the problem.
+
+**Cheap diagnostic to confirm:** for one camera at 85% budget, dump `(tile_idx, visible, W_k, C_k, score, rank)` for both `vd_lod` and `vd_lod_w_c`. Count inversions: how many invisible tiles outrank visible tiles in `vd_lod_w_c` vs `vd_lod` (expect ~0 in baseline, >0 in vd_lod_w_c). Tooling: `experiments/debug_viewer_app.py` already plots per-tile distributions; extend or repurpose for the inversion count.
+
+If hypothesis holds, the principled fix is Exp 4 (oracle ΔQ + knapsack-ratio packer) already scoped above. Short-term workaround: try `w_norm=max` and `c_norm=max` instead of `sum` to preserve the relative magnitude of `(v/d)` vs `W·C`.
+
+**0514 sweep expanded for this rerun:** added all 5 missing NeRF-Synthetic scenes (chair, drums, ficus, materials, mic) on top of hotdog + ship + bicycle. `experiments/0514/run_exp{1,2}_*.sh` now default to 8 scenes; new `sparse_views_100.json` traces generated next to each new PLY via `experiments/gen_sparse_views.py --scene-type synthetic`.
 
 ---
 
@@ -77,7 +189,7 @@ The first 0514 run on 2026-05-14 died mid-sweep at cam 31 (disk full) with only 
 
 - `experiments/plot_metrics.py` now plots **95 % CI on the mean** (`±1.96·σ/√n`, ddof=1), not `±std`. With n=100 cameras, CI bars are ~20× tighter than the old std bars; method-vs-method differences become visually unambiguous.
 - PSNR plots gain a dotted **60 dB saturation guide** (MSE < 10⁻⁶ ⇒ visually identical even before 8-bit PNG quantization at ≈48 dB). Use this, not SSIM, as the saturation criterion. SSIM hits 1.0000 well before identity.
-- Discovered: tile AABBs in GGSP are pure grid-cell boxes on Gaussian *centers* — no footprint inflation. So a Gaussian whose center is in a culled tile but whose splat extends into view will leak. This is why the old `progressive` packer's hard mask broke identity. The two-pass fix routes around it at the candidate-pool level; we explicitly chose not to inflate AABBs (would defeat directional culling — see chat 2026-05-15 for the rationale).
+- Discovered: tile AABBs in GGSP are pure grid-cell boxes on Gaussian _centers_ — no footprint inflation. So a Gaussian whose center is in a culled tile but whose splat extends into view will leak. This is why the old `progressive` packer's hard mask broke identity. The two-pass fix routes around it at the candidate-pool level; we explicitly chose not to inflate AABBs (would defeat directional culling — see chat 2026-05-15 for the rationale).
 
 **Pre-fix Exp 1 results (hotdog + ship, kept as a reference)** — `screen_area` dominated every non-saturated budget on both scenes by 1.6–5.4 PSNR over `volume_over_d2` and 3.6–7.5 over `volume`. The ranking is expected to be preserved post-fix (the second pass only fires near saturation; mid-budget signal is unaffected). Bicycle was not in the dataset and is the most informative scene — that's the headline value of the rerun.
 

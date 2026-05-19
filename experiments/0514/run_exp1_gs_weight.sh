@@ -11,7 +11,7 @@
 #   GRID_SHAPE="8 8 8"
 #   CAMERA_INDEX=-1                    # -1 = all cameras
 #   CUDA_VISIBLE_DEVICES=2
-#   OUTPUT_ROOT=.../output/0514/exp1_gs_weight
+#   OUTPUT_ROOT=.../output/0518/exp1_gs_weight   (run-date stamped; see PLAN.md convention note)
 #   DRY_RUN=1                          # passes --dry-run to test_utility.py
 #   SKIP_RENDER=1                      # skip render_metrics + downstream
 set -euo pipefail
@@ -31,7 +31,7 @@ GRID_SHAPE="${GRID_SHAPE:-8 8 8}"
 NUM_LOD="${NUM_LOD:-1}"
 CAMERA_INDEX="${CAMERA_INDEX:--1}"
 SCHEME="${SCHEME:-vd_lod_w_c}"
-OUT_BASE="${OUTPUT_ROOT:-$UTIL_DIR/output/0514/exp1_gs_weight}"
+OUT_BASE="${OUTPUT_ROOT:-$UTIL_DIR/output/0518/exp1_gs_weight}"
 
 DRY_RUN_FLAG=""
 [[ "${DRY_RUN:-0}" == "1" ]] && DRY_RUN_FLAG="--dry-run"
@@ -61,7 +61,7 @@ scene_trace() {
 }
 
 echo "=========================================="
-echo "0514 Exp 1 — GS weight sweep (progressive packing)"
+echo "Exp 1 — GS weight sweep (progressive packing) — output_root=$OUT_BASE"
 echo "=========================================="
 echo "OUTPUT_ROOT  : $OUT_BASE"
 echo "SCENES       : $SCENES"

@@ -31,7 +31,7 @@ SCHEMES_LIST="${SCHEMES_LIST:-vd_lod vd_lod_w vd_lod_c vd_lod_w_c}"
 GRID_SHAPE="${GRID_SHAPE:-8 8 8}"
 NUM_LOD="${NUM_LOD:-1}"
 CAMERA_INDEX="${CAMERA_INDEX:--1}"
-OUT_BASE="${OUTPUT_ROOT:-$UTIL_DIR/output/0514/exp2_tile_utility}"
+OUT_BASE="${OUTPUT_ROOT:-$UTIL_DIR/output/0518/exp2_tile_utility}"
 
 DRY_RUN_FLAG=""
 [[ "${DRY_RUN:-0}" == "1" ]] && DRY_RUN_FLAG="--dry-run"
@@ -61,7 +61,7 @@ scene_trace() {
 }
 
 echo "=========================================="
-echo "0514 Exp 2 — Tile utility sweep (tile_strict)"
+echo "Exp 2 — Tile utility sweep (tile_strict) — output_root=$OUT_BASE"
 echo "=========================================="
 echo "OUTPUT_ROOT   : $OUT_BASE"
 echo "SCENES        : $SCENES"

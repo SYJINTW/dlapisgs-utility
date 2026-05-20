@@ -179,31 +179,37 @@ def _greedy_order_progressive(visibility_tile, tile_index_offsets, tile_flat_ind
     return ordered.detach().cpu().numpy().astype(np.int64, copy=False)
 
 
-def _greedy_order_tile_strict(order_pairs, tile_index_offsets, tile_flat_indices,
-                              w_gi, bytes_per_gaussian, max_budget_bytes):
-    """Mode `tile_strict`: pick tiles by utility; drop any tile that doesn't fit whole.
+def _greedy_order_tile_strict(order_pairs, tile_index_offsets, tile_flat_indices, w_gi):
+    """Mode `tile_strict`: emit tiles by utility with cumulative-count boundaries.
 
-    Same priority order as `tile_partial`, but instead of partial-filling the
-    final tile we skip every tile whose count exceeds the remaining budget.
+    All-or-nothing per tile. Emits every non-empty tile in utility order (within
+    each tile, GS sorted by w_gi descending) and records the cumulative GS count
+    after each tile. The per-budget selector (`_select_at_budget`) keeps the
+    first k tiles whose cumulative count fits and STOPS at the first overflow —
+    no skip-and-continue, no mid-tile partial fill.
+
+    Returns:
+      all_ordered:     flat int64 array, GS indices in tile-priority order
+      tile_cum_counts: int64 array; cum_counts[k] = total #GS after emitting tile k
     """
-    max_count = max_budget_bytes // bytes_per_gaussian
     chunks = []
+    cum_counts = []
     count = 0
     for tile_idx, _lod in order_pairs:
-        remaining = max_count - count
-        if remaining <= 0:
-            break
         start = tile_index_offsets[tile_idx]
         end = tile_index_offsets[tile_idx + 1]
         indices_for_tile = tile_flat_indices[start:end]
         n = len(indices_for_tile)
-        if n == 0 or n > remaining:
+        if n == 0:
             continue
         tile_weights = w_gi[indices_for_tile]
         sorted_tile = indices_for_tile[torch.argsort(tile_weights, descending=True)].cpu().numpy()
         chunks.append(sorted_tile)
         count += n
-    return np.concatenate(chunks) if chunks else np.empty(0, dtype=np.int64)
+        cum_counts.append(count)
+    if not chunks:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    return np.concatenate(chunks), np.asarray(cum_counts, dtype=np.int64)
 
 
 def _greedy_order(order_pairs, tile_index_offsets, tile_flat_indices, w_gi, bytes_per_gaussian, max_budget_bytes):
@@ -232,8 +238,18 @@ def _greedy_order(order_pairs, tile_index_offsets, tile_flat_indices, w_gi, byte
     return np.concatenate(chunks) if chunks else np.empty(0, dtype=np.int64)
 
 
-def _select_at_budget(all_ordered, budget_bytes, bytes_per_gaussian):
+def _select_at_budget(all_ordered, budget_bytes, bytes_per_gaussian, tile_cum_counts=None):
+    """Cut `all_ordered` at the per-budget GS count.
+
+    Default cut: flat prefix at `budget_bytes // bpg` (tile_partial / progressive —
+    these orderings are designed to be cut anywhere). When `tile_cum_counts` is
+    provided (tile_strict), the cut is snapped down to the last tile boundary
+    that fits — all-or-nothing per tile, stop at first overflow.
+    """
     count = budget_bytes // bytes_per_gaussian
+    if tile_cum_counts is not None and len(tile_cum_counts) > 0:
+        fit = int(np.searchsorted(tile_cum_counts, count, side="right"))
+        count = int(tile_cum_counts[fit - 1]) if fit > 0 else 0
     selected = all_ordered[:count]
     # Sort ascending to enforce source-PLY order in the output PLY. This is a
     # *reproducibility* policy, not a transport-ordering decision:
@@ -580,23 +596,24 @@ def main() -> None:
 
             with _timed("greedy", timings, camera=camera_index, scheme=scheme,
                         packing_mode=args.packing_mode):
+                tile_cum_counts = None
                 if args.packing_mode == "progressive":
                     all_ordered = _greedy_order_progressive(
                         visibility, tile_index_offsets, tile_flat_indices,
                         w_gi, bytes_per_gaussian, max_budget_bytes,
                     )
                 elif args.packing_mode == "tile_strict":
-                    all_ordered = _greedy_order_tile_strict(
-                        utilities, tile_index_offsets, tile_flat_indices,
-                        w_gi, bytes_per_gaussian, max_budget_bytes,
+                    all_ordered, tile_cum_counts = _greedy_order_tile_strict(
+                        utilities, tile_index_offsets, tile_flat_indices, w_gi,
                     )
                 else:  # tile_partial (default, our proposed method)
                     all_ordered = _greedy_order(
                         utilities, tile_index_offsets, tile_flat_indices,
                         w_gi, bytes_per_gaussian, max_budget_bytes,
                     )
-                logger.info("camera={} scheme={} n_ordered={}",
-                            camera_index, scheme, len(all_ordered))
+                logger.info("camera={} scheme={} n_ordered={} n_tiles={}",
+                            camera_index, scheme, len(all_ordered),
+                            len(tile_cum_counts) if tile_cum_counts is not None else "-")
 
             # ---- Per-budget loop: submit PLY writes to thread pool ----
             for budget_mb in tqdm(budget_list, desc="budgets", leave=False, unit="MB", unit_scale=True):
@@ -605,6 +622,7 @@ def main() -> None:
                             scheme=scheme, budget_mb=budget_mb):
                     selected_indices, used_bytes = _select_at_budget(
                         all_ordered, budget_bytes, bytes_per_gaussian,
+                        tile_cum_counts=tile_cum_counts,
                     )
 
                 if args.output_root is not None:

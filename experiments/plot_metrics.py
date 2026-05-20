@@ -165,23 +165,29 @@ def main() -> None:
     suffix  = f" — {args.title_suffix}" if args.title_suffix else ""
     n_groups = len([k for k in order if k in agg])
 
-    # Scene-N reference for the gaussian-count plot: max selected_gaussians observed
+    # Scene-N reference for the gaussian-ratio plot: max selected_gaussians observed
     # across the whole CSV. Reaches true N only when at least one (group, budget)
-    # cell saturates (i.e. budget >= scene size). Otherwise it's a lower bound.
+    # cell saturates (i.e. budget >= scene size). Otherwise it's a lower bound, and
+    # the plotted ratio is an upper bound (overestimates selection fraction).
     scene_n_gs = max(
         (v["ngs_mean"] for s in agg.values() for v in s.values()),
         default=0.0,
     )
+    if scene_n_gs > 0:
+        for s in agg.values():
+            for v in s.values():
+                v["ngs_mean"] /= scene_n_gs
+                v["ngs_ci95"] /= scene_n_gs
 
     _plot(agg, order, labels, "psnr", "PSNR (dB)",
           f"PSNR vs Budget — {n_groups} {args.group_by}s (mean ± 95% CI, {n_views} views){suffix}",
           out_dir / "psnr_vs_budget.png",
           hline=(60.0, "saturated (≥60 dB)"))
 
-    _plot(agg, order, labels, "ngs", "# selected Gaussians",
-          f"# Gaussians vs Budget — {n_groups} {args.group_by}s (mean ± 95% CI, {n_views} views){suffix}",
+    _plot(agg, order, labels, "ngs", "selected / total Gaussians",
+          f"Selection ratio vs Budget — {n_groups} {args.group_by}s (mean ± 95% CI, {n_views} views){suffix}",
           out_dir / "ngs_vs_budget.png",
-          hline=(scene_n_gs, f"full scene (≈{int(scene_n_gs):,} GS)") if scene_n_gs > 0 else None)
+          hline=(1.0, f"full scene (≈{int(scene_n_gs):,} GS)") if scene_n_gs > 0 else None)
 
     _plot(agg, order, labels, "ssim", "SSIM",
           f"SSIM vs Budget — {n_groups} {args.group_by}s (mean ± 95% CI, {n_views} views){suffix}",

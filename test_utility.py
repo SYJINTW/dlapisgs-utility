@@ -52,9 +52,11 @@ import visibility_AABB_pytorch  # noqa: E402
 import tiling as ggsp_tiling  # noqa: E402
 import utility_calculation as uc  # noqa: E402
 import io_3dgs  # noqa: E402  # pyright: ignore[reportMissingImports]
+from ml import predict as ml_predict  # noqa: E402
 
 
-VALID_SCHEMES = ["vd", "vd_lod", "vd_lod_w", "vd_lod_c", "vd_lod_w_c"]
+VALID_SCHEMES = ["vd", "vd_lod", "vd_lod_w", "vd_lod_c", "vd_lod_w_c",
+                 "ml_lgbm_raw", "ml_lgbm_resid"]
 PLY_WORKERS = 4
 
 
@@ -300,6 +302,8 @@ def main() -> None:
                         help="Exponent for Gaussian weight: w = sigmoid(o) * det(Sigma)^gamma / d^2")
     parser.add_argument("--camera-index", type=int, default=0,
                         help="Index of the camera in the trace to evaluate; use -1 to process all cameras")
+    parser.add_argument("--camera-indices", nargs="+", type=int, default=None,
+                        help="Explicit list of camera indices to process (overrides --camera-index)")
     parser.add_argument("--img-w", type=int, default=800,
                         help="Camera image width for visibility checks")
     parser.add_argument("--img-h", type=int, default=800,
@@ -331,6 +335,9 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the full job matrix (cameras x schemes x budgets -> paths) and exit. "
                              "No GPU work or disk writes. Shows [x] for outputs that already exist.")
+    parser.add_argument("--ml-model-dir", type=str, default=None,
+                        help="Directory containing trained LightGBM models (model_raw.pkl, "
+                             "model_resid.pkl, ols_coefs.json). Required when using ml_lgbm_* schemes.")
     args = parser.parse_args()
 
     # budget_list is resolved later once we know bytes_per_gaussian and N (for --budget-pct).
@@ -356,6 +363,9 @@ def main() -> None:
 
     if args.output_root is None and args.output is None:
         raise ValueError("Either --output-root or --output must be provided")
+
+    if any(s.startswith("ml_lgbm_") for s in scheme_list) and args.ml_model_dir is None:
+        raise ValueError("--ml-model-dir is required when using ml_lgbm_* schemes")
 
     logger.remove()
     logger.add(lambda msg: tqdm.write(msg, end=""), level="INFO", colorize=True)
@@ -487,7 +497,12 @@ def main() -> None:
     bytes_per_gaussian = _bytes_per_gaussian(gs)
     max_budget_bytes = int(max(budget_list) * 1024 * 1024)
 
-    if args.camera_index < 0:
+    if args.camera_indices is not None:
+        for ci in args.camera_indices:
+            if ci >= len(cameras):
+                raise ValueError(f"--camera-indices: index {ci} out of range")
+        camera_indices = sorted(set(args.camera_indices))
+    elif args.camera_index < 0:
         camera_indices = list(range(len(cameras)))
     else:
         if args.camera_index >= len(cameras):
@@ -581,18 +596,27 @@ def main() -> None:
 
         # ---- Per-scheme loop ----
         for scheme in tqdm(scheme_list, desc="schemes", leave=False):
-            include_lod = scheme != "vd"
-            include_w = scheme in ("vd_lod_w", "vd_lod_w_c")
-            include_c = scheme in ("vd_lod_c", "vd_lod_w_c")
-
             with _timed("utility", timings, camera=camera_index, scheme=scheme):
-                utilities = uc.calculate_utility_param(
-                    visibility, distances,
-                    num_of_level=args.num_lod,
-                    weight_sum_tensor=W_k if include_w else None,
-                    complexity_tensor=C_k if include_c else None,
-                    include_lod=include_lod, include_w=include_w, include_c=include_c,
-                )
+                if scheme.startswith("ml_lgbm_"):
+                    head = scheme[len("ml_lgbm_"):]
+                    utilities = ml_predict.predict_utility(
+                        args.ml_model_dir, head,
+                        visibility_t=visibility,
+                        distances_t=distances,
+                        tile_index_offsets_t=tile_index_offsets,
+                        W_k_t=W_k,
+                    )
+                else:
+                    include_lod = scheme != "vd"
+                    include_w = scheme in ("vd_lod_w", "vd_lod_w_c")
+                    include_c = scheme in ("vd_lod_c", "vd_lod_w_c")
+                    utilities = uc.calculate_utility_param(
+                        visibility, distances,
+                        num_of_level=args.num_lod,
+                        weight_sum_tensor=W_k if include_w else None,
+                        complexity_tensor=C_k if include_c else None,
+                        include_lod=include_lod, include_w=include_w, include_c=include_c,
+                    )
 
             with _timed("greedy", timings, camera=camera_index, scheme=scheme,
                         packing_mode=args.packing_mode):

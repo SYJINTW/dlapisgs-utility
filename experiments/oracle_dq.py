@@ -3,6 +3,9 @@
 Importable from either conda env — no torch dependency. See
 `.claude/exp4_oracle_dq.md` §D4 for the on-disk schema this module
 reads and writes.
+
+Oracle delta Q(tile)
+
 """
 from __future__ import annotations
 

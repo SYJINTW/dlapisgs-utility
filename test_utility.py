@@ -316,6 +316,12 @@ def main() -> None:
                         help="Normalization for W_k (tile aggregate weight). Default: sum.")
     parser.add_argument("--c-norm", type=str, default="sum", choices=list(uc.NORM_MODES),
                         help="Normalization for C_k (tile complexity). Default: sum.")
+    parser.add_argument("--c-kind", type=str, default="count",
+                        choices=list(uc.COMPLEXITY_KINDS) + ["count"],
+                        help="Tile complexity descriptor for C_k. "
+                             "count (default): backward-compat #GS count. "
+                             "eigenentropy: entropy of eigenvalue spectrum of weighted centroid covariance. "
+                             "voxel_entropy: Shannon entropy of 8^3 weighted voxel occupancy.")
     parser.add_argument("--packing-mode", type=str, default="tile_partial",
                         choices=["tile_partial", "tile_strict", "progressive"],
                         help="tile_partial (proposed, default): tile-greedy + partial last tile. "
@@ -386,8 +392,8 @@ def main() -> None:
     logger.info("ply={} output={} trace={}", ply_path, base_output_path, camera_trace)
     logger.info("grid_shape={} budgets_mb={} budget_pct={} num_lod={} schemes={}",
                 args.grid_shape, budget_list, args.budget_pct, args.num_lod, scheme_list)
-    logger.info("w_norm={} c_norm={} packing_mode={} weight_mode={}",
-                args.w_norm, args.c_norm, args.packing_mode, args.weight_mode)
+    logger.info("w_norm={} c_norm={} c_kind={} packing_mode={} weight_mode={}",
+                args.w_norm, args.c_norm, args.c_kind, args.packing_mode, args.weight_mode)
 
     # If --budget-pct, resolve to MB by loading PLY (cheap; needed for paths even in dry-run).
     if budget_list is None:
@@ -568,10 +574,21 @@ def main() -> None:
         cam_pbar.set_postfix(idx=camera_index, stage="tile_weights")
         with _timed("tile_weights", timings, camera=camera_index,
                     w_norm=args.w_norm, c_norm=args.c_norm):
-            W_k, C_k = uc.compute_tile_weights_and_counts(
+            W_k, N_k = uc.compute_tile_weights_and_counts(
                 tile_index_offsets, tile_flat_indices, w_gi,
                 w_norm=args.w_norm, c_norm=args.c_norm,
             )
+
+        needs_c = any(s in ("vd_lod_c", "vd_lod_w_c") for s in scheme_list)
+        if needs_c and args.c_kind != "count":
+            with _timed("tile_complexity", timings, camera=camera_index, c_kind=args.c_kind):
+                C_k = uc.compute_tile_complexity(
+                    args.c_kind, tile_index_offsets, tile_flat_indices, w_gi, gs_xyz_t,
+                    min_corners=min_corners_t, max_corners=max_corners_t,
+                )
+                C_k = uc.normalize_term(C_k, args.c_norm)
+        else:
+            C_k = N_k  # count (backward-compat) or not needed
 
         # vis.npz: write once per camera
         np_visibility_all = visibility.cpu().numpy() if hasattr(visibility, 'cpu') else np.asarray(visibility)

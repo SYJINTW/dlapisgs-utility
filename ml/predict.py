@@ -76,7 +76,14 @@ def predict_utility(
     if head == "resid":
         scores += beta0 + beta1 * np.log(C_k.clip(1))
 
-    scores[v_k == 0] = uc.INVISIBLE_PRIORITY_EPS
+    # Invisible tiles must rank below all visible ones.
+    # Model outputs log(ΔMSE) which is negative (ΔMSE << 1), so we can't use
+    # INVISIBLE_PRIORITY_EPS (=1e-2, positive) — that would rank invisible tiles first.
+    visible_mask = v_k > 0
+    if visible_mask.any():
+        scores[~visible_mask] = scores[visible_mask].min() - 1.0
+    else:
+        scores[:] = -1e9
 
     order = np.argsort(-scores, kind="stable")
     pairs = np.column_stack([order, np.zeros(N_tiles, dtype=np.int64)])

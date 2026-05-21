@@ -14,6 +14,8 @@ import tiling
 # Numerical constants
 INVISIBLE_PRIORITY_EPS = 1e-2   # priority weight for invisible tiles (kept >0 to avoid starvation)
 DISTANCE_EPS = 1e-3             # added to distance to prevent division by zero
+COMPLEXITY_SPARSE_GUARD = 20    # min GS in a tile for reliable covariance / voxel entropy estimate
+COMPLEXITY_SPECTRAL_FC  = 2.0   # frequency cutoff (cycles) for spectral_energy high-freq ratio; N=8 → max ≈ 4√3≈6.9
 
 NORM_MODES = ("none", "max", "minmax", "log1p", "sum")
 # Per-Gaussian weight formulas. Each name describes the math literally:
@@ -212,6 +214,120 @@ def compute_tile_weights_and_counts(tile_index_offsets, tile_flat_indices, w_gi,
     W_k = normalize_term(W_k, w_norm)
     C_k = normalize_term(C_k, c_norm)
     return W_k, C_k
+
+
+COMPLEXITY_KINDS = ("eigenentropy", "voxel_entropy", "spectral_energy")
+
+
+def compute_tile_complexity(c_kind, tile_index_offsets, tile_flat_indices,
+                            w_gi, xyz, *, min_corners, max_corners,
+                            sparse_guard=COMPLEXITY_SPARSE_GUARD, voxel_n=8):
+    """Per-tile structural complexity descriptor.
+
+    Args:
+        c_kind: "eigenentropy", "voxel_entropy", or "spectral_energy"
+        tile_index_offsets: (N+1,) long tensor
+        tile_flat_indices:  (M,)   long tensor — GS indices into xyz / w_gi
+        w_gi:               (M_all,) float32 — per-GS weights (indexed by tile_flat_indices)
+        xyz:                (M_all, 3) float32 — GS world positions
+        min_corners:        (N, 3) float32 — tile AABB lower bounds
+        max_corners:        (N, 3) float32 — tile AABB upper bounds
+        sparse_guard:       tiles with fewer GS get 0.0 (unreliable statistics)
+        voxel_n:            voxel grid side length for voxel_entropy
+
+    Returns:
+        (N,) float32 tensor, unnormalized. Caller applies normalize_term.
+    """
+    if c_kind not in COMPLEXITY_KINDS:
+        raise ValueError(f"unknown c_kind '{c_kind}'; valid: {COMPLEXITY_KINDS}")
+
+    num_tiles = len(tile_index_offsets) - 1
+    device = w_gi.device
+    sizes = tile_index_offsets[1:] - tile_index_offsets[:-1]   # (N,)
+    M_total = tile_flat_indices.numel()
+    out = torch.zeros(num_tiles, dtype=torch.float32, device=device)
+
+    if M_total == 0:
+        return out
+
+    seg_ids = torch.repeat_interleave(
+        torch.arange(num_tiles, device=device), sizes
+    )  # (M_total,) — tile index for each GS in tile order
+
+    pts = xyz[tile_flat_indices]   # (M_total, 3)
+    w   = w_gi[tile_flat_indices]  # (M_total,)
+
+    # Normalize positions to [0,1]^3 within each tile AABB
+    lo = min_corners[seg_ids]  # (M_total, 3)
+    hi = max_corners[seg_ids]  # (M_total, 3)
+    pts_n = (pts - lo) / (hi - lo).clamp(min=1e-6)  # (M_total, 3)
+
+    if c_kind == "eigenentropy":
+        # Weighted covariance of GS centroids: M_k = Σ w_i (x_i-μ)(x_i-μ)^T / Σw_i
+        wsum = torch.zeros(num_tiles, dtype=torch.float32, device=device)
+        wsum.scatter_add_(0, seg_ids, w)
+
+        mu = torch.zeros(num_tiles, 3, dtype=torch.float32, device=device)
+        for d in range(3):
+            mu[:, d].scatter_add_(0, seg_ids, w * pts_n[:, d])
+        mu = mu / wsum.unsqueeze(1).clamp(min=1e-12)  # (N, 3)
+
+        diff = pts_n - mu[seg_ids]  # (M_total, 3)
+
+        # Weighted outer products → scatter into (N, 3, 3) via (M_total, 9) reshape
+        w_outer = (w.unsqueeze(1).unsqueeze(2)
+                   * diff.unsqueeze(2)
+                   * diff.unsqueeze(1))  # (M_total, 3, 3)
+        M_cov = torch.zeros(num_tiles, 9, dtype=torch.float32, device=device)
+        M_cov.scatter_add_(0, seg_ids.unsqueeze(1).expand(-1, 9),
+                           w_outer.view(M_total, 9))
+        M_cov = M_cov.view(num_tiles, 3, 3) / wsum.view(num_tiles, 1, 1).clamp(1e-12)
+
+        lam = torch.linalg.eigvalsh(M_cov).clamp(min=0.0)  # (N, 3) ascending
+        lsum = lam.sum(dim=1)
+        valid = (sizes >= sparse_guard) & (lsum > 1e-12)
+        lam_n = (lam / lsum.unsqueeze(1).clamp(1e-12)).clamp(min=1e-12)
+        entropy = -(lam_n * lam_n.log()).sum(dim=1)  # (N,)
+        out[valid] = entropy[valid]
+
+    else:  # voxel_entropy or spectral_energy — both start with the same voxelization
+        N3 = voxel_n ** 3
+        vox_ijk = (pts_n.clamp(0.0, 1.0 - 1e-6) * voxel_n).long()  # (M_total, 3)
+        vox_flat = (vox_ijk[:, 0] * voxel_n * voxel_n
+                    + vox_ijk[:, 1] * voxel_n
+                    + vox_ijk[:, 2])  # (M_total,)
+        combined = seg_ids * N3 + vox_flat  # global key in [0, N*N3)
+
+        occ = torch.zeros(num_tiles * N3, dtype=torch.float32, device=device)
+        occ.scatter_add_(0, combined, w)
+        occ = occ.view(num_tiles, N3)  # (num_tiles, N^3)
+
+        if c_kind == "voxel_entropy":
+            occ_sum = occ.sum(dim=1, keepdim=True).clamp(min=1e-12)
+            p = occ / occ_sum
+            log_p = torch.where(p > 0, p.log(), torch.zeros_like(p))
+            entropy = -(p * log_p).sum(dim=1)  # (num_tiles,)
+            out[sizes >= sparse_guard] = entropy[sizes >= sparse_guard]
+
+        else:  # spectral_energy
+            # 3D FFT of per-tile weighted voxel density → high-freq energy ratio.
+            # fc = COMPLEXITY_SPECTRAL_FC; N=8 → Nyquist ≈ 4√3 ≈ 6.9.
+            occ_3d = occ.view(num_tiles, voxel_n, voxel_n, voxel_n)
+            F = torch.fft.fftn(occ_3d, dim=(-3, -2, -1))     # (num_tiles, N, N, N) complex
+            power = F.real ** 2 + F.imag ** 2                 # |F|²
+
+            # Frequency magnitude grid (integer cycles, unshifted FFT convention)
+            freq = torch.fft.fftfreq(voxel_n, device=device) * voxel_n  # (N,) in [-N/2, N/2)
+            fx, fy, fz = torch.meshgrid(freq, freq, freq, indexing="ij")  # (N, N, N)
+            freq_mag = (fx ** 2 + fy ** 2 + fz ** 2).sqrt()               # (N, N, N)
+            high_mask = (freq_mag > COMPLEXITY_SPECTRAL_FC).unsqueeze(0)  # (1, N, N, N)
+
+            total_power = power.sum(dim=(-3, -2, -1))                      # (num_tiles,)
+            high_power  = (power * high_mask).sum(dim=(-3, -2, -1))        # (num_tiles,)
+            ratio = high_power / total_power.clamp(min=1e-12)              # (num_tiles,)
+            out[sizes >= sparse_guard] = ratio[sizes >= sparse_guard]
+
+    return out
 
 
 def project_covariance_2d(xyz, scale_0, scale_1, scale_2,

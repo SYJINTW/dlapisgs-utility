@@ -210,6 +210,8 @@ def main() -> None:
                         help="Flush partial NPZ every N tiles for crash recovery.")
     parser.add_argument("--skip-existing", action="store_true",
                         help="Reuse existing NPZ; skip (c,k) entries already filled (non-NaN).")
+    parser.add_argument("--compute-aoi", action="store_true",
+                        help="Also render each tile in isolation (add-one-in). Doubles render time.")
     args = parser.parse_args()
 
     output_root = Path(args.output_root)
@@ -274,6 +276,9 @@ def main() -> None:
         psnr_mat = np.full((n_cams, n_tiles), np.nan, dtype=np.float32)
         ssim_mat = np.full((n_cams, n_tiles), np.nan, dtype=np.float32)
 
+    mse_aoi_mat = (np.full((n_cams, n_tiles), np.nan, dtype=np.float32)
+                   if args.compute_aoi else None)
+
     full_dir = output_root / "full_renders"
     full_dir.mkdir(parents=True, exist_ok=True)
     ablation_dir = output_root / "ablation_renders"
@@ -333,6 +338,7 @@ def main() -> None:
             mse=mse_mat,
             psnr=psnr_mat,
             ssim=ssim_mat,
+            mse_aoi=mse_aoi_mat,
             gen_meta={
                 "scene_ply": str(Path(args.ply)),
                 "trace": str(Path(args.trace)),
@@ -393,6 +399,16 @@ def main() -> None:
                             img,
                             str(ablation_tile_dir / f"camera_{c_global:03d}.png"),
                         )
+
+        if args.compute_aoi:
+            with _timed("tile_aoi_all_cams", timings, k=k, n_cams=n_cams):
+                _apply_subset(g, snaps, member_t)  # only tile k's GS
+                with torch.no_grad():
+                    for ci, (c_global, cam) in enumerate(zip(camera_indices, cameras)):
+                        if args.skip_existing and np.isfinite(mse_aoi_mat[ci, k]):
+                            continue
+                        img = _render_current(g, cam, args.white_bg)
+                        mse_aoi_mat[ci, k], _ = _mse_psnr(img, full_renders[ci])
 
         if (ti + 1) % max(args.flush_every, 1) == 0:
             with _timed("flush_partial", timings, tiles_done=ti + 1):

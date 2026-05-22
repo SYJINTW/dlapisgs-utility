@@ -216,7 +216,7 @@ def compute_tile_weights_and_counts(tile_index_offsets, tile_flat_indices, w_gi,
     return W_k, C_k
 
 
-COMPLEXITY_KINDS = ("eigenentropy", "voxel_entropy", "spectral_energy")
+COMPLEXITY_KINDS = ("eigenentropy", "omnivariance", "voxel_entropy", "spectral_energy")
 
 
 def compute_tile_complexity(c_kind, tile_index_offsets, tile_flat_indices,
@@ -262,7 +262,7 @@ def compute_tile_complexity(c_kind, tile_index_offsets, tile_flat_indices,
     hi = max_corners[seg_ids]  # (M_total, 3)
     pts_n = (pts - lo) / (hi - lo).clamp(min=1e-6)  # (M_total, 3)
 
-    if c_kind == "eigenentropy":
+    if c_kind in ("eigenentropy", "omnivariance"):
         # Weighted covariance of GS centroids: M_k = Σ w_i (x_i-μ)(x_i-μ)^T / Σw_i
         wsum = torch.zeros(num_tiles, dtype=torch.float32, device=device)
         wsum.scatter_add_(0, seg_ids, w)
@@ -286,11 +286,16 @@ def compute_tile_complexity(c_kind, tile_index_offsets, tile_flat_indices,
         lam = torch.linalg.eigvalsh(M_cov).clamp(min=0.0)  # (N, 3) ascending
         lsum = lam.sum(dim=1)
         valid = (sizes >= sparse_guard) & (lsum > 1e-12)
-        lam_n = (lam / lsum.unsqueeze(1).clamp(1e-12)).clamp(min=1e-12)
-        entropy = -(lam_n * lam_n.log()).sum(dim=1)  # (N,)
-        out[valid] = entropy[valid]
 
-    else:  # voxel_entropy or spectral_energy — both start with the same voxelization
+        if c_kind == "eigenentropy":
+            lam_n = (lam / lsum.unsqueeze(1).clamp(1e-12)).clamp(min=1e-12)
+            entropy = -(lam_n * lam_n.log()).sum(dim=1)  # (N,)
+            out[valid] = entropy[valid]
+        else:  # omnivariance: geometric mean of eigenvalues = det(cov)^(1/3)
+            omni = lam.prod(dim=1).clamp(min=0.0) ** (1.0 / 3.0)
+            out[valid] = omni[valid]
+
+    if c_kind in ("voxel_entropy", "spectral_energy"):  # voxelization-based
         N3 = voxel_n ** 3
         vox_ijk = (pts_n.clamp(0.0, 1.0 - 1e-6) * voxel_n).long()  # (M_total, 3)
         vox_flat = (vox_ijk[:, 0] * voxel_n * voxel_n

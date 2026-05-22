@@ -63,23 +63,23 @@ def n_gs_per_tile(tiling: dict[str, np.ndarray]) -> np.ndarray:
 
 @dataclass
 class OracleDQResult:
-    """One LOO oracle artifact per scene. See exp4_oracle_dq.md §D4."""
+    """LOO + optional AOI oracle artifact per scene. See exp4_oracle_dq.md §D4."""
     min_corners: np.ndarray         # (N_tiles, 3) float32
     max_corners: np.ndarray         # (N_tiles, 3) float32
     index_offsets: np.ndarray       # (N_tiles+1,) int64
     flat_indices: np.ndarray        # (total_GS,) int64
     camera_indices: np.ndarray      # (N_cams,) int32
     n_gs_per_tile: np.ndarray       # (N_tiles,) int64
-    mse: np.ndarray                 # (N_cams, N_tiles) float32
+    mse: np.ndarray                 # (N_cams, N_tiles) float32  — LOO: MSE(full\k) vs full
     psnr: np.ndarray                # (N_cams, N_tiles) float32
     ssim: np.ndarray                # (N_cams, N_tiles) float32
     gen_meta: dict[str, Any] = field(default_factory=dict)
+    mse_aoi: np.ndarray | None = None   # (N_cams, N_tiles) float32 — AOI: MSE({k}) vs full
 
     def save_npz(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(
-            str(path),
+        arrays = dict(
             min_corners=self.min_corners,
             max_corners=self.max_corners,
             index_offsets=self.index_offsets,
@@ -91,6 +91,9 @@ class OracleDQResult:
             ssim=self.ssim,
             gen_meta=np.asarray(json.dumps(self.gen_meta)),
         )
+        if self.mse_aoi is not None:
+            arrays["mse_aoi"] = self.mse_aoi
+        np.savez(str(path), **arrays)
 
     @classmethod
     def load_npz(cls, path: str | Path) -> "OracleDQResult":
@@ -111,6 +114,7 @@ class OracleDQResult:
             psnr=d["psnr"],
             ssim=d["ssim"],
             gen_meta=meta,
+            mse_aoi=d["mse_aoi"] if "mse_aoi" in d else None,
         )
 
 

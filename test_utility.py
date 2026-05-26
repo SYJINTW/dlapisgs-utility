@@ -56,7 +56,8 @@ from ml import predict as ml_predict  # noqa: E402
 
 
 VALID_SCHEMES = ["vd", "vd_lod", "vd_lod_w", "vd_lod_c", "vd_lod_w_c",
-                 "ml_lgbm_raw", "ml_lgbm_resid"]
+                 "ml_lgbm_raw", "ml_lgbm_resid",
+                 "oracle_loo", "oracle_aoi", "oracle_combined"]
 PLY_WORKERS = 4
 
 
@@ -267,6 +268,59 @@ def _select_at_budget(all_ordered, budget_bytes, bytes_per_gaussian, tile_cum_co
     return selected, len(selected) * bytes_per_gaussian
 
 
+def _oracle_utilities(scheme, oracle_data, camera_index, n_tiles):
+    """Build sorted (tile_idx, lod=0) pairs from oracle_dq.npz scores.
+
+    Returns (n_tiles, 2) int64 array matching calculate_utility_param's output format.
+    Tiles not in the oracle (NaN scores) are sorted to the end.
+    """
+    cam_idx_to_row = oracle_data["cam_idx_to_row"]
+    if camera_index not in cam_idx_to_row:
+        logger.warning("camera {} not in oracle NPZ; {} falls back to tile-index order",
+                       camera_index, scheme)
+        tile_order = np.arange(n_tiles, dtype=np.int64)
+        return np.stack([tile_order, np.zeros(n_tiles, dtype=np.int64)], axis=1)
+
+    row = cam_idx_to_row[camera_index]
+    mse_loo = oracle_data["mse_loo"][row]   # (N_tiles,), higher = more important
+
+    if scheme == "oracle_loo":
+        scores = np.where(np.isfinite(mse_loo), mse_loo, -np.inf)
+        tile_order = np.argsort(scores)[::-1].astype(np.int64)
+
+    elif scheme == "oracle_aoi":
+        mse_aoi = oracle_data["mse_aoi"]
+        if mse_aoi is None:
+            raise ValueError("oracle_aoi requires mse_aoi in oracle NPZ (re-run exp4 with --compute-aoi)")
+        aoi_row = mse_aoi[row]              # lower = more important
+        scores = np.where(np.isfinite(aoi_row), -aoi_row, -np.inf)
+        tile_order = np.argsort(scores)[::-1].astype(np.int64)
+
+    else:  # oracle_combined
+        mse_aoi = oracle_data["mse_aoi"]
+        if mse_aoi is None:
+            raise ValueError("oracle_combined requires mse_aoi in oracle NPZ (re-run exp4 with --compute-aoi)")
+        aoi_row = mse_aoi[row]
+        # Borda count: rank each by importance (higher rank = more important), average ranks.
+        # NaN tiles get rank 0 (least important).
+        def _rank_safe(arr, ascending=False):
+            finite = np.isfinite(arr)
+            ranks = np.zeros(len(arr), dtype=np.float64)
+            sub = arr[finite]
+            order = np.argsort(sub) if ascending else np.argsort(sub)[::-1]
+            dense = np.empty(len(sub), dtype=np.float64)
+            dense[order] = np.arange(1, len(sub) + 1, dtype=np.float64)
+            ranks[finite] = dense
+            return ranks
+        loo_rank = _rank_safe(mse_loo, ascending=False)   # higher loo MSE → rank 1
+        aoi_rank = _rank_safe(aoi_row, ascending=True)    # lower aoi MSE → rank 1
+        combined = (loo_rank + aoi_rank) / 2.0
+        # rank 1 = most important; argsort ascending puts rank-1 tiles first
+        tile_order = np.argsort(combined).astype(np.int64)
+
+    return np.stack([tile_order, np.zeros(n_tiles, dtype=np.int64)], axis=1)
+
+
 def _write_ply(gs, selected_indices, output_path, ascii_ply):
     selected_gs = gs.extract_gaussians(selected_indices)
     selected_gs.export_gs_to_ply(str(output_path), ascii=ascii_ply)
@@ -316,6 +370,10 @@ def main() -> None:
                         help="Normalization for W_k (tile aggregate weight). Default: sum.")
     parser.add_argument("--c-norm", type=str, default="sum", choices=list(uc.NORM_MODES),
                         help="Normalization for C_k (tile complexity). Default: sum.")
+    parser.add_argument("--w-mode", type=str, default="sum", choices=list(uc.W_MODES),
+                        help="Tile aggregate weight reduction for W_k. "
+                             "sum (default): W_k = Σ w(g_i), scales with tile size. "
+                             "mean: W_k = Σ w(g_i) / N_k, size-invariant mean quality.")
     parser.add_argument("--c-kind", type=str, default="count",
                         choices=list(uc.COMPLEXITY_KINDS) + ["count"],
                         help="Tile complexity descriptor for C_k. "
@@ -344,6 +402,8 @@ def main() -> None:
     parser.add_argument("--ml-model-dir", type=str, default=None,
                         help="Directory containing trained LightGBM models (model_raw.pkl, "
                              "model_resid.pkl, ols_coefs.json). Required when using ml_lgbm_* schemes.")
+    parser.add_argument("--oracle-npz", type=str, default=None,
+                        help="oracle_dq.npz from exp4_oracle_dq.py. Required when using oracle_* schemes.")
     args = parser.parse_args()
 
     # budget_list is resolved later once we know bytes_per_gaussian and N (for --budget-pct).
@@ -372,6 +432,8 @@ def main() -> None:
 
     if any(s.startswith("ml_lgbm_") for s in scheme_list) and args.ml_model_dir is None:
         raise ValueError("--ml-model-dir is required when using ml_lgbm_* schemes")
+    if any(s.startswith("oracle_") for s in scheme_list) and args.oracle_npz is None:
+        raise ValueError("--oracle-npz is required when using oracle_* schemes")
 
     logger.remove()
     logger.add(lambda msg: tqdm.write(msg, end=""), level="INFO", colorize=True)
@@ -392,8 +454,8 @@ def main() -> None:
     logger.info("ply={} output={} trace={}", ply_path, base_output_path, camera_trace)
     logger.info("grid_shape={} budgets_mb={} budget_pct={} num_lod={} schemes={}",
                 args.grid_shape, budget_list, args.budget_pct, args.num_lod, scheme_list)
-    logger.info("w_norm={} c_norm={} c_kind={} packing_mode={} weight_mode={}",
-                args.w_norm, args.c_norm, args.c_kind, args.packing_mode, args.weight_mode)
+    logger.info("w_norm={} w_mode={} c_norm={} c_kind={} packing_mode={} weight_mode={}",
+                args.w_norm, args.w_mode, args.c_norm, args.c_kind, args.packing_mode, args.weight_mode)
 
     # If --budget-pct, resolve to MB by loading PLY (cheap; needed for paths even in dry-run).
     if budget_list is None:
@@ -530,6 +592,27 @@ def main() -> None:
     else:
         shared_tiling_npz = tiling_cache_path
 
+    # ---- Oracle data load (once per run) ----
+    oracle_data = None
+    if args.oracle_npz is not None:
+        _od = np.load(args.oracle_npz, allow_pickle=False)
+        _cam_ids = _od["camera_indices"].astype(np.int32)
+        _mse_aoi = _od["mse_aoi"] if "mse_aoi" in _od else None
+        oracle_data = {
+            "mse_loo": _od["mse"].astype(np.float64),
+            "mse_aoi": _mse_aoi.astype(np.float64) if _mse_aoi is not None else None,
+            "cam_idx_to_row": {int(c): i for i, c in enumerate(_cam_ids)},
+        }
+        n_oracle_tiles = oracle_data["mse_loo"].shape[1]
+        n_scene_tiles = len(index_offsets) - 1
+        if n_oracle_tiles != n_scene_tiles:
+            raise ValueError(
+                f"oracle_dq.npz has {n_oracle_tiles} tiles but scene tiling has {n_scene_tiles}. "
+                "Use the same --tiling-cache that was passed to exp4_oracle_dq.py."
+            )
+        logger.info("oracle NPZ loaded: {} cameras, {} tiles, aoi={}",
+                    len(_cam_ids), n_oracle_tiles, _mse_aoi is not None)
+
     executor = ThreadPoolExecutor(max_workers=args.ply_workers)
     timings_path = output_root_for_meta / "timings.json"
 
@@ -576,7 +659,7 @@ def main() -> None:
                     w_norm=args.w_norm, c_norm=args.c_norm):
             W_k, N_k = uc.compute_tile_weights_and_counts(
                 tile_index_offsets, tile_flat_indices, w_gi,
-                w_norm=args.w_norm, c_norm=args.c_norm,
+                w_norm=args.w_norm, c_norm=args.c_norm, w_mode=args.w_mode,
             )
 
         needs_c = any(s in ("vd_lod_c", "vd_lod_w_c") for s in scheme_list)
@@ -614,7 +697,10 @@ def main() -> None:
         # ---- Per-scheme loop ----
         for scheme in tqdm(scheme_list, desc="schemes", leave=False):
             with _timed("utility", timings, camera=camera_index, scheme=scheme):
-                if scheme.startswith("ml_lgbm_"):
+                if scheme.startswith("oracle_"):
+                    n_tiles = len(index_offsets) - 1
+                    utilities = _oracle_utilities(scheme, oracle_data, camera_index, n_tiles)
+                elif scheme.startswith("ml_lgbm_"):
                     head = scheme[len("ml_lgbm_"):]
                     utilities = ml_predict.predict_utility(
                         args.ml_model_dir, head,

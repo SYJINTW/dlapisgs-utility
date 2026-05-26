@@ -18,6 +18,10 @@ COMPLEXITY_SPARSE_GUARD = 20    # min GS in a tile for reliable covariance / vox
 COMPLEXITY_SPECTRAL_FC  = 2.0   # frequency cutoff (cycles) for spectral_energy high-freq ratio; N=8 → max ≈ 4√3≈6.9
 
 NORM_MODES = ("none", "max", "minmax", "log1p", "sum")
+# Tile aggregate weight mode: how to reduce per-GS weights to a tile scalar.
+#   sum  : W_k = Σ w(g_i)           (current default; scales with tile size)
+#   mean : W_k = Σ w(g_i) / N_k     (mean per-Gaussian quality; size-invariant)
+W_MODES = ("sum", "mean")
 # Per-Gaussian weight formulas. Each name describes the math literally:
 #   det_gamma_over_d2 : sigmoid(o) * det(Σ)^gamma / d^2     (current default; gamma tunable)
 #   volume            : sigmoid(o) * det(Σ)^0.5             (i.e. s_x·s_y·s_z, the 1-σ ellipsoid volume proxy)
@@ -188,12 +192,16 @@ def compute_gaussian_weights(opacity, scale_0, scale_1, scale_2, gamma=1.0,
 
 
 def compute_tile_weights_and_counts(tile_index_offsets, tile_flat_indices, w_gi,
-                                    w_norm="none", c_norm="max"):
+                                    w_norm="none", c_norm="max", w_mode="sum"):
     """
     Computes W_k (aggregate weight) and C_k (count) for all tiles.
 
     Both W_k and C_k are normalized according to `w_norm` and `c_norm`. Defaults
     preserve historical behavior: W_k unnormalized, C_k max-normalized.
+
+    w_mode controls the per-tile reduction before normalization:
+        "sum"  : W_k = Σ w(g_i)           (default; scales with tile size)
+        "mean" : W_k = Σ w(g_i) / N_k     (mean per-Gaussian quality; size-invariant)
 
     Returns:
         W_k (torch.Tensor): length-N
@@ -210,6 +218,9 @@ def compute_tile_weights_and_counts(tile_index_offsets, tile_flat_indices, w_gi,
             torch.arange(num_tiles, device=w_gi.device), sizes
         )
         W_k.scatter_add_(0, segment_ids, w_gi[tile_flat_indices])
+
+    if w_mode == "mean":
+        W_k = W_k / sizes.float().clamp(min=1).to(W_k.device)
 
     W_k = normalize_term(W_k, w_norm)
     C_k = normalize_term(C_k, c_norm)

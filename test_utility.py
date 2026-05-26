@@ -322,6 +322,7 @@ def _oracle_utilities(scheme, oracle_data, camera_index, n_tiles):
 
 
 def _write_ply(gs, selected_indices, output_path, ascii_ply):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     selected_gs = gs.extract_gaussians(selected_indices)
     selected_gs.export_gs_to_ply(str(output_path), ascii=ascii_ply)
     return output_path

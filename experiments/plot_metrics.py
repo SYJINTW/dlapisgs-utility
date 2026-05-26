@@ -147,6 +147,8 @@ def main() -> None:
     parser.add_argument("--group-by", default="scheme",
                         help="CSV column to group lines by (default: scheme). "
                              "Use 'weight_mode' for setup2, 'w_norm' for setup1, etc.")
+    parser.add_argument("--quick", action="store_true",
+                        help="Quick-inspect mode: skip NGS plot, use --out-dir as-is.")
     args = parser.parse_args()
 
     summary_csv = Path(args.summary_csv)
@@ -184,10 +186,11 @@ def main() -> None:
           out_dir / "psnr_vs_budget.png",
           hline=(60.0, "saturated (≥60 dB)"))
 
-    _plot(agg, order, labels, "ngs", "selected / total Gaussians",
-          f"Selection ratio vs Budget — {n_groups} {args.group_by}s (mean ± 95% CI, {n_views} views){suffix}",
-          out_dir / "ngs_vs_budget.png",
-          hline=(1.0, f"full scene (≈{int(scene_n_gs):,} GS)") if scene_n_gs > 0 else None)
+    if not args.quick:
+        _plot(agg, order, labels, "ngs", "selected / total Gaussians",
+              f"Selection ratio vs Budget — {n_groups} {args.group_by}s (mean ± 95% CI, {n_views} views){suffix}",
+              out_dir / "ngs_vs_budget.png",
+              hline=(1.0, f"full scene (≈{int(scene_n_gs):,} GS)") if scene_n_gs > 0 else None)
 
     _plot(agg, order, labels, "ssim", "SSIM",
           f"SSIM vs Budget — {n_groups} {args.group_by}s (mean ± 95% CI, {n_views} views){suffix}",

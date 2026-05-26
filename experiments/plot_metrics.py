@@ -20,12 +20,14 @@ import numpy as np
 
 # Stable label/order/style for the default scheme grouping.
 _SCHEME_LABELS = {
-    "vd_lod":     "VD+LOD (baseline)",
-    "vd_lod_w":   "VD+LOD+W",
-    "vd_lod_c":   "VD+LOD+C",
-    "vd_lod_w_c": "VD+LOD+W+C (proposed)",
+    "vd_lod":          "VD+LOD (baseline)",
+    "vd_lod_w":        "VD+LOD+W",
+    "vd_lod_c":        "VD+LOD+C",
+    "vd_lod_w_c":      "VD+LOD+W+C (proposed)",
+    "vd_lod_w_sa":     "VD+LOD+W (screen_area)",
+    "vd_lod_w_vd2":    "VD+LOD+W (vol/d²)",
 }
-_SCHEME_ORDER = ["vd_lod", "vd_lod_w", "vd_lod_c", "vd_lod_w_c"]
+_SCHEME_ORDER = ["vd_lod", "vd_lod_w", "vd_lod_w_sa", "vd_lod_w_vd2", "vd_lod_c", "vd_lod_w_c"]
 
 # For weight_mode grouping — worst-to-best order matches the hypothesis.
 _WEIGHT_MODE_ORDER = ["det_gamma_over_d2", "volume", "volume_over_d2", "screen_area"]
@@ -104,9 +106,9 @@ def _plot(agg: dict[str, dict[float, dict]], order: list[str], labels: dict[str,
           hline: tuple[float, str] | None = None) -> None:
     """Generic group-keyed line plot with optional horizontal reference line."""
     fig, ax = plt.subplots(figsize=(8.5, 5.2))
-    for key, marker, color in zip(order, MARKERS, COLORS):
-        if key not in agg:
-            continue
+    for i, key in enumerate(k for k in order if k in agg):
+        marker = MARKERS[i % len(MARKERS)]
+        color  = COLORS[i % len(COLORS)]
         pts = sorted(agg[key].items())
         x   = [p[0] for p in pts]
         y   = [p[1][f"{metric}_mean"] for p in pts]

@@ -9,8 +9,8 @@ Candidates evaluated:
   - 1/d_k        : inverse distance (camera-averaged)
   - W_k_screen   : Σ w_i (screen_area weights, camera-averaged)
   - W_k_vol_d2   : Σ w_i (volume_over_d2 weights, camera-averaged)
-  - C_eigenentropy, C_voxel_entropy, C_spectral_energy  (screen_area, camera-averaged)
-  - 1-C_spectral : complement of spectral_energy
+  - C_eigenentropy, C_omnivariance, C_voxel_entropy, C_spectral_energy  (screen_area weighted)
+  - C_eigenentropy_pos, C_omnivariance_pos, C_voxel_entropy_pos, C_spectral_pos  (uniform weights)
 
 Usage:
     CUDA_VISIBLE_DEVICES=3 conda run -n gsquic python experiments/0521/diag_ck_spearman.py \\
@@ -162,14 +162,19 @@ def main():
     print(f"averaging over {len(cam_indices)} cameras")
 
     # Accumulators for camera-averaged quantities
-    vis_sum   = np.zeros(num_tiles)
-    invd_sum  = np.zeros(num_tiles)
-    Wk_sc_sum = np.zeros(num_tiles)   # W_k screen_area
-    Wk_vd_sum = np.zeros(num_tiles)   # W_k volume_over_d2
-    Ck_ee_sum = np.zeros(num_tiles)   # eigenentropy
-    Ck_ov_sum = np.zeros(num_tiles)   # omnivariance
-    Ck_ve_sum = np.zeros(num_tiles)   # voxel_entropy
-    Ck_se_sum = np.zeros(num_tiles)   # spectral_energy
+    vis_sum      = np.zeros(num_tiles)
+    invd_sum     = np.zeros(num_tiles)
+    Wk_sc_sum    = np.zeros(num_tiles)   # W_k screen_area
+    Wk_vd_sum    = np.zeros(num_tiles)   # W_k volume_over_d2
+    Ck_ee_sum    = np.zeros(num_tiles)   # eigenentropy (screen_area weighted)
+    Ck_ov_sum    = np.zeros(num_tiles)   # omnivariance (screen_area weighted)
+    Ck_ve_sum    = np.zeros(num_tiles)   # voxel_entropy (screen_area weighted)
+    Ck_se_sum    = np.zeros(num_tiles)   # spectral_energy (screen_area weighted)
+    # Positional-only (uniform weights): C_k measures shape/layout, not opacity/scale
+    Ck_ee_pos_sum = np.zeros(num_tiles)
+    Ck_ov_pos_sum = np.zeros(num_tiles)
+    Ck_ve_pos_sum = np.zeros(num_tiles)
+    Ck_se_pos_sum = np.zeros(num_tiles)
 
     for ci in cam_indices:
         cam = cameras[ci]
@@ -182,6 +187,7 @@ def main():
 
         w_sc, xyz_t = _screen_area_weights(gs, cam, device)
         w_vd, _     = _vol_d2_weights(gs, cam, device)
+        w_unif      = torch.ones_like(w_sc)
 
         Wk_sc, _ = uc.compute_tile_weights_and_counts(
             tile_index_offsets, tile_flat_indices, w_sc, w_norm="none", c_norm="none"
@@ -205,15 +211,35 @@ def main():
             "spectral_energy", tile_index_offsets, tile_flat_indices, w_sc, xyz_t,
             min_corners=min_corners_t, max_corners=max_corners_t,
         )
+        Ck_ee_pos = uc.compute_tile_complexity(
+            "eigenentropy", tile_index_offsets, tile_flat_indices, w_unif, xyz_t,
+            min_corners=min_corners_t, max_corners=max_corners_t,
+        )
+        Ck_ov_pos = uc.compute_tile_complexity(
+            "omnivariance", tile_index_offsets, tile_flat_indices, w_unif, xyz_t,
+            min_corners=min_corners_t, max_corners=max_corners_t,
+        )
+        Ck_ve_pos = uc.compute_tile_complexity(
+            "voxel_entropy", tile_index_offsets, tile_flat_indices, w_unif, xyz_t,
+            min_corners=min_corners_t, max_corners=max_corners_t,
+        )
+        Ck_se_pos = uc.compute_tile_complexity(
+            "spectral_energy", tile_index_offsets, tile_flat_indices, w_unif, xyz_t,
+            min_corners=min_corners_t, max_corners=max_corners_t,
+        )
 
-        vis_sum   += vis
-        invd_sum  += 1.0 / (dists + 1e-3)
-        Wk_sc_sum += Wk_sc.cpu().numpy()
-        Wk_vd_sum += Wk_vd.cpu().numpy()
-        Ck_ee_sum += Ck_ee.cpu().numpy()
-        Ck_ov_sum += Ck_ov.cpu().numpy()
-        Ck_ve_sum += Ck_ve.cpu().numpy()
-        Ck_se_sum += Ck_se.cpu().numpy()
+        vis_sum       += vis
+        invd_sum      += 1.0 / (dists + 1e-3)
+        Wk_sc_sum     += Wk_sc.cpu().numpy()
+        Wk_vd_sum     += Wk_vd.cpu().numpy()
+        Ck_ee_sum     += Ck_ee.cpu().numpy()
+        Ck_ov_sum     += Ck_ov.cpu().numpy()
+        Ck_ve_sum     += Ck_ve.cpu().numpy()
+        Ck_se_sum     += Ck_se.cpu().numpy()
+        Ck_ee_pos_sum += Ck_ee_pos.cpu().numpy()
+        Ck_ov_pos_sum += Ck_ov_pos.cpu().numpy()
+        Ck_ve_pos_sum += Ck_ve_pos.cpu().numpy()
+        Ck_se_pos_sum += Ck_se_pos.cpu().numpy()
         print(f"  cam {ci:03d} done")
 
     n_cam = len(cam_indices)
@@ -222,18 +248,21 @@ def main():
     w_bar_k_sc = np.where(sizes > 0, Wk_sc_avg / sizes, 0.0)
     w_bar_k_vd = np.where(sizes > 0, Wk_vd_avg / sizes, 0.0)
     candidates = {
-        "N_k":              sizes,
-        "v_k":              vis_sum   / n_cam,
-        "1/d_k":            invd_sum  / n_cam,
-        "W_k_screen":       Wk_sc_avg,
-        "W_k_vol_d2":       Wk_vd_avg,
-        "wbar_k_screen":    w_bar_k_sc,
-        "wbar_k_vol_d2":    w_bar_k_vd,
-        "C_eigenentropy":   Ck_ee_sum / n_cam,
-        "C_omnivariance":   Ck_ov_sum / n_cam,
-        "C_voxel_entropy":  Ck_ve_sum / n_cam,
-        "C_spectral_energy":Ck_se_sum / n_cam,
-        "1-C_spectral":     1.0 - Ck_se_sum / n_cam,
+        "N_k":                 sizes,
+        "v_k":                 vis_sum    / n_cam,
+        "1/d_k":               invd_sum   / n_cam,
+        "W_k_screen":          Wk_sc_avg,
+        "W_k_vol_d2":          Wk_vd_avg,
+        "wbar_k_screen":       w_bar_k_sc,
+        "wbar_k_vol_d2":       w_bar_k_vd,
+        "C_eigenentropy":      Ck_ee_sum  / n_cam,
+        "C_omnivariance":      Ck_ov_sum  / n_cam,
+        "C_voxel_entropy":     Ck_ve_sum  / n_cam,
+        "C_spectral_energy":   Ck_se_sum  / n_cam,
+        "C_eigenentropy_pos":  Ck_ee_pos_sum / n_cam,
+        "C_omnivariance_pos":  Ck_ov_pos_sum / n_cam,
+        "C_voxel_entropy_pos": Ck_ve_pos_sum / n_cam,
+        "C_spectral_pos":      Ck_se_pos_sum / n_cam,
     }
 
     # --- OLS residual ---

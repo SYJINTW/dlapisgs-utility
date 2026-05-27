@@ -52,11 +52,11 @@ import visibility_AABB_pytorch  # noqa: E402
 import tiling as ggsp_tiling  # noqa: E402
 import utility_calculation as uc  # noqa: E402
 import io_3dgs  # noqa: E402  # pyright: ignore[reportMissingImports]
-from ml import predict as ml_predict  # noqa: E402
+from ml import predict as ml_predict, features as ml_features  # noqa: E402
 
 
 VALID_SCHEMES = ["vd", "vd_lod", "vd_lod_w", "vd_lod_c", "vd_lod_w_c",
-                 "ml_lgbm_raw", "ml_lgbm_resid",
+                 "ml",
                  "oracle_loo", "oracle_aoi", "oracle_combined"]
 PLY_WORKERS = 4
 
@@ -401,8 +401,11 @@ def main() -> None:
                         help="Print the full job matrix (cameras x schemes x budgets -> paths) and exit. "
                              "No GPU work or disk writes. Shows [x] for outputs that already exist.")
     parser.add_argument("--ml-model-dir", type=str, default=None,
-                        help="Directory containing trained LightGBM models (model_raw.pkl, "
-                             "model_resid.pkl, ols_coefs.json). Required when using ml_lgbm_* schemes.")
+                        help="Directory containing trained ML models (lgbm.pkl, xgb.pkl, rf.pkl, "
+                             "feature_names.json). E.g. ml/models/ship/ABCD. Required for ml scheme.")
+    parser.add_argument("--ml-model-type", type=str, default="lgbm",
+                        choices=["lgbm", "xgb", "rf"],
+                        help="Which trained model to use for the ml scheme (default: lgbm).")
     parser.add_argument("--oracle-npz", type=str, default=None,
                         help="oracle_dq.npz from exp4_oracle_dq.py. Required when using oracle_* schemes.")
     args = parser.parse_args()
@@ -431,8 +434,8 @@ def main() -> None:
     if args.output_root is None and args.output is None:
         raise ValueError("Either --output-root or --output must be provided")
 
-    if any(s.startswith("ml_lgbm_") for s in scheme_list) and args.ml_model_dir is None:
-        raise ValueError("--ml-model-dir is required when using ml_lgbm_* schemes")
+    if "ml" in scheme_list and args.ml_model_dir is None:
+        raise ValueError("--ml-model-dir is required when using the ml scheme")
     if any(s.startswith("oracle_") for s in scheme_list) and args.oracle_npz is None:
         raise ValueError("--oracle-npz is required when using oracle_* schemes")
 
@@ -566,6 +569,21 @@ def main() -> None:
     bytes_per_gaussian = _bytes_per_gaussian(gs)
     max_budget_bytes = int(max(budget_list) * 1024 * 1024)
 
+    # ---- ML: precompute view-independent features C+D (once per run) ----
+    ml_static_feats = None
+    ml_feature_names = None
+    ml_include_b = False
+    if "ml" in scheme_list:
+        _ml_model_path = Path(args.ml_model_dir)
+        ml_feature_names = json.loads((_ml_model_path / "feature_names.json").read_text())
+        ml_include_b = any(n in set(ml_features.GROUP_B_NAMES) for n in ml_feature_names)
+        logger.info("ml: model_dir={} model_type={} include_group_b={} n_features={}",
+                    _ml_model_path, args.ml_model_type, ml_include_b, len(ml_feature_names))
+        with _timed("ml_static_features", timings):
+            ml_static_feats = ml_features.build_static_features(
+                gs.data, index_offsets, flat_indices
+            )
+
     if args.camera_indices is not None:
         for ci in args.camera_indices:
             if ci >= len(cameras):
@@ -684,6 +702,35 @@ def main() -> None:
         visibility_meta = np_visibility_all[meta_positions] if len(meta_positions) > 0 else np.zeros((0,), dtype=bool)
         tile_centers_np = tile_centers.cpu().numpy()
 
+        # ---- ML: per-camera features A (+ B if enabled) ----
+        ml_group_a = ml_group_b = None
+        if "ml" in scheme_list:
+            with _timed("ml_camera_features", timings, camera=camera_index):
+                import math as _math
+                _n_gs_per_tile = (index_offsets[1:] - index_offsets[:-1]).astype(np.float32)
+                _cam_fwd = cam_w2v[:3, 2]  # 3rd column of R_wv = camera forward in world
+                ml_group_a = ml_features.build_group_a(
+                    cam_center_np, _cam_fwd,
+                    float(getattr(cam, "FoVx", _math.pi / 2)),
+                    float(getattr(cam, "FoVy", _math.pi / 2)),
+                    tile_centers_np, _n_gs_per_tile, np_distances, np_visibility_all,
+                )
+                if ml_include_b:
+                    if any(r is None for r in (rot_0, rot_1, rot_2, rot_3)):
+                        raise RuntimeError("ml scheme with Group B requires rot_0..rot_3 in PLY")
+                    ml_group_b = ml_features.build_group_b(
+                        tile_index_offsets, tile_flat_indices,
+                        min_corners_t, max_corners_t,
+                        gs_xyz_t, opacity, scale_0, scale_1, scale_2,
+                        rot_0, rot_1, rot_2, rot_3,
+                        cam.camera_center.to(device),
+                        cam.world_view_transform, cam.projection_matrix,
+                        args.img_w, args.img_h,
+                        _n_gs_per_tile, device,
+                        fov_x=getattr(cam, "FoVx", None),
+                        fov_y=getattr(cam, "FoVy", None),
+                    )
+
         shared_vis_dir = base_output_path / "camera_viz"
         shared_vis_dir.mkdir(parents=True, exist_ok=True)
         shared_vis_npz = shared_vis_dir / f"{camera_index:03d}.npz"
@@ -701,14 +748,13 @@ def main() -> None:
                 if scheme.startswith("oracle_"):
                     n_tiles = len(index_offsets) - 1
                     utilities = _oracle_utilities(scheme, oracle_data, camera_index, n_tiles)
-                elif scheme.startswith("ml_lgbm_"):
-                    head = scheme[len("ml_lgbm_"):]
+                elif scheme == "ml":
                     utilities = ml_predict.predict_utility(
-                        args.ml_model_dir, head,
-                        visibility_t=visibility,
-                        distances_t=distances,
-                        tile_index_offsets_t=tile_index_offsets,
-                        W_k_t=W_k,
+                        args.ml_model_dir, args.ml_model_type,
+                        static_features=ml_static_feats,
+                        group_a=ml_group_a,
+                        group_b=ml_group_b,
+                        feature_names=ml_feature_names,
                     )
                 else:
                     include_lod = scheme != "vd"

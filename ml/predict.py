@@ -1,90 +1,84 @@
-"""Inference helper: per-(tile, LOD=0) utility scores from a trained LightGBM model.
+"""Inference helper: per-tile utility scores from a trained ML model.
 
-Returns sorted (tile_idx, lod) pairs in the same format as uc.calculate_utility_param,
-so it drops into the existing _greedy_order_* functions unchanged.
+Loads a model from model_dir/{model_type}.pkl and feature_names.json,
+assembles features from precomputed static (C+D) + per-camera (A+B),
+returns (tile_idx, lod=0) pairs sorted descending by predicted score.
+
+The model output is used directly as tile priority — no invisible-tile floor.
+v_k is in Group A so the model learns visibility importance end-to-end.
 """
 
 import json
-import sys
 from pathlib import Path
 
 import joblib
 import numpy as np
 
-_HERE = Path(__file__).resolve().parent.parent
-_WORKSPACE = _HERE.parent
-for _p in (_WORKSPACE / "Frustum-for-3DGS", _WORKSPACE / "GGSP", _WORKSPACE / "GS-Interface"):
-    _s = str(_p)
-    if _s not in sys.path:
-        sys.path.insert(0, _s)
-
-import utility_calculation as uc  # noqa: E402
-
-FEAT_COLS = ["lod", "v_k", "d_k", "C_k", "W_k"]
-
 
 def predict_utility(
     model_dir: str,
-    head: str,
+    model_type: str,          # "lgbm" | "xgb" | "rf"
     *,
-    visibility_t,
-    distances_t,
-    tile_index_offsets_t,
-    W_k_t,
-    num_lod: int = 1,
+    static_features: np.ndarray,   # (N_tiles, 134) — Groups C+D, precomputed at startup
+    group_a: np.ndarray,            # (N_tiles, 14)  — Group A per camera
+    group_b: "np.ndarray | None",   # (N_tiles, 12)  — Group B or None
+    feature_names: list,            # list[str] from feature_names.json
 ) -> np.ndarray:
-    """Predict tile utility scores and return sorted (tile_idx, lod) pairs.
+    """Predict tile utility and return sorted (tile_idx, lod=0) pairs.
 
     Args:
-        model_dir: Directory with model_{head}.pkl and ols_coefs.json.
-        head: "raw" or "resid".
-        visibility_t: bool tensor [N_tiles].
-        distances_t: float tensor [N_tiles].
-        tile_index_offsets_t: long tensor [N_tiles+1] from tiling cache.
-        W_k_t: float tensor [N_tiles], sum-normalized per-tile screen_area weight.
-        num_lod: kept for API parity; v1 always emits lod=0.
+        model_dir:       Dir with {lgbm|xgb|rf}.pkl and feature_names.json.
+        model_type:      Which model to use: "lgbm", "xgb", or "rf".
+        static_features: Groups C+D precomputed at startup. Shape (N_tiles, 134).
+        group_a:         Group A per-camera features. Shape (N_tiles, 14).
+        group_b:         Group B per-camera features. Shape (N_tiles, 12), or None
+                         if model was trained without Group B.
+        feature_names:   Column names matching training order.
 
     Returns:
-        np.ndarray shape (N_tiles, 2), dtype int64 — (tile_idx, lod) pairs
-        sorted descending by predicted utility. Matches calculate_utility_param output.
+        np.ndarray shape (N_tiles, 2), dtype int64: (tile_idx, lod=0) sorted
+        descending by predicted score. Matches calculate_utility_param output format.
     """
     model_dir = Path(model_dir)
-    model = joblib.load(model_dir / f"model_{head}.pkl")
+    model_pkl = model_dir / f"{model_type}.pkl"
+    if not model_pkl.exists():
+        raise FileNotFoundError(
+            f"Model not found: {model_pkl}. "
+            f"Train first with: python ml/train.py --oracle-npz <path> --output-dir <dir>"
+        )
+    model = joblib.load(model_pkl)
 
-    beta0, beta1 = 0.0, 0.0
-    if head == "resid":
-        coefs = json.loads((model_dir / "ols_coefs.json").read_text())
-        beta0, beta1 = coefs["beta0"], coefs["beta1"]
+    # ── Assemble full feature matrix [A | B | C | D] ──────────────────────
+    if group_b is not None:
+        X_all = np.hstack([group_a, group_b, static_features])  # (N_tiles, 160)
+    else:
+        X_all = np.hstack([group_a, static_features])            # (N_tiles, 148 or 132)
 
-    v_k = visibility_t.float().cpu().numpy()
-    d_k = distances_t.cpu().numpy()
-    offsets = tile_index_offsets_t.cpu().numpy()
-    C_k = (offsets[1:] - offsets[:-1]).astype(np.float32)
-    W_k = W_k_t.cpu().numpy()
+    # ── Select columns matching training feature order ─────────────────────
+    # Build column name → index map from ALL_FEATURE_NAMES order used in X_all.
+    # The order in X_all depends on whether group_b is present.
+    from ml.features import (GROUP_A_NAMES, GROUP_B_NAMES,
+                              GROUP_C_NAMES, GROUP_D_NAMES)
+    if group_b is not None:
+        all_col_names = GROUP_A_NAMES + GROUP_B_NAMES + GROUP_C_NAMES + GROUP_D_NAMES
+    else:
+        all_col_names = GROUP_A_NAMES + GROUP_C_NAMES + GROUP_D_NAMES
 
-    N_tiles = len(v_k)
-    X = np.column_stack([
-        np.zeros(N_tiles, dtype=np.float32),  # lod=0
-        v_k,
-        d_k,
-        C_k,
-        W_k,
-    ])
+    col_map = {name: i for i, name in enumerate(all_col_names)}
+    try:
+        feat_idx = [col_map[n] for n in feature_names]
+    except KeyError as e:
+        raise KeyError(
+            f"Feature '{e.args[0]}' in feature_names.json not found in assembled matrix. "
+            "Ensure the model was trained with matching Group B setting."
+        ) from e
 
+    X = X_all[:, feat_idx].astype(np.float32)
+
+    # ── Predict and sort ───────────────────────────────────────────────────
     scores = model.predict(X).astype(np.float64)
 
-    if head == "resid":
-        scores += beta0 + beta1 * np.log(C_k.clip(1))
-
-    # Invisible tiles must rank below all visible ones.
-    # Model outputs log(ΔMSE) which is negative (ΔMSE << 1), so we can't use
-    # INVISIBLE_PRIORITY_EPS (=1e-2, positive) — that would rank invisible tiles first.
-    visible_mask = v_k > 0
-    if visible_mask.any():
-        scores[~visible_mask] = scores[visible_mask].min() - 1.0
-    else:
-        scores[:] = -1e9
-
+    N_tiles = len(scores)
     order = np.argsort(-scores, kind="stable")
     pairs = np.column_stack([order, np.zeros(N_tiles, dtype=np.int64)])
     return pairs.astype(np.int64)

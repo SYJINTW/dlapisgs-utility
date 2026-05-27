@@ -1,13 +1,15 @@
-"""ML feature builder — Groups A/B/C/D.
+"""ML feature builder — Groups A/B/C/D/E/F.
 
 Feature groups:
   A (14)  : viewport + tile geometry — view-dependent
   B (12)  : handcrafted tile signals — view-dependent
   C (118) : GS aggregate stats (mean+std of all 59 PLY attrs after transforms) — view-independent
   D (16)  : higher-order moments for opacity+scale_0/1/2 — view-independent
+  E (50)  : PCA of GS attrs (top-25 PCs) → per-tile mean+std — view-independent
+  F (6)   : SH-evaluated color (opacity-weighted mean+std RGB per tile) — view-dependent
 
-Groups C+D are view-independent; call build_static_features() once at startup.
-Groups A+B are view-dependent; call build_group_a() and build_group_b() per camera.
+Groups C/D/E are view-independent; call their builders once at startup.
+Groups A/B/F are view-dependent; call their builders per camera.
 
 Training entry point:
     df, names = build_feature_matrix(oracle_npz_path)
@@ -29,6 +31,7 @@ for _p in (
     WORKSPACE / "Frustum-for-3DGS",
     WORKSPACE / "GGSP",
     WORKSPACE / "GS-Interface",
+    WORKSPACE / "LapisGS-object-based-renderer",
 ):
     _s = str(_p)
     if _s not in sys.path:
@@ -37,6 +40,7 @@ for _p in (
 import visibility_AABB_pytorch  # noqa: E402
 import io_3dgs  # noqa: E402
 import utility_calculation as uc  # noqa: E402
+from utils.sh_utils import eval_sh  # noqa: E402
 
 # ─── canonical 59 PLY attribute names (excluding nx/ny/nz which are all-zero) ─
 
@@ -83,24 +87,38 @@ GROUP_D_NAMES: list = [
     for m in ("skew", "kurt", "median", "max")
 ]  # 16
 
-ALL_FEATURE_NAMES: list = GROUP_A_NAMES + GROUP_B_NAMES + GROUP_C_NAMES + GROUP_D_NAMES
-# 14 + 12 + 118 + 16 = 160
+GROUP_F_NAMES: list = [
+    "sh_mean_r", "sh_mean_g", "sh_mean_b",
+    "sh_std_r",  "sh_std_g",  "sh_std_b",
+]  # 6
 
-ABLATION_NAMES = ("ABCD", "ACD", "AC", "ABC")
+ALL_FEATURE_NAMES: list = GROUP_A_NAMES + GROUP_B_NAMES + GROUP_C_NAMES + GROUP_D_NAMES + GROUP_F_NAMES
+# 14 + 12 + 118 + 16 + 6 = 166
+
+_GROUP_MAP: dict = {
+    "A": GROUP_A_NAMES,
+    "B": GROUP_B_NAMES,
+    "C": GROUP_C_NAMES,
+    "D": GROUP_D_NAMES,
+    "F": GROUP_F_NAMES,
+}
+_GROUP_ORDER = "ABCDF"
+
+# Canonical example ablations (any subset of ABCDF is valid).
+ABLATION_NAMES = ("ABCDF", "ABCD", "ACDF", "ACD", "ACF", "AC", "AF", "ABC", "AB", "A")
 _GROUP_B_SET = set(GROUP_B_NAMES)
 
 
 def feature_names_for_ablation(ablation: str) -> list:
-    """Return ordered feature name list for a given ablation."""
-    if ablation == "ABCD":
-        return GROUP_A_NAMES + GROUP_B_NAMES + GROUP_C_NAMES + GROUP_D_NAMES
-    if ablation == "ACD":
-        return GROUP_A_NAMES + GROUP_C_NAMES + GROUP_D_NAMES
-    if ablation == "AC":
-        return GROUP_A_NAMES + GROUP_C_NAMES
-    if ablation == "ABC":
-        return GROUP_A_NAMES + GROUP_B_NAMES + GROUP_C_NAMES
-    raise ValueError(f"unknown ablation '{ablation}'; valid: {ABLATION_NAMES}")
+    """Return ordered feature names for an ablation.
+
+    Ablation = subset of 'ABCDF' in canonical order (A < B < C < D < F).
+    Any combination is valid, e.g. 'AF', 'ACDF', 'ABCDF'.
+    """
+    unknown = set(ablation) - set(_GROUP_MAP)
+    if unknown:
+        raise ValueError(f"unknown group(s) {sorted(unknown)} in ablation '{ablation}'")
+    return [name for g in _GROUP_ORDER if g in ablation for name in _GROUP_MAP[g]]
 
 
 # ─── view-independent features (Groups C+D) ───────────────────────────────────
@@ -290,6 +308,78 @@ def build_group_b(tile_index_offsets_t: torch.Tensor,
     ]).astype(np.float32)  # (N_tiles, 12)
 
 
+def build_group_f(
+    gs_data: dict,
+    flat_indices: np.ndarray,
+    index_offsets: np.ndarray,
+    gs_xyz: np.ndarray,
+    cam_pos_np: np.ndarray,
+    sh_deg: int,
+) -> np.ndarray:
+    """Build Group F: SH-evaluated color per tile, per camera.
+
+    Direction convention matches 3DGS renderer:
+        dir = normalize(gs_xyz - cam_pos)  [Gaussian → camera, then negated inside SH]
+
+    Args:
+        gs_data:       gs.data dict from GaussianModelV2
+        flat_indices:  (N_total_gs,) tile membership
+        index_offsets: (N_tiles+1,) CSR offsets
+        gs_xyz:        (N_gs, 3) float32
+        cam_pos_np:    (3,) camera world position
+        sh_deg:        SH degree of the model (0-3)
+
+    Returns:
+        float32 array (N_tiles, 6)
+        columns: sh_mean_r/g/b, sh_std_r/g/b  (opacity-weighted)
+    """
+    N_gs   = len(gs_xyz)
+    N_tiles = len(index_offsets) - 1
+    n_coeff = (sh_deg + 1) ** 2
+
+    # Build SH tensor (N_gs, 3, n_coeff).
+    # PLY layout (standard 3DGS): f_rest_{(i-1)*3 + c} = i-th higher-order coeff, channel c.
+    shs = np.zeros((N_gs, 3, n_coeff), dtype=np.float32)
+    for c, dc_key in enumerate(["f_dc_0", "f_dc_1", "f_dc_2"]):
+        shs[:, c, 0] = gs_data[dc_key]["data"].astype(np.float32)
+    for i in range(1, n_coeff):
+        for c in range(3):
+            rest_key = f"f_rest_{(i - 1) * 3 + c}"
+            if rest_key in gs_data:
+                shs[:, c, i] = gs_data[rest_key]["data"].astype(np.float32)
+
+    # Viewing directions: gs → cam (matches 3DGS renderer sign convention).
+    dirs = gs_xyz - cam_pos_np[None, :]          # (N_gs, 3)
+    norms = np.linalg.norm(dirs, axis=1, keepdims=True).clip(min=1e-6)
+    dirs = (dirs / norms).astype(np.float32)      # (N_gs, 3)
+
+    # Evaluate SH → RGB, then apply +0.5 offset and clamp (matches 3DGS renderer).
+    rgb = eval_sh(sh_deg, shs, dirs)              # (N_gs, 3)
+    rgb = np.clip(rgb + 0.5, 0.0, 1.0).astype(np.float32)
+
+    # Opacity weights: sigmoid(raw opacity).
+    raw_op = gs_data["opacity"]["data"].astype(np.float32)
+    opacity = (1.0 / (1.0 + np.exp(-raw_op.clip(-30, 30)))).astype(np.float32)
+
+    # Per-tile opacity-weighted mean and std of RGB.
+    out = np.zeros((N_tiles, 6), dtype=np.float32)
+    for t in range(N_tiles):
+        s, e = int(index_offsets[t]), int(index_offsets[t + 1])
+        if e <= s:
+            continue
+        idx  = flat_indices[s:e]
+        w    = opacity[idx]                        # (n,)
+        c    = rgb[idx]                            # (n, 3)
+        w_sum = float(w.sum()) + 1e-8
+        mean_rgb  = (w[:, None] * c).sum(axis=0) / w_sum
+        diff      = c - mean_rgb[None, :]
+        std_rgb   = np.sqrt((w[:, None] * diff ** 2).sum(axis=0) / w_sum)
+        out[t, :3] = mean_rgb
+        out[t, 3:] = std_rgb
+
+    return out  # (N_tiles, 6)
+
+
 # ─── training entry point ─────────────────────────────────────────────────────
 
 def build_feature_matrix(oracle_npz_path: str) -> "tuple[pd.DataFrame, list]":
@@ -391,7 +481,12 @@ def build_feature_matrix(oracle_npz_path: str) -> "tuple[pd.DataFrame, list]":
             fov_x=getattr(cam, "FoVx", None), fov_y=getattr(cam, "FoVy", None),
         )
 
-        X_cam = np.hstack([group_a, group_b, static_feats])  # (N_tiles, 160)
+        group_f = build_group_f(
+            gs.data, flat_indices, index_offsets,
+            gs_xyz, cam_pos_np, gs.sh_deg,
+        )
+
+        X_cam = np.hstack([group_a, group_b, static_feats, group_f])  # (N_tiles, 166)
 
         row_idx = cam_to_row[cam_idx_int]
         mse_row = mse_loo[row_idx]   # (N_tiles,)

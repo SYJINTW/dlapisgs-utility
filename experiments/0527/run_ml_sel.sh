@@ -21,7 +21,9 @@ ABLATION="${ABLATION:-ACD}"
 MODEL_TYPE="${MODEL_TYPE:-lgbm}"
 BUDGETS="10 25 40 55 70 85 99 100"
 
-SCENES=(chair drums ficus hotdog materials mic ship bicycle)
+# SCENES=(chair drums ficus hotdog materials mic ship bicycle)
+SCENES=(chair drums ficus hotdog materials mic ship)
+
 
 # Extract fields from params.yaml
 get_param() {

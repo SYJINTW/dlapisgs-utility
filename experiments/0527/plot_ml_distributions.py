@@ -95,10 +95,13 @@ def main():
         # ── collect predictions ──────────────────────────────────────────────
         model_preds = {}
         model_rhos  = {}
-        colors = {"lgbm": "#1f77b4", "xgb": "#ff7f0e", "rf": "#2ca02c"}
+        colors = {
+            "lgbm":  "#1f77b4", "xgb":   "#ff7f0e", "rf":    "#2ca02c",
+            "ols":   "#9467bd", "ridge":  "#8c564b", "lasso": "#e377c2",
+        }
         from scipy.stats import spearmanr
 
-        for mtype in ("lgbm", "xgb", "rf"):
+        for mtype in ("lgbm", "xgb", "rf", "ols", "ridge", "lasso"):
             pkl = ablation_dir / f"{mtype}.pkl"
             if not pkl.exists():
                 continue
@@ -107,7 +110,8 @@ def main():
             model_preds[mtype] = preds
             rho, _ = spearmanr(preds, y_te)
             model_rhos[mtype] = float(rho)
-            print(f"  {mtype} ρ_test = {rho:.4f}", flush=True)
+            r2 = metrics.get(mtype, {}).get("r2_test", float("nan"))
+            print(f"  {mtype} ρ_test = {rho:.4f}  R²_test = {r2:.4f}", flush=True)
 
         # ── plot ─────────────────────────────────────────────────────────────
         fig, ax = plt.subplots(figsize=(7, 4))

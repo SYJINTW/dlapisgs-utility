@@ -21,6 +21,8 @@ import lightgbm as lgb
 import numpy as np
 from scipy.stats import spearmanr
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression, Ridge, Lasso
+from sklearn.metrics import r2_score
 
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
@@ -119,11 +121,12 @@ def train_scene(oracle_npz_path: str, output_dir: str, seed: int = 0):
         preds_lgbm = model_lgbm.predict(X_te)
         rho_lgbm_tr, _ = _spearman(model_lgbm.predict(X_tr), y_tr)
         rho_lgbm_te, _ = _spearman(preds_lgbm, y_te)
+        r2_lgbm = float(r2_score(y_te, preds_lgbm))
         print(f"    LGBM  ρ_train={rho_lgbm_tr:.4f}  ρ_test={rho_lgbm_te:.4f}  "
-              f"best_iter={model_lgbm.best_iteration_}", flush=True)
+              f"R²_test={r2_lgbm:.4f}  best_iter={model_lgbm.best_iteration_}", flush=True)
         joblib.dump(model_lgbm, ablation_dir / "lgbm.pkl")
         metrics["lgbm"] = {
-            "rho_train": rho_lgbm_tr, "rho_test": rho_lgbm_te,
+            "rho_train": rho_lgbm_tr, "rho_test": rho_lgbm_te, "r2_test": r2_lgbm,
             "best_iter": int(model_lgbm.best_iteration_),
         }
 
@@ -133,17 +136,18 @@ def train_scene(oracle_npz_path: str, output_dir: str, seed: int = 0):
             model_xgb = xgb.XGBRegressor(
                 n_estimators=1000, random_state=seed, n_jobs=-1,
                 verbosity=0, eval_metric="rmse",
-                early_stopping_rounds=50,
+                early_stopping_rounds=150,
             )
             model_xgb.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
             preds_xgb = model_xgb.predict(X_te)
             rho_xgb_tr, _ = _spearman(model_xgb.predict(X_tr), y_tr)
             rho_xgb_te, _ = _spearman(preds_xgb, y_te)
+            r2_xgb = float(r2_score(y_te, preds_xgb))
             print(f"    XGB   ρ_train={rho_xgb_tr:.4f}  ρ_test={rho_xgb_te:.4f}  "
-                  f"best_iter={model_xgb.best_iteration}", flush=True)
+                  f"R²_test={r2_xgb:.4f}  best_iter={model_xgb.best_iteration}", flush=True)
             joblib.dump(model_xgb, ablation_dir / "xgb.pkl")
             metrics["xgb"] = {
-                "rho_train": rho_xgb_tr, "rho_test": rho_xgb_te,
+                "rho_train": rho_xgb_tr, "rho_test": rho_xgb_te, "r2_test": r2_xgb,
                 "best_iter": int(model_xgb.best_iteration),
             }
 
@@ -156,11 +160,32 @@ def train_scene(oracle_npz_path: str, output_dir: str, seed: int = 0):
         preds_rf = model_rf.predict(X_te)
         rho_rf_tr, _ = _spearman(model_rf.predict(X_tr), y_tr)
         rho_rf_te, _ = _spearman(preds_rf, y_te)
-        print(f"    RF    ρ_train={rho_rf_tr:.4f}  ρ_test={rho_rf_te:.4f}", flush=True)
+        r2_rf = float(r2_score(y_te, preds_rf))
+        print(f"    RF    ρ_train={rho_rf_tr:.4f}  ρ_test={rho_rf_te:.4f}  "
+              f"R²_test={r2_rf:.4f}", flush=True)
         joblib.dump(model_rf, ablation_dir / "rf.pkl")
         metrics["rf"] = {
-            "rho_train": rho_rf_tr, "rho_test": rho_rf_te,
+            "rho_train": rho_rf_tr, "rho_test": rho_rf_te, "r2_test": r2_rf,
         }
+
+        # ── Linear models ────────────────────────────────────────────────────
+        for lin_name, lin_model in [
+            ("ols",   LinearRegression()),
+            ("ridge", Ridge(alpha=1.0)),
+            ("lasso", Lasso(alpha=0.001, max_iter=5000)),
+        ]:
+            print(f"  Training {lin_name.upper()} ...", flush=True)
+            lin_model.fit(X_tr, y_tr)
+            preds_lin = lin_model.predict(X_te)
+            rho_lin_tr, _ = _spearman(lin_model.predict(X_tr), y_tr)
+            rho_lin_te, _ = _spearman(preds_lin, y_te)
+            r2_lin = float(r2_score(y_te, preds_lin))
+            print(f"    {lin_name.upper():5s} ρ_train={rho_lin_tr:.4f}  ρ_test={rho_lin_te:.4f}  "
+                  f"R²_test={r2_lin:.4f}", flush=True)
+            joblib.dump(lin_model, ablation_dir / f"{lin_name}.pkl")
+            metrics[lin_name] = {
+                "rho_train": rho_lin_tr, "rho_test": rho_lin_te, "r2_test": r2_lin,
+            }
 
         # ── Save feature names and metrics ───────────────────────────────────
         (ablation_dir / "feature_names.json").write_text(json.dumps(feat_cols, indent=2))

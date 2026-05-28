@@ -68,8 +68,15 @@ def _apply_label_mode(df, label_mode, feat_cols):
 _RF_SWEEP_LEAF    = (1, 2, 5, 10, 20, 50)
 _RF_SWEEP_FEATS   = (0.3, 0.5, 0.7, 1.0)
 
+_LGBM_SWEEP_LEAVES     = (15, 31, 63)
+_LGBM_SWEEP_MIN_CHILD  = (20, 50, 100)
 
-def _run_cv(df, feat_cols, split_key, cv_folds, seed, models_to_run, rf_kwargs=None):
+_XGB_SWEEP_DEPTH    = (3, 6, 9)
+_XGB_SWEEP_SUBSAMPLE = (0.5, 0.8, 1.0)
+
+
+def _run_cv(df, feat_cols, split_key, cv_folds, seed, models_to_run,
+            rf_kwargs=None, lgbm_kwargs=None, xgb_kwargs=None):
     """5-fold (or n-fold) cross-validation.
 
     Within each fold, 20% of train units are carved as val for LGBM/XGB early stopping.
@@ -118,7 +125,9 @@ def _run_cv(df, feat_cols, split_key, cv_folds, seed, models_to_run, rf_kwargs=N
 
         # ── LightGBM ────────────────────────────────────────────────────────
         if "lgbm" in models_to_run:
-            m = lgb.LGBMRegressor(n_estimators=1000, random_state=seed, n_jobs=-1, verbosity=-1)
+            kw = lgbm_kwargs or {}
+            m = lgb.LGBMRegressor(n_estimators=1000, random_state=seed, n_jobs=-1,
+                                  verbosity=-1, **kw)
             m.fit(X_tr, y_tr, eval_set=[(X_va, y_va)],
                   callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)])
             preds = m.predict(X_te)
@@ -128,8 +137,10 @@ def _run_cv(df, feat_cols, split_key, cv_folds, seed, models_to_run, rf_kwargs=N
 
         # ── XGBoost ─────────────────────────────────────────────────────────
         if "xgb" in models_to_run and _HAS_XGB:
+            kw = xgb_kwargs or {}
             m = xgb.XGBRegressor(n_estimators=1000, random_state=seed, n_jobs=-1,
-                                  verbosity=0, eval_metric="rmse", early_stopping_rounds=150)
+                                  verbosity=0, eval_metric="rmse",
+                                  early_stopping_rounds=150, **kw)
             m.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
             preds = m.predict(X_te)
             fold_rho["xgb"].append(_spearman(preds, y_te)[0])
@@ -193,21 +204,93 @@ def sweep_rf_hparams(df, feat_cols, split_key, cv_folds, seed,
     return results
 
 
-def _refit_final(X_all, y_all, seed, models_to_run, best_iters, rf_kwargs=None):
+def sweep_lgbm_hparams(df, feat_cols, split_key, cv_folds, seed,
+                       leaves_grid=_LGBM_SWEEP_LEAVES,
+                       min_child_grid=_LGBM_SWEEP_MIN_CHILD):
+    """Grid search num_leaves × min_child_samples for LGBM via CV.
+
+    Returns list of dicts sorted by cv_rho_mean desc.
+    """
+    results = []
+    for nl in leaves_grid:
+        for mc in min_child_grid:
+            kw = {"num_leaves": nl, "min_child_samples": mc}
+            cv_stats, _, _, _ = _run_cv(
+                df, feat_cols, split_key, cv_folds, seed,
+                models_to_run={"lgbm"}, lgbm_kwargs=kw,
+            )
+            s = cv_stats.get("lgbm", {})
+            results.append({
+                "num_leaves":        nl,
+                "min_child_samples": mc,
+                "cv_rho_mean": s.get("cv_rho_mean", float("nan")),
+                "cv_rho_std":  s.get("cv_rho_std",  float("nan")),
+                "cv_r2_mean":  s.get("cv_r2_mean",  float("nan")),
+                "cv_r2_std":   s.get("cv_r2_std",   float("nan")),
+            })
+            print(f"  nl={nl:3d}  mc={mc:3d}  "
+                  f"ρ={s.get('cv_rho_mean',float('nan')):.4f}"
+                  f"±{s.get('cv_rho_std',float('nan')):.4f}  "
+                  f"R²={s.get('cv_r2_mean',float('nan')):.4f}", flush=True)
+    results.sort(key=lambda r: r["cv_rho_mean"], reverse=True)
+    return results
+
+
+def sweep_xgb_hparams(df, feat_cols, split_key, cv_folds, seed,
+                      depth_grid=_XGB_SWEEP_DEPTH,
+                      subsample_grid=_XGB_SWEEP_SUBSAMPLE):
+    """Grid search max_depth × subsample for XGB via CV.
+
+    Returns list of dicts sorted by cv_rho_mean desc.
+    """
+    if not _HAS_XGB:
+        print("WARNING: xgboost not installed — skipping XGB sweep", flush=True)
+        return []
+    results = []
+    for d in depth_grid:
+        for s in subsample_grid:
+            kw = {"max_depth": d, "subsample": s}
+            cv_stats, _, _, _ = _run_cv(
+                df, feat_cols, split_key, cv_folds, seed,
+                models_to_run={"xgb"}, xgb_kwargs=kw,
+            )
+            xs = cv_stats.get("xgb", {})
+            results.append({
+                "max_depth":  d,
+                "subsample":  s,
+                "cv_rho_mean": xs.get("cv_rho_mean", float("nan")),
+                "cv_rho_std":  xs.get("cv_rho_std",  float("nan")),
+                "cv_r2_mean":  xs.get("cv_r2_mean",  float("nan")),
+                "cv_r2_std":   xs.get("cv_r2_std",   float("nan")),
+            })
+            print(f"  depth={d}  sub={s:.1f}  "
+                  f"ρ={xs.get('cv_rho_mean',float('nan')):.4f}"
+                  f"±{xs.get('cv_rho_std',float('nan')):.4f}  "
+                  f"R²={xs.get('cv_r2_mean',float('nan')):.4f}", flush=True)
+    results.sort(key=lambda r: r["cv_rho_mean"], reverse=True)
+    return results
+
+
+def _refit_final(X_all, y_all, seed, models_to_run, best_iters,
+                 rf_kwargs=None, lgbm_kwargs=None, xgb_kwargs=None):
     """Refit on all data for deployment. Returns dict model -> fitted model."""
     finals = {}
 
     if "lgbm" in models_to_run:
         iters = best_iters["lgbm"]
         n = int(np.mean(iters) * 1.1) if iters else 500
-        m = lgb.LGBMRegressor(n_estimators=n, random_state=seed, n_jobs=-1, verbosity=-1)
+        kw = lgbm_kwargs or {}
+        m = lgb.LGBMRegressor(n_estimators=n, random_state=seed, n_jobs=-1,
+                               verbosity=-1, **kw)
         m.fit(X_all, y_all)
         finals["lgbm"] = m
 
     if "xgb" in models_to_run and _HAS_XGB:
         iters = best_iters["xgb"]
         n = int(np.mean(iters) * 1.1) if iters else 500
-        m = xgb.XGBRegressor(n_estimators=n, random_state=seed, n_jobs=-1, verbosity=0)
+        kw = xgb_kwargs or {}
+        m = xgb.XGBRegressor(n_estimators=n, random_state=seed, n_jobs=-1,
+                              verbosity=0, **kw)
         m.fit(X_all, y_all)
         finals["xgb"] = m
 
@@ -222,8 +305,9 @@ def _refit_final(X_all, y_all, seed, models_to_run, best_iters, rf_kwargs=None):
 
 def train_scene(oracle_npz_path: str, output_dir: str, seed: int = 0,
                 ablations=None, models=None, cv_folds: int = 5,
-                label_mode: str = "raw", rf_kwargs=None,
-                rf_sweep: bool = False):
+                label_mode: str = "raw", rf_kwargs=None, lgbm_kwargs=None,
+                xgb_kwargs=None, rf_sweep: bool = False,
+                lgbm_sweep: bool = False, xgb_sweep: bool = False):
     """Train all ablations for one scene. Saves models to output_dir/{ablation}/."""
     out_root = Path(output_dir)
     print(f"\n{'='*60}", flush=True)
@@ -262,10 +346,43 @@ def train_scene(oracle_npz_path: str, output_dir: str, seed: int = 0,
             (ablation_dir / "rf_sweep.json").write_text(
                 json.dumps(sweep_results, indent=2)
             )
+            rf_kwargs = {"min_samples_leaf": best["min_samples_leaf"],
+                         "max_features": best["max_features"]}
+
+        if lgbm_sweep and "lgbm" in models_to_run:
+            print("  LGBM hparam sweep:", flush=True)
+            lgbm_sweep_results = sweep_lgbm_hparams(
+                df_abl, feat_cols, split_key, cv_folds, seed,
+            )
+            best_lgbm = lgbm_sweep_results[0]
+            print(f"  Best LGBM: nl={best_lgbm['num_leaves']}  "
+                  f"mc={best_lgbm['min_child_samples']}  "
+                  f"ρ={best_lgbm['cv_rho_mean']:.4f}", flush=True)
+            (ablation_dir / "lgbm_sweep.json").write_text(
+                json.dumps(lgbm_sweep_results, indent=2)
+            )
+            lgbm_kwargs = {"num_leaves": best_lgbm["num_leaves"],
+                           "min_child_samples": best_lgbm["min_child_samples"]}
+
+        if xgb_sweep and "xgb" in models_to_run:
+            print("  XGB hparam sweep:", flush=True)
+            xgb_sweep_results = sweep_xgb_hparams(
+                df_abl, feat_cols, split_key, cv_folds, seed,
+            )
+            if xgb_sweep_results:
+                best_xgb = xgb_sweep_results[0]
+                print(f"  Best XGB: depth={best_xgb['max_depth']}  "
+                      f"sub={best_xgb['subsample']}  "
+                      f"ρ={best_xgb['cv_rho_mean']:.4f}", flush=True)
+                (ablation_dir / "xgb_sweep.json").write_text(
+                    json.dumps(xgb_sweep_results, indent=2)
+                )
+                xgb_kwargs = {"max_depth": best_xgb["max_depth"],
+                              "subsample": best_xgb["subsample"]}
 
         cv_stats, best_iters, X_all, y_all = _run_cv(
             df_abl, feat_cols, split_key, cv_folds, seed, models_to_run,
-            rf_kwargs=rf_kwargs,
+            rf_kwargs=rf_kwargs, lgbm_kwargs=lgbm_kwargs, xgb_kwargs=xgb_kwargs,
         )
 
         # Print CV summary
@@ -275,7 +392,8 @@ def train_scene(oracle_npz_path: str, output_dir: str, seed: int = 0,
 
         # Refit on all data and save
         finals = _refit_final(X_all, y_all, seed, models_to_run, best_iters,
-                              rf_kwargs=rf_kwargs)
+                              rf_kwargs=rf_kwargs, lgbm_kwargs=lgbm_kwargs,
+                              xgb_kwargs=xgb_kwargs)
         rho_train_full = {}
         for model, fitted in finals.items():
             joblib.dump(fitted, ablation_dir / f"{model}.pkl")
@@ -327,6 +445,18 @@ def main():
                         help="RF min_samples_leaf (default 1).")
     parser.add_argument("--rf-max-features", type=float, default=1.0,
                         help="RF max_features fraction (default 1.0).")
+    parser.add_argument("--lgbm-sweep", action="store_true",
+                        help="Grid search num_leaves × min_child_samples for LGBM.")
+    parser.add_argument("--lgbm-num-leaves", type=int, default=None,
+                        help="LGBM num_leaves (skip sweep if set).")
+    parser.add_argument("--lgbm-min-child-samples", type=int, default=None,
+                        help="LGBM min_child_samples (skip sweep if set).")
+    parser.add_argument("--xgb-sweep", action="store_true",
+                        help="Grid search max_depth × subsample for XGB.")
+    parser.add_argument("--xgb-max-depth", type=int, default=None,
+                        help="XGB max_depth (skip sweep if set).")
+    parser.add_argument("--xgb-subsample", type=float, default=None,
+                        help="XGB subsample (skip sweep if set).")
     args = parser.parse_args()
 
     rf_kwargs = {}
@@ -335,10 +465,25 @@ def main():
     if args.rf_max_features != 1.0:
         rf_kwargs["max_features"] = args.rf_max_features
 
+    lgbm_kwargs = {}
+    if args.lgbm_num_leaves is not None:
+        lgbm_kwargs["num_leaves"] = args.lgbm_num_leaves
+    if args.lgbm_min_child_samples is not None:
+        lgbm_kwargs["min_child_samples"] = args.lgbm_min_child_samples
+
+    xgb_kwargs = {}
+    if args.xgb_max_depth is not None:
+        xgb_kwargs["max_depth"] = args.xgb_max_depth
+    if args.xgb_subsample is not None:
+        xgb_kwargs["subsample"] = args.xgb_subsample
+
     train_scene(args.oracle_npz, args.output_dir, seed=args.seed,
                 ablations=args.ablations, models=args.models,
                 cv_folds=args.cv_folds, label_mode=args.label_mode,
-                rf_kwargs=rf_kwargs or None, rf_sweep=args.rf_sweep)
+                rf_kwargs=rf_kwargs or None, lgbm_kwargs=lgbm_kwargs or None,
+                xgb_kwargs=xgb_kwargs or None,
+                rf_sweep=args.rf_sweep, lgbm_sweep=args.lgbm_sweep,
+                xgb_sweep=args.xgb_sweep)
 
 
 if __name__ == "__main__":

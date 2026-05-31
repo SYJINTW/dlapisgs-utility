@@ -24,6 +24,7 @@ import numpy as np
 _SCHEME_LABELS = {
     "vd_lod":          "VD+LOD (baseline)",
     "vd_lod_w":        "VD+LOD+W (ours)",
+    "ml":              "ML (ours)",
     "vd_lod_c":        "VD+LOD+C",
     "vd_lod_w_c":      "VD+LOD+W+C (proposed)",
     "vd_lod_w_sa":     "VD+LOD+W (screen_area)",
@@ -33,7 +34,8 @@ _SCHEME_LABELS = {
     "oracle_combined": "Oracle-combined",
 }
 _SCHEME_ORDER = [
-    "vd_lod", "vd_lod_w", "vd_lod_w_sa", "vd_lod_w_vd2", "vd_lod_c", "vd_lod_w_c",
+    # baseline → ours (vd_lod_w + ml) → … → oracle (upper bound) last
+    "vd_lod", "vd_lod_w", "ml", "vd_lod_w_sa", "vd_lod_w_vd2", "vd_lod_c", "vd_lod_w_c",
     "oracle_aoi", "oracle_combined", "oracle_loo",
 ]
 
@@ -54,6 +56,26 @@ COLORS  = ["#4878CF", "#6ACC65", "#D65F5F", "#B47CC7", "#FF8C00", "#00CED1"]
 # silently drops inf y-values from line plots, so we clamp pre-mean. 60 dB
 # matches the existing saturation guide drawn at hline=(60, "saturated (≥60 dB)").
 PSNR_SATURATION_DB = 60.0
+
+
+def _data_ylim(values: list[float], metric: str) -> tuple[float, float]:
+    """Tight y-limits with a small pad below the min mean — keeps dynamic range.
+
+    Trims the dead low end (PSNR floored to nearest 5 dB below data, SSIM to
+    nearest 0.05) so bars/lines fill the panel instead of starting at 0. Ported
+    from the 0514 summary plotter to match its layout.
+    """
+    vals = [v for v in values if v == v]  # drop NaN
+    if not vals:
+        return (0.0, PSNR_SATURATION_DB) if metric == "psnr" else (0.0, 1.0)
+    lo, hi = min(vals), max(vals)
+    if metric == "psnr":
+        floor = max(0.0, np.floor((lo - 3) / 5) * 5)
+        ceil  = min(PSNR_SATURATION_DB * 1.05, max(PSNR_SATURATION_DB * 1.02, hi + 2))
+        return floor, ceil
+    floor = max(0.0, np.floor((lo - 0.03) * 20) / 20)  # nearest 0.05
+    ceil  = min(1.005, hi + 0.02)
+    return floor, ceil
 
 
 def _read_csv(path: Path) -> list[dict]:
@@ -139,6 +161,7 @@ def _plot(agg: dict[str, dict[float, dict]], order: list[str], labels: dict[str,
           hline: tuple[float, str] | None = None) -> None:
     """Generic group-keyed line plot with optional horizontal reference line."""
     fig, ax = plt.subplots(figsize=(8.5, 5.2))
+    all_means: list[float] = []
     for i, key in enumerate(k for k in order if k in agg):
         marker = MARKERS[i % len(MARKERS)]
         color  = COLORS[i % len(COLORS)]
@@ -146,9 +169,11 @@ def _plot(agg: dict[str, dict[float, dict]], order: list[str], labels: dict[str,
         x   = [p[0] for p in pts]
         y   = [p[1][f"{metric}_mean"] for p in pts]
         err = [p[1][f"{metric}_ci95"] for p in pts]
+        all_means.extend(y)
         ax.errorbar(x, y, yerr=err, marker=marker, color=color,
                     linewidth=1.8, markersize=6, capsize=3,
                     label=labels.get(key, key))
+    ax.set_ylim(*_data_ylim(all_means, metric))
     ax.set_xlabel("Budget (MiB)", fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_title(title, fontsize=13)
@@ -208,15 +233,18 @@ def _bar_plot(agg: dict, order: list[str], labels: dict[str, str],
     bar_width = 0.8 / max(n_groups, 1)
     x = np.arange(n_budgets)
 
-    fig, ax = plt.subplots(figsize=(max(9, n_budgets * 1.4), 5.2))
+    fig, ax = plt.subplots(figsize=(max(11.5, n_budgets * 1.6), 5.5))
+    all_means: list[float] = []
     for i, key in enumerate(groups):
         color = COLORS[i % len(COLORS)]
         y   = [agg[key].get(b, {}).get(f"{metric}_mean", 0.0) for b in all_budgets]
         err = [agg[key].get(b, {}).get(f"{metric}_ci95",  0.0) for b in all_budgets]
+        all_means.extend(v for b, v in zip(all_budgets, y) if b in agg[key])
         offset = (i - n_groups / 2 + 0.5) * bar_width
         ax.bar(x + offset, y, bar_width * 0.92, yerr=err, capsize=2,
                color=color, label=labels.get(key, key), error_kw={"linewidth": 0.8})
 
+    ax.set_ylim(*_data_ylim(all_means, metric))
     ax.set_xticks(x)
     ax.set_xticklabels([str(b) for b in all_budgets], fontsize=10)
     pct_labels = bool(all_budgets) and isinstance(all_budgets[0], str) and all_budgets[0].endswith("%")
@@ -252,11 +280,20 @@ def _multi_scene_plot(scenes_agg: dict[str, dict], order: list[str], labels: dic
     ncols = min(ncols, n)
     nrows = math.ceil(n / ncols)
 
-    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 2.8, nrows * 2.6),
-                              squeeze=False)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3.6, nrows * 3.4),
+                              squeeze=False, sharey=True)
     axes_flat = axes.flatten()
     for ax in axes_flat[n:]:
         ax.set_visible(False)
+
+    # Shared, data-tight y-axis across all panels (comparable scenes).
+    ylim = _data_ylim(
+        [cell[f"{metric}_mean"]
+         for agg in scenes_agg.values()
+         for budgets in agg.values()
+         for cell in budgets.values()],
+        metric,
+    )
 
     for idx, scene in enumerate(scene_names):
         ax = axes_flat[idx]
@@ -283,10 +320,12 @@ def _multi_scene_plot(scenes_agg: dict[str, dict], order: list[str], labels: dic
                         label=labels.get(key, key))
 
         ax.set_xticks(x_pos)
-        ax.set_xticklabels([str(b) for b in x_labels], fontsize=7, rotation=30, ha="right")
-        ax.set_title(scene, fontsize=10)
-        ax.set_xlabel("Budget %", fontsize=8)
-        ax.set_ylabel(ylabel, fontsize=8)
+        ax.set_xticklabels([str(b) for b in x_labels], fontsize=8, rotation=30, ha="right")
+        ax.set_title(scene, fontsize=11)
+        ax.set_xlabel("Budget %", fontsize=10)
+        if idx % ncols == 0:
+            ax.set_ylabel(ylabel, fontsize=11)
+        ax.set_ylim(*ylim)
         ax.grid(alpha=0.2)
         if hline is not None:
             ax.axhline(hline[0], color="gray", linestyle=":", linewidth=1.0)

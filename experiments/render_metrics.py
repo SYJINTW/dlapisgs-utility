@@ -116,15 +116,17 @@ def _load_trace(trace_path: Path) -> list[dict]:
     return data["frames"]
 
 
-def _render_ply(ply_path: Path, camera, sh_degree: int, white_bg: bool) -> torch.Tensor:
+def _render_ply(ply_path: Path, camera, sh_degree: int, white_bg: bool,
+                timings: list, labels: dict) -> torch.Tensor:
     gaussians = GaussianModel(sh_degree)
-    gaussians.load_ply(str(ply_path))
+    with _timed("ply_load", timings, **labels):        # PLY disk read (IO-bound for large scenes)
+        gaussians.load_ply(str(ply_path))
     gs_res = torch.ones(len(gaussians.get_xyz), device="cuda")
     bg = [1, 1, 1] if white_bg else [0, 0, 0]
     bg_color = torch.tensor(bg, dtype=torch.float32, device="cuda").view(3, 1, 1)
     bg_color = bg_color.expand(3, camera.image_height, camera.image_width)
     bg_depth = torch.zeros(1, camera.image_height, camera.image_width, device="cuda")
-    with torch.no_grad():
+    with _timed("rasterize", timings, **labels), torch.no_grad():  # GPU rasterize only
         result = render(camera, gaussians, PIPELINE, bg_color, bg_depth, gs_res=gs_res)
     return result["render"].clamp(0.0, 1.0)
 
@@ -258,8 +260,8 @@ def main() -> None:
             continue
 
         labels = dict(camera=cam_idx, scheme=scheme, budget_mb=budget_mb)
-        with _timed("render_selected", timings, **labels):
-            rendered = _render_ply(selected_ply, cameras[cam_idx], args.sh_degree, args.white_bg)
+        with _timed("render_selected", timings, **labels):       # = ply_load + rasterize (total)
+            rendered = _render_ply(selected_ply, cameras[cam_idx], args.sh_degree, args.white_bg, timings, labels)
         with _timed("metrics", timings, **labels):
             m = _compute_metrics(rendered, gt_renders[cam_idx])
 

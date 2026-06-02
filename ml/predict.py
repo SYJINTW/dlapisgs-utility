@@ -23,6 +23,7 @@ def predict_utility(
     group_a: np.ndarray,            # (N_tiles, 14)  — Group A per camera
     group_b: "np.ndarray | None",   # (N_tiles, 12)  — Group B or None
     feature_names: list,            # list[str] from feature_names.json
+    model=None,                     # pre-loaded model; if None, load from disk
 ) -> np.ndarray:
     """Predict tile utility and return sorted (tile_idx, lod=0) pairs.
 
@@ -39,14 +40,15 @@ def predict_utility(
         np.ndarray shape (N_tiles, 2), dtype int64: (tile_idx, lod=0) sorted
         descending by predicted score. Matches calculate_utility_param output format.
     """
-    model_dir = Path(model_dir)
-    model_pkl = model_dir / f"{model_type}.pkl"
-    if not model_pkl.exists():
-        raise FileNotFoundError(
-            f"Model not found: {model_pkl}. "
-            f"Train first with: python ml/train.py --oracle-npz <path> --output-dir <dir>"
-        )
-    model = joblib.load(model_pkl)
+    if model is None:
+        model_dir = Path(model_dir)
+        model_pkl = model_dir / f"{model_type}.pkl"
+        if not model_pkl.exists():
+            raise FileNotFoundError(
+                f"Model not found: {model_pkl}. "
+                f"Train first with: python ml/train.py --oracle-npz <path> --output-dir <dir>"
+            )
+        model = joblib.load(model_pkl)
 
     # ── Assemble full feature matrix [A | B | C | D] ──────────────────────
     if group_b is not None:

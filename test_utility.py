@@ -36,6 +36,7 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import joblib
 import numpy as np
 import torch
 import yaml
@@ -593,7 +594,9 @@ def main() -> None:
             ml_static_feats = ml_features.build_static_features(
                 gs.data, index_offsets, flat_indices
             )
-
+        with _timed("ml_model_load", timings):
+            _ml_model = joblib.load(Path(args.ml_model_dir) / f"{args.ml_model_type}.pkl")
+        # cache the model, don't reload on every camera iteration
     if args.camera_indices is not None:
         for ci in args.camera_indices:
             if ci >= len(cameras):
@@ -765,6 +768,7 @@ def main() -> None:
                         group_a=ml_group_a,
                         group_b=ml_group_b,
                         feature_names=ml_feature_names,
+                        model=_ml_model,
                     )
                 else:
                     include_lod = scheme != "vd"

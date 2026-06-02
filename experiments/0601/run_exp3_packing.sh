@@ -64,8 +64,8 @@ scene_trace() {
 
 mkdir -p "$OUT_ROOT"
 
-for PACKING in "${PACKING_MODES[@]}"; do
 for SCENE in "${SCENES[@]}"; do
+for PACKING in "${PACKING_MODES[@]}"; do
     ORACLE_NPZ="${ORACLE_ROOT}/${SCENE}/oracle_dq.npz"
     MODEL_DIR="${MODEL_ROOT}/${SCENE}/AC"
     PLY="$(scene_ply "$SCENE")"
@@ -95,16 +95,24 @@ for SCENE in "${SCENES[@]}"; do
 
     mkdir -p "$OUT_DIR"   # parent must exist before tee opens the _sel.log
 
+    # progressive ignores per-tile utility (sorts GS by w_gi only) → all schemes
+    # produce an identical curve. Run one scheme; strict/partial get the full set.
+    if [ "$PACKING" = "progressive" ]; then
+        SCHEMES="vd_lod"
+    else
+        SCHEMES="ml vd_lod vd_lod_w oracle_loo"
+    fi
+
     # ── Selection ────────────────────────────────────────────────────────────
     echo ""
-    echo "=== [$PACKING/$SCENE] selection ==="
+    echo "=== [$PACKING/$SCENE] selection (schemes: $SCHEMES) ==="
     conda run -n gsquic python test_utility.py \
         --ply "$PLY" \
         --output-root "$OUT_DIR" \
         --camera-trace "$TRACE" \
         --grid-shape 8 8 8 \
         --budget-pct $BUDGETS \
-        --schemes ml vd_lod vd_lod_w oracle_loo \
+        --schemes $SCHEMES \
         --num-lod 1 \
         --camera-index "$CAMERA_INDEX" \
         --packing-mode "$PACKING" \
@@ -127,6 +135,7 @@ for SCENE in "${SCENES[@]}"; do
         --gt-ply "$PLY" \
         --trace "$TRACE" \
         --scene "$SCENE" \
+        --render-dir "${OUT_DIR}/renders" \
         --delete-ply \
         2>&1 | tee "${OUT_DIR%/}_render.log"
 

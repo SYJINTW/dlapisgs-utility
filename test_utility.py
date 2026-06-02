@@ -566,6 +566,16 @@ def main() -> None:
         tile_index_offsets = torch.tensor(index_offsets, dtype=torch.long, device=device)
         tile_flat_indices = torch.tensor(flat_indices, dtype=torch.long, device=device)
 
+        # Per-GS tile id, for recording the selected tile set in each manifest.
+        # -1 = Gaussian not assigned to any tile.
+        _offsets_np = np.asarray(index_offsets, dtype=np.int64)
+        _flat_np = np.asarray(flat_indices, dtype=np.int64)
+        gs_to_tile = np.full(gs_xyz.shape[0], -1, dtype=np.int64)
+        gs_to_tile[_flat_np] = np.repeat(
+            np.arange(len(_offsets_np) - 1, dtype=np.int64),
+            _offsets_np[1:] - _offsets_np[:-1],
+        )
+
     bytes_per_gaussian = _bytes_per_gaussian(gs)
     max_budget_bytes = int(max(budget_list) * 1024 * 1024)
 
@@ -814,6 +824,9 @@ def main() -> None:
 
                 camera_dir.mkdir(parents=True, exist_ok=True)
 
+                selected_tiles = np.unique(gs_to_tile[selected_indices]) if len(selected_indices) else np.empty(0, dtype=np.int64)
+                selected_tiles = selected_tiles[selected_tiles >= 0]
+
                 submitted_at = time.perf_counter()
                 fut = executor.submit(_write_ply, gs, selected_indices, output_path, args.ascii_ply)
                 cam_futures.append((fut, submitted_at))
@@ -825,6 +838,8 @@ def main() -> None:
                     "budget_bytes": budget_bytes,
                     "used_bytes": used_bytes,
                     "selected_gaussians": len(selected_indices),
+                    "n_selected_tiles": int(selected_tiles.size),
+                    "selected_tiles": selected_tiles.tolist(),
                     "bytes_per_gaussian": bytes_per_gaussian,
                     "output_path": str(output_path),
                     "tiling_metadata_npz": str(shared_tiling_npz),

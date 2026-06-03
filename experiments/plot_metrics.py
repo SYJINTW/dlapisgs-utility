@@ -162,7 +162,8 @@ def _plot(agg: dict[str, dict[float, dict]], order: list[str], labels: dict[str,
     """Generic group-keyed line plot with optional horizontal reference line."""
     fig, ax = plt.subplots(figsize=(8.5, 5.2))
     all_means: list[float] = []
-    for i, key in enumerate(k for k in order if k in agg):
+    present = [k for k in order if k in agg]
+    for i, key in enumerate(present):
         marker = MARKERS[i % len(MARKERS)]
         color  = COLORS[i % len(COLORS)]
         pts = sorted(agg[key].items())
@@ -278,6 +279,8 @@ def _multi_scene_plot(scenes_agg: dict[str, dict], order: list[str], labels: dic
     scene_names = sorted(scenes_agg.keys())
     n = len(scene_names)
     ncols = min(ncols, n)
+    # Global color/marker index: position among schemes present in ANY scene.
+    global_present = [k for k in order if any(k in agg for agg in scenes_agg.values())]
     nrows = math.ceil(n / ncols)
 
     fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3.6, nrows * 3.4),
@@ -309,7 +312,8 @@ def _multi_scene_plot(scenes_agg: dict[str, dict], order: list[str], labels: dic
             continue
         x_pos = list(range(len(x_labels)))
 
-        for i, key in enumerate(k for k in order if k in agg):
+        for key in (k for k in order if k in agg):
+            i      = global_present.index(key)
             color  = COLORS[i % len(COLORS)]
             marker = MARKERS[i % len(MARKERS)]
             d = agg[key]
@@ -330,8 +334,17 @@ def _multi_scene_plot(scenes_agg: dict[str, dict], order: list[str], labels: dic
         if hline is not None:
             ax.axhline(hline[0], color="gray", linestyle=":", linewidth=1.0)
 
-    # Shared legend above subplots.
-    handles, lbls = axes_flat[0].get_legend_handles_labels()
+    # Shared legend above subplots — collect across all axes so missing schemes
+    # in early subplots don't truncate the legend.
+    seen = {}
+    for ax in axes_flat:
+        for h, l in zip(*ax.get_legend_handles_labels()):
+            if l not in seen:
+                seen[l] = h
+    # Restore scheme order.
+    lbls = [l for l in order if l in seen or l in labels and labels[l] in seen]
+    lbls = [labels.get(l, l) for l in order if labels.get(l, l) in seen]
+    handles = [seen[l] for l in lbls]
     fig.legend(handles, lbls, loc="upper center", ncol=min(len(lbls), 6),
                fontsize=9, bbox_to_anchor=(0.5, 1.0))
     fig.suptitle(suptitle, fontsize=11, y=1.03)
@@ -426,11 +439,8 @@ def main() -> None:
             for scene, scene_rows in sorted(rows_by_scene.items())
         }
         all_keys: set[str] = {k for agg in scenes_agg.values() for k in agg}
-        first_agg = next(iter(scenes_agg.values()))
-        order, labels = _resolve_order_and_labels(first_agg, args.group_by)
-        # Ensure overlay schemes appear in order even if absent from first scene's agg.
-        extras = [k for k in sorted(all_keys) if k not in order]
-        order = order + extras
+        # Use all_keys (not first scene) so color assignment is consistent with bar mode.
+        order, labels = _resolve_order_and_labels({k: {} for k in all_keys}, args.group_by)
 
         n_cameras = max(
             (v["n_cameras"] for agg in scenes_agg.values() for s in agg.values() for v in s.values()),

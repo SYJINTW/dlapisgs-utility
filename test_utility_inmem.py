@@ -171,7 +171,8 @@ def _budget_tag(budget_mb: float) -> str:
 
 
 def _greedy_order_progressive(visibility_tile, tile_index_offsets, tile_flat_indices,
-                              w_gi, bytes_per_gaussian, max_budget_bytes):
+                              w_gi, bytes_per_gaussian, max_budget_bytes,
+                              shuffle_seed=None):
     max_count = max_budget_bytes // bytes_per_gaussian
     device = w_gi.device
     vis = visibility_tile.to(device=device, dtype=torch.bool)
@@ -181,13 +182,20 @@ def _greedy_order_progressive(visibility_tile, tile_index_offsets, tile_flat_ind
         return np.empty(0, dtype=np.int64)
 
     visible_gs = tile_flat_indices[per_gs_vis]
-    visible_sorted = visible_gs[torch.argsort(w_gi[visible_gs], descending=True)]
+    invisible_gs = tile_flat_indices[~per_gs_vis]
+    if shuffle_seed is not None:
+        gen = torch.Generator(device=device)
+        gen.manual_seed(shuffle_seed)
+        visible_sorted = visible_gs[torch.randperm(len(visible_gs), generator=gen, device=device)]
+        gen.manual_seed(shuffle_seed + 1)
+        invisible_sorted = invisible_gs[torch.randperm(len(invisible_gs), generator=gen, device=device)]
+    else:
+        visible_sorted = visible_gs[torch.argsort(w_gi[visible_gs], descending=True)]
+        invisible_sorted = invisible_gs[torch.argsort(w_gi[invisible_gs], descending=True)]
 
     if visible_sorted.numel() >= max_count:
         return visible_sorted[:max_count].detach().cpu().numpy().astype(np.int64, copy=False)
 
-    invisible_gs = tile_flat_indices[~per_gs_vis]
-    invisible_sorted = invisible_gs[torch.argsort(w_gi[invisible_gs], descending=True)]
     remaining = max_count - int(visible_sorted.numel())
     ordered = torch.cat([visible_sorted, invisible_sorted[:remaining]])
     return ordered.detach().cpu().numpy().astype(np.int64, copy=False)
@@ -481,6 +489,9 @@ def main() -> None:
                         help="Column used to group cells in representative view picker.")
 
     # --- Output control ---
+    parser.add_argument("--shuffle-visible-seed", type=int, default=None,
+                        help="Random control: shuffle Gaussians within visible/invisible partitions "
+                             "instead of sorting by weight. Only used with --packing-mode progressive.")
     parser.add_argument("--save-ply", action="store_true",
                         help="Also write selected PLYs to disk (same layout as test_utility.py).")
     parser.add_argument("--ply-workers", type=int, default=PLY_WORKERS,
@@ -883,6 +894,7 @@ def main() -> None:
                     all_ordered = _greedy_order_progressive(
                         visibility, tile_index_offsets, tile_flat_indices,
                         w_gi, bytes_per_gaussian, max_budget_bytes,
+                        shuffle_seed=args.shuffle_visible_seed,
                     )
                 elif args.packing_mode == "tile_strict":
                     all_ordered, tile_cum_counts = _greedy_order_tile_strict(

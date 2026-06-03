@@ -1,4 +1,9 @@
 """
+DEPRECATED: use test_utility_inmem.py instead.
+test_utility_inmem.py does select + render + PSNR/SSIM in one pass (gaussian_splatting env),
+no PLY roundtrip, ~5-10× faster. This file is kept only as a reference for the
+selection-only path (gsquic env, no renderer dep).
+
 Offline utility runner.
 
 Steps:

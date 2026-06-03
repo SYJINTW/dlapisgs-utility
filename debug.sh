@@ -36,18 +36,14 @@ ORACLE_NPZ="output/0527_clean/exp4_oracle_dq/eval/${SCENE}/oracle_dq.npz"
 [ "$SCHEME" = "oracle_loo" ] && [ -f "$ORACLE_NPZ" ]  && EXTRA="$EXTRA --oracle-npz $ORACLE_NPZ"
 
 rm -rf "$OUT"; mkdir -p "$OUT"
-echo ">> select  $SCENE cam=$CAM budget=${BUD}% grid=${GRID}³ packing=$PACK scheme=$SCHEME"
-conda run -n gsquic python test_utility.py \
-  --ply "$PLY" --output-root "$OUT" --camera-trace "$TRACE" \
+echo ">> select + render + metrics  $SCENE cam=$CAM budget=${BUD}% grid=${GRID}³ packing=$PACK scheme=$SCHEME"
+conda run -n gaussian_splatting python test_utility_inmem.py \
+  --ply "$PLY" --gt-ply "$PLY" --output-root "$OUT" --camera-trace "$TRACE" \
   --grid-shape "$GRID" "$GRID" "$GRID" --camera-index "$CAM" --budget-pct "$BUD" \
   --schemes "$SCHEME" --num-lod 1 --packing-mode "$PACK" \
   --weight-mode screen_area --w-norm sum --c-norm sum --img-w 1600 --img-h 1600 \
+  --scene "$SCENE" \
   $EXTRA >/dev/null 2>&1
-
-echo ">> render + metrics"
-conda run -n gaussian_splatting python experiments/render_metrics.py \
-  --output-root "$OUT" --gt-ply "$PLY" --trace "$TRACE" \
-  --scene "$SCENE" --render-dir "${OUT}/renders" >/dev/null 2>&1
 
 MJ=$(find "${OUT}/metrics" -name "camera_$(printf '%03d' "$CAM").json" | head -1)
 PNG=$(find "${OUT}/renders" -name "camera_$(printf '%03d' "$CAM").png" | head -1)

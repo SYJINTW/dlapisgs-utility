@@ -107,6 +107,37 @@ def _timed(name, store, **labels):
         store.append(row)
 
 
+def _gpu_state() -> dict:
+    """Snapshot system-level GPU state via nvidia-smi for the active CUDA device."""
+    gpu_idx = int(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0])
+    try:
+        def _query(fields):
+            return subprocess.check_output(
+                ["nvidia-smi", f"--id={gpu_idx}", f"--query-gpu={fields}",
+                 "--format=csv,noheader,nounits"], text=True
+            ).strip()
+        free_mib, used_mib, util_pct = _query("memory.free,memory.used,utilization.gpu").split(",")
+        procs_raw = subprocess.check_output(
+            ["nvidia-smi", f"--id={gpu_idx}", "--query-compute-apps=pid,used_memory",
+             "--format=csv,noheader"], text=True
+        ).strip()
+        procs = []
+        for ln in procs_raw.splitlines():
+            ln = ln.strip()
+            if ln:
+                pid_s, mem_s = ln.split(",", 1)
+                procs.append({"pid": int(pid_s.strip()), "used_mib": mem_s.strip()})
+        return {
+            "gpu_idx": gpu_idx,
+            "free_mib": int(free_mib.strip()),
+            "used_mib": int(used_mib.strip()),
+            "util_pct": util_pct.strip(),
+            "other_procs": procs,
+        }
+    except Exception as exc:
+        return {"gpu_idx": gpu_idx, "error": str(exc)}
+
+
 def _yaml_safe(obj):
     if isinstance(obj, dict):
         return {str(k): _yaml_safe(v) for k, v in obj.items()}
@@ -365,6 +396,23 @@ def _infer_scene(gt_ply: Path) -> str:
 # Representative views (inline, matching pick_representative_views.py logic)
 # ---------------------------------------------------------------------------
 
+def _collect_rep_keys(summary_rows: list, group_by: str) -> set:
+    """Return set of (camera_index, budget_mb, scheme) for worst/median/best per (scene,group,budget) cell."""
+    by_cell: dict = {}
+    for r in summary_rows:
+        if r.get("psnr") in (None, ""):
+            continue
+        group_val = r.get(group_by, r.get("scheme", ""))
+        key = (r.get("scene", ""), group_val, float(r["budget_mb"]))
+        by_cell.setdefault(key, []).append(r)
+    keys: set = set()
+    for cell_rows in by_cell.values():
+        cell_rows.sort(key=lambda r: float(r["psnr"]))
+        for r in (cell_rows[0], cell_rows[len(cell_rows) // 2], cell_rows[-1]):
+            keys.add((int(r["camera_index"]), float(r["budget_mb"]), r["scheme"]))
+    return keys
+
+
 def _pick_representative_views(output_root: Path, summary_rows: list, group_by: str) -> None:
     import matplotlib
     matplotlib.use("Agg")
@@ -500,6 +548,11 @@ def main() -> None:
     parser.add_argument("--ply-workers", type=int, default=PLY_WORKERS,
                         help="Thread pool size for PLY writes (only used with --save-ply).")
     parser.add_argument("--ascii-ply", action="store_true")
+    parser.add_argument("--png-workers", type=int, default=0,
+                        help="Thread pool size for async PNG writes. 0 = synchronous (default).")
+    parser.add_argument("--save-rep-only", action="store_true",
+                        help="Skip per-camera PNG writes; re-render and save only worst/median/best "
+                             "cameras per (budget, group) after the main loop.")
 
     args = parser.parse_args()
 
@@ -563,6 +616,13 @@ def main() -> None:
     output_root_for_meta = base_output_path
     _dump_run_params(output_root_for_meta, args, device)
     timings: list = []
+    if torch.cuda.is_available():
+        _gs = _gpu_state()
+        _gs["stage"] = "gpu_state_startup"
+        timings.append(_gs)
+        (output_root_for_meta / "gpu_startup.json").write_text(json.dumps(_gs, indent=2))
+        logger.info("GPU startup: free={}MiB used={}MiB other_procs={}",
+                    _gs.get("free_mib"), _gs.get("used_mib"), _gs.get("other_procs"))
 
     # --- Load selection model (io_3dgs, numpy attrs) ---
     with _timed("ply_load_selection", timings):
@@ -751,6 +811,8 @@ def main() -> None:
     timings_path = output_root_for_meta / "timings.json"
 
     executor = ThreadPoolExecutor(max_workers=args.ply_workers) if args.save_ply else None
+    png_executor = ThreadPoolExecutor(max_workers=args.png_workers) if args.png_workers > 0 else None
+    png_futures: list = []
 
     # --- Per-camera loop ---
     cam_pbar = tqdm(camera_indices, desc="cameras", unit="cam")
@@ -758,6 +820,10 @@ def main() -> None:
         sel_cam = sel_cameras[camera_index]
         rend_cam = rend_cameras[camera_index]
         cam_futures = []
+        _sel_peak_mib = 0
+        _rend_peak_mib = 0
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
         cam_pbar.set_postfix(idx=camera_index, stage="visibility")
         with _timed("visibility", timings, camera=camera_index):
@@ -775,6 +841,7 @@ def main() -> None:
                     opacity, scale_0, scale_1, scale_2, gamma=args.gamma,
                     xyz=gs_xyz_t, cam_center=cam_center,
                 ).to(device)
+                logger.debug(" THIS Weight_MODE is DEPRECATED, gaussian_weights: det_gamma_over_d2 with gamma={}", args.gamma)
             else:
                 kw = dict(
                     opacity=opacity, scale_0=scale_0, scale_1=scale_1, scale_2=scale_2,
@@ -912,6 +979,11 @@ def main() -> None:
                         w_gi, bytes_per_gaussian, max_budget_bytes,
                     )
 
+            if torch.cuda.is_available():
+                _p = torch.cuda.max_memory_allocated() // (1024 * 1024)
+                _sel_peak_mib = max(_sel_peak_mib, _p)
+                torch.cuda.reset_peak_memory_stats()
+
             # --- Per-budget loop ---
             for budget_mb in tqdm(budget_list, desc="budgets", leave=False, unit="MB"):
                 budget_bytes = int(budget_mb * 1024 * 1024)
@@ -934,13 +1006,24 @@ def main() -> None:
                     rendered = _render_gs(sub_gs, rend_cam, args.white_bg)
                     del sub_gs
 
+                if torch.cuda.is_available():
+                    _p = torch.cuda.max_memory_allocated() // (1024 * 1024)
+                    _rend_peak_mib = max(_rend_peak_mib, _p)
+                    torch.cuda.reset_peak_memory_stats()
+
                 with _timed("metrics", timings, camera=camera_index,
                             scheme=scheme, budget_mb=budget_mb):
                     m = _compute_metrics(rendered, gt_renders[camera_index].to(rendered.device))
 
-                with _timed("png_write", timings, camera=camera_index,
-                            scheme=scheme, budget_mb=budget_mb):
-                    torchvision.utils.save_image(rendered, str(render_png))
+                if not args.save_rep_only:
+                    if png_executor:
+                        png_futures.append(png_executor.submit(
+                            torchvision.utils.save_image,
+                            rendered.cpu().clone(), str(render_png)))
+                    else:
+                        with _timed("png_write", timings, camera=camera_index,
+                                    scheme=scheme, budget_mb=budget_mb):
+                            torchvision.utils.save_image(rendered, str(render_png))
 
                 selected_tiles = (np.unique(gs_to_tile[selected_indices])
                                   if len(selected_indices) else np.empty(0, dtype=np.int64))
@@ -1013,10 +1096,21 @@ def main() -> None:
                 for fut in cam_futures:
                     fut.result()
 
+        if torch.cuda.is_available():
+            timings.append({"stage": "gpu_peak_selection", "camera": camera_index,
+                            "peak_alloc_mib": _sel_peak_mib})
+            timings.append({"stage": "gpu_peak_render", "camera": camera_index,
+                            "peak_alloc_mib": _rend_peak_mib})
+
         timings_path.write_text(json.dumps(timings, indent=2), encoding="utf-8")
 
     if executor:
         executor.shutdown(wait=True)
+
+    if png_executor:
+        for fut in png_futures:
+            fut.result()
+        png_executor.shutdown(wait=True)
 
     # --- Write summary ---
     if all_metric_rows:
@@ -1033,6 +1127,76 @@ def main() -> None:
 
     timings_path.write_text(json.dumps(timings, indent=2), encoding="utf-8")
     logger.info("done; timings -> {}", timings_path)
+
+    # --- Rep-only second pass: re-render and save PNGs for worst/median/best cameras ---
+    if args.save_rep_only and all_metric_rows:
+        rep_keys = _collect_rep_keys(all_metric_rows, args.group_by)
+        logger.info("save_rep_only: re-rendering {} (cam, budget, scheme) combos", len(rep_keys))
+        import collections as _col
+        rep_by_cam: dict = _col.defaultdict(list)
+        for (ci, bm, sc) in rep_keys:
+            rep_by_cam[ci].append((bm, sc))
+
+        for camera_index in sorted(rep_by_cam):
+            sel_cam = sel_cameras[camera_index]
+            rend_cam = rend_cameras[camera_index]
+            distances = uc.calculate_distances(tile_centers, sel_cam.camera_center.to(device))
+            visibility = visibility_AABB_pytorch.batched_check_tiles_visible(
+                min_corners_t, max_corners_t, sel_cam, device=device)
+            cam_center = sel_cam.camera_center.to(device)
+            kw = dict(opacity=opacity, scale_0=scale_0, scale_1=scale_1, scale_2=scale_2,
+                      xyz=gs_xyz_t, cam_center=cam_center)
+            if args.weight_mode == "screen_area":
+                kw.update(rot_0=rot_0, rot_1=rot_1, rot_2=rot_2, rot_3=rot_3,
+                          world_view=sel_cam.world_view_transform,
+                          proj=sel_cam.projection_matrix,
+                          img_w=args.img_w, img_h=args.img_h,
+                          fov_x=getattr(sel_cam, "FoVx", None),
+                          fov_y=getattr(sel_cam, "FoVy", None))
+            w_gi = uc.compute_gaussian_weights_v2(args.weight_mode, **kw).to(device)
+            W_k, _ = uc.compute_tile_weights_and_counts(
+                tile_index_offsets, tile_flat_indices, w_gi,
+                w_norm=args.w_norm, c_norm=args.c_norm, w_mode=args.w_mode)
+
+            needed_schemes = {sc for _, sc in rep_by_cam[camera_index]}
+            for scheme in needed_schemes:
+                include_lod = scheme != "vd"
+                include_w = scheme in ("vd_lod_w", "vd_lod_w_c")
+                include_c = scheme in ("vd_lod_c", "vd_lod_w_c")
+                utilities = uc.calculate_utility_param(
+                    visibility, distances, num_of_level=args.num_lod,
+                    weight_sum_tensor=W_k if include_w else None,
+                    complexity_tensor=None,
+                    include_lod=include_lod, include_w=include_w, include_c=include_c)
+                tile_cum_counts = None
+                if args.packing_mode == "progressive":
+                    all_ordered = _greedy_order_progressive(
+                        visibility, tile_index_offsets, tile_flat_indices,
+                        w_gi, bytes_per_gaussian, max_budget_bytes,
+                        shuffle_seed=args.shuffle_visible_seed)
+                elif args.packing_mode == "tile_strict":
+                    all_ordered, tile_cum_counts = _greedy_order_tile_strict(
+                        utilities, tile_index_offsets, tile_flat_indices, w_gi)
+                else:
+                    all_ordered = _greedy_order(
+                        utilities, tile_index_offsets, tile_flat_indices,
+                        w_gi, bytes_per_gaussian, max_budget_bytes)
+
+                needed_budgets = [bm for bm, sc in rep_by_cam[camera_index] if sc == scheme]
+                for budget_mb in needed_budgets:
+                    budget_bytes = int(budget_mb * 1024 * 1024)
+                    selected_indices, _ = _select_at_budget(
+                        all_ordered, budget_bytes, bytes_per_gaussian,
+                        tile_cum_counts=tile_cum_counts)
+                    sub_gs = _subset_gaussians(rend_gs_full, selected_indices)
+                    rendered = _render_gs(sub_gs, rend_cam, args.white_bg)
+                    del sub_gs
+                    budget_tag = f"budget_{_budget_tag(budget_mb)}"
+                    render_png = (base_output_path / "renders" / "ply" / budget_tag
+                                  / scheme / f"camera_{camera_index:03d}.png")
+                    render_png.parent.mkdir(parents=True, exist_ok=True)
+                    torchvision.utils.save_image(rendered, str(render_png))
+                    logger.info("[rep] cam={:03d} budget={} scheme={}", camera_index, budget_tag, scheme)
 
     # --- Representative views ---
     if all_metric_rows:

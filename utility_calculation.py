@@ -14,20 +14,23 @@ import tiling
 # Numerical constants
 INVISIBLE_PRIORITY_EPS = 1e-2   # priority weight for invisible tiles (kept >0 to avoid starvation)
 DISTANCE_EPS = 1e-3             # added to distance to prevent division by zero
-COMPLEXITY_SPARSE_GUARD = 20    # min GS in a tile for reliable covariance / voxel entropy estimate
-COMPLEXITY_SPECTRAL_FC  = 2.0   # frequency cutoff (cycles) for spectral_energy high-freq ratio; N=8 → max ≈ 4√3≈6.9
 
-NORM_MODES = ("none", "max", "minmax", "log1p", "sum")
+
+
 # Tile aggregate weight mode: how to reduce per-GS weights to a tile scalar.
 #   sum  : W_k = Σ w(g_i)           (current default; scales with tile size)
 #   mean : W_k = Σ w(g_i) / N_k     (mean per-Gaussian quality; size-invariant)
 W_MODES = ("sum", "mean")
+
+
 # Per-Gaussian weight formulas. Each name describes the math literally:
 #   det_gamma_over_d2 : sigmoid(o) * det(Σ)^gamma / d^2     (current default; gamma tunable)
 #   volume            : sigmoid(o) * det(Σ)^0.5             (i.e. s_x·s_y·s_z, the 1-σ ellipsoid volume proxy)
 #   volume_over_d2    : sigmoid(o) * det(Σ)^0.5 / d^2
 #   screen_area       : sigmoid(o) * π · sqrt(det(Σ_2D))    (true projected footprint via EWA Jacobian)
-WEIGHT_MODES = ("det_gamma_over_d2", "volume", "volume_over_d2", "screen_area")
+WEIGHT_MODES = ("det_gamma_over_d2", "volume", "volume_over_d2", "screen_area", "random")
+
+NORM_MODES = ("none", "max", "minmax", "log1p", "sum")
 
 
 def normalize_term(x, mode="none", eps=1e-12):
@@ -38,10 +41,12 @@ def normalize_term(x, mode="none", eps=1e-12):
       - "max":    x / max(x)
       - "minmax": (x - min) / (max - min)
       - "log1p":  log(1 + x)
-      - "sum":    x / sum(x) 
-      
+      - "sum":    x / sum(x)
+
     just use sum
     """
+
+    # how are W_k and C_k normalized across tiles before utility calculation
     if mode == "none" or x is None:
         return x
     if mode not in NORM_MODES:
@@ -60,10 +65,21 @@ def normalize_term(x, mode="none", eps=1e-12):
     if mode == "sum":
         s = x.sum()
         return x / s if s > 0 else x
-    raise AssertionError("unreachable")
+    raise AssertionError("this case is unreachable")
 
 
 def _compute_base_scores(visibility_mask_tensor, tile_distances_tensor):
+    """_summary_
+
+    Args:
+        visibility_mask_tensor (_type_): _description_
+        tile_distances_tensor (_type_): _description_
+
+    Returns:
+        _type_: _description_
+        
+    U = V/D
+    """
     vis_factor = torch.where(visibility_mask_tensor, 1.0, INVISIBLE_PRIORITY_EPS)
     dist_factor = 1.0 / (tile_distances_tensor + DISTANCE_EPS)
     return vis_factor * dist_factor
@@ -150,9 +166,10 @@ def calculate_utility_param(
 def compute_gaussian_weights(opacity, scale_0, scale_1, scale_2, gamma=1.0,
                              xyz=None, cam_center=None):
     """
+    [DEPRECATED] use v2()
     Compute individual Gaussian weights.
 
-    View-independent (xyz/cam_center not given):
+    View-independent (xyz/cam_center not given): DO NOT USE THIS MODE
         w(g_i) = sigmoid(opacity) * det(Sigma)^gamma
 
     View-dependent (xyz and cam_center given):
@@ -228,6 +245,9 @@ def compute_tile_weights_and_counts(tile_index_offsets, tile_flat_indices, w_gi,
 
 
 COMPLEXITY_KINDS = ("eigenentropy", "omnivariance", "voxel_entropy", "spectral_energy")
+COMPLEXITY_SPARSE_GUARD = 20    # min GS in a tile for reliable covariance / voxel entropy estimate
+COMPLEXITY_SPECTRAL_FC  = 2.0   # frequency cutoff (cycles) for spectral_energy high-freq ratio; N=8 → max ≈ 4√3≈6.9
+
 
 
 def compute_tile_complexity(c_kind, tile_index_offsets, tile_flat_indices,
@@ -236,7 +256,7 @@ def compute_tile_complexity(c_kind, tile_index_offsets, tile_flat_indices,
     """Per-tile structural complexity descriptor.
 
     Args:
-        c_kind: "eigenentropy", "voxel_entropy", or "spectral_energy"
+        c_kind: "eigenentropy", "omnivariance", "voxel_entropy", or "spectral_energy"
         tile_index_offsets: (N+1,) long tensor
         tile_flat_indices:  (M,)   long tensor — GS indices into xyz / w_gi
         w_gi:               (M_all,) float32 — per-GS weights (indexed by tile_flat_indices)
@@ -449,13 +469,14 @@ def compute_gaussian_weights_v2(weight_mode, *, opacity, scale_0, scale_1, scale
                                 xyz=None, cam_center=None,
                                 rot_0=None, rot_1=None, rot_2=None, rot_3=None,
                                 world_view=None, proj=None, img_w=None, img_h=None,
-                                fov_x=None, fov_y=None):
-    """Per-Gaussian weight under one of three named modes.
+                                fov_x=None, fov_y=None, random_seed=42):
+    """Per-Gaussian weight under one of the named modes.
 
     Modes:
       - "volume":         sigmoid(o) * det(Σ_3D)^0.5  (≈ Gaussian "volume")
       - "volume_over_d2": sigmoid(o) * det(Σ_3D)^0.5 / d^2  (view-dependent)
       - "screen_area":    sigmoid(o) * π · √det(Σ_2D)  (projected footprint area)
+      - "random":         U(0,1) per Gaussian (seeded); random ordering baseline
     """
     if not isinstance(opacity, torch.Tensor):
         opacity = torch.as_tensor(opacity, dtype=torch.float32)
@@ -463,6 +484,12 @@ def compute_gaussian_weights_v2(weight_mode, *, opacity, scale_0, scale_1, scale
         scale_1 = torch.as_tensor(scale_1, dtype=torch.float32)
         scale_2 = torch.as_tensor(scale_2, dtype=torch.float32)
     o_i = torch.sigmoid(opacity)
+
+    if weight_mode == "random":
+        gen = torch.Generator(device=o_i.device)
+        gen.manual_seed(random_seed)
+        return torch.rand(len(o_i), generator=gen, device=o_i.device)
+
     # det(Σ_3D)^0.5 = exp(scale_0 + scale_1 + scale_2)  (since Σ = R S^2 R^T → det = exp(2Σs))
     vol = torch.exp(scale_0 + scale_1 + scale_2)
 
@@ -506,6 +533,7 @@ def calculate_distances(tile_centers_tensor, cam_center_tensor):
 
 
 # main func for unit test
+# path hardcoded, use test_utility_inmem.py instead
 def main():
     base_dir = Path("/home/syjintw/Desktop/NUS/dlapisgs-output/longdress/opacity")
     res1_frame0_path = base_dir / "longdress_res1" / "dynamic_1051" / "point_cloud" / "iteration_30000" / "point_cloud.ply"

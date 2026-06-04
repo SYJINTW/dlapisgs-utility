@@ -20,7 +20,7 @@ UTIL_DIR="$ROOT/dlapisgs-utility"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
-SCENES="${SCENES:-chair drums ficus hotdog materials mic ship bicycle}"
+SCENES="${SCENES:-bicycle drums ship mic ficus materials chair hotdog}"
 WEIGHT_MODES="${WEIGHT_MODES:-screen_area volume volume_over_d2}"
 BUDGET_PCTS="${BUDGET_PCTS:-10 25 40 55 70 85 99 100}"
 SHUFFLE_SEED="${SHUFFLE_SEED:-42}"
@@ -70,6 +70,7 @@ for scene in $SCENES; do
     fi
 
     TILING_CACHE="$OUT_BASE/$scene/.tiling_cache.npz"
+    GT_CACHE="$OUT_BASE/$scene/gt_renders"
     mkdir -p "$(dirname "$TILING_CACHE")"
 
     for wm in $WEIGHT_MODES; do
@@ -93,7 +94,8 @@ for scene in $SCENES; do
             --img-w 1600 --img-h 1600 \
             --scene "$scene" \
             --group-by weight_mode \
-            --tiling-cache "$TILING_CACHE"
+            --tiling-cache "$TILING_CACHE" \
+            --gt-renders-cache "$GT_CACHE"
 
         conda run -n gsquic python "$UTIL_DIR/experiments/aggregate_timings.py" \
             --output-root "$OUT_DIR" || true
@@ -120,7 +122,8 @@ for scene in $SCENES; do
         --img-w 1600 --img-h 1600 \
         --scene "$scene" \
         --group-by weight_mode \
-        --tiling-cache "$TILING_CACHE"
+        --tiling-cache "$TILING_CACHE" \
+        --gt-renders-cache "$GT_CACHE"
 done
 
 # Concat per-cell CSVs + plot

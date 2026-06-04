@@ -30,6 +30,7 @@ import json
 import os
 import platform
 import socket
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -473,6 +474,8 @@ def main() -> None:
     parser.add_argument("--weight-mode", type=str, default="det_gamma_over_d2",
                         choices=list(uc.WEIGHT_MODES))
     parser.add_argument("--tiling-cache", type=str, default=None)
+    parser.add_argument("--gt-renders-cache", type=str, default=None,
+                        help="Shared GT render PNG dir across weight modes for same scene.")
     parser.add_argument("--ml-model-dir", type=str, default=None)
     parser.add_argument("--ml-model-type", type=str, default="lgbm",
                         choices=["lgbm", "xgb", "rf"])
@@ -625,12 +628,14 @@ def main() -> None:
             load_camera_from_streaming_config(f, width=args.img_w, height=args.img_h)
             for f in frames
         ]
+        for cam in rend_cameras:
+            cam.original_image = None  # dummy placeholder, never read in inference
 
     assert len(sel_cameras) == len(rend_cameras), (
         f"Camera count mismatch: sel={len(sel_cameras)} rend={len(rend_cameras)}")
 
     # --- Pre-render GT (once, cached) ---
-    gt_renders_dir = base_output_path / "gt_renders"
+    gt_renders_dir = Path(args.gt_renders_cache) if args.gt_renders_cache else base_output_path / "gt_renders"
     gt_renders_dir.mkdir(parents=True, exist_ok=True)
     bg = [1, 1, 1] if args.white_bg else [0, 0, 0]
 
@@ -646,7 +651,7 @@ def main() -> None:
             for idx, cam in enumerate(tqdm(rend_cameras, desc="gt_render", leave=False)):
                 gt_png = gt_renders_dir / f"camera_{idx:03d}.png"
                 if gt_png.exists():
-                    frame_t = torchvision.io.read_image(str(gt_png)).float().cuda() / 255.0
+                    frame_t = torchvision.io.read_image(str(gt_png)).float() / 255.0
                     gt_renders.append(frame_t)
                     continue
                 bg_color = torch.tensor(bg, dtype=torch.float32, device="cuda").view(3, 1, 1)
@@ -655,10 +660,11 @@ def main() -> None:
                 result = gs_render(cam, gt_gaussians, PIPELINE, bg_color, bg_depth,
                                    gs_res=gt_gs_res)
                 frame_t = result["render"].clamp(0.0, 1.0)
-                gt_renders.append(frame_t)
+                gt_renders.append(frame_t.cpu())
                 torchvision.utils.save_image(frame_t, str(gt_png))
     logger.success("GT rendered: {} frames cached to {}", len(gt_renders), gt_renders_dir)
     del gt_gaussians
+    torch.cuda.empty_cache()
 
     # --- Selection attrs (numpy, from sel_gs) ---
     with _timed("gs_attrs", timings):
@@ -930,7 +936,7 @@ def main() -> None:
 
                 with _timed("metrics", timings, camera=camera_index,
                             scheme=scheme, budget_mb=budget_mb):
-                    m = _compute_metrics(rendered, gt_renders[camera_index])
+                    m = _compute_metrics(rendered, gt_renders[camera_index].to(rendered.device))
 
                 with _timed("png_write", timings, camera=camera_index,
                             scheme=scheme, budget_mb=budget_mb):

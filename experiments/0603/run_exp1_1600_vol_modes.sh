@@ -17,8 +17,21 @@ set -euo pipefail
 
 ROOT="/mnt/data1/samk/gs-quic/cs5262_tile_quic"
 UTIL_DIR="$ROOT/dlapisgs-utility"
-
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+
+# Abort if target GPU has < MIN_FREE_MIB free (default 8 GiB).
+MIN_FREE_MIB="${MIN_FREE_MIB:-8192}"
+check_gpu_free() {
+    local gpu_idx="${CUDA_VISIBLE_DEVICES%%,*}"
+    local free_mib
+    free_mib=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$gpu_idx" 2>/dev/null)
+    if [[ -z "$free_mib" || "$free_mib" -lt "$MIN_FREE_MIB" ]]; then
+        echo "[GPU GUARD] GPU $gpu_idx: ${free_mib:-?} MiB free (need >=${MIN_FREE_MIB}). Aborting."
+        nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader -i "$gpu_idx" 2>/dev/null
+        return 1
+    fi
+    echo "[GPU GUARD] GPU $gpu_idx: ${free_mib} MiB free — OK"
+}
 
 SCENES="${SCENES:-bicycle drums ship mic ficus materials chair hotdog}"
 WEIGHT_MODES="${WEIGHT_MODES:-screen_area volume volume_over_d2}"
@@ -78,6 +91,7 @@ for scene in $SCENES; do
         echo ""
         echo "---- [$scene] weight_mode=$wm ----"
         mkdir -p "$OUT_DIR"
+        check_gpu_free
 
         conda run -n gaussian_splatting python "$UTIL_DIR/test_utility_inmem.py" \
             --ply "$PLY" \
@@ -95,7 +109,8 @@ for scene in $SCENES; do
             --scene "$scene" \
             --group-by weight_mode \
             --tiling-cache "$TILING_CACHE" \
-            --gt-renders-cache "$GT_CACHE"
+            --gt-renders-cache "$GT_CACHE" \
+            --save-rep-only
 
         conda run -n gsquic python "$UTIL_DIR/experiments/aggregate_timings.py" \
             --output-root "$OUT_DIR" || true
@@ -106,6 +121,7 @@ for scene in $SCENES; do
     echo ""
     echo "---- [$scene] weight_mode=random (baseline) ----"
     mkdir -p "$OUT_DIR"
+    check_gpu_free
     conda run -n gaussian_splatting python "$UTIL_DIR/test_utility_inmem.py" \
         --ply "$PLY" \
         --gt-ply "$PLY" \
@@ -123,7 +139,8 @@ for scene in $SCENES; do
         --scene "$scene" \
         --group-by weight_mode \
         --tiling-cache "$TILING_CACHE" \
-        --gt-renders-cache "$GT_CACHE"
+        --gt-renders-cache "$GT_CACHE" \
+        --save-rep-only
 done
 
 # Concat per-cell CSVs + plot

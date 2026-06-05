@@ -413,7 +413,8 @@ def _collect_rep_keys(summary_rows: list, group_by: str) -> set:
     return keys
 
 
-def _pick_representative_views(output_root: Path, summary_rows: list, group_by: str) -> None:
+def _pick_representative_views(output_root: Path, summary_rows: list, group_by: str,
+                               gt_dir: Path | None = None) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -430,7 +431,7 @@ def _pick_representative_views(output_root: Path, summary_rows: list, group_by: 
 
     rep_root = output_root / "representative"
     rep_root.mkdir(parents=True, exist_ok=True)
-    gt_dir = output_root / "gt_renders"
+    gt_dir = gt_dir if gt_dir is not None else output_root / "gt_renders"
     render_root = output_root / "renders"
 
     by_cell: dict = {}
@@ -1201,7 +1202,8 @@ def main() -> None:
     # --- Representative views ---
     if all_metric_rows:
         logger.info("Picking representative views ...")
-        _pick_representative_views(base_output_path, all_metric_rows, args.group_by)
+        _pick_representative_views(base_output_path, all_metric_rows, args.group_by,
+                                   gt_dir=gt_renders_dir)
 
 
 if __name__ == "__main__":

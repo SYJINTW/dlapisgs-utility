@@ -3,9 +3,9 @@
 # screen_area@1600² already exists in output/0601/exp3_packing/progressive/.
 #
 # Fixed:  packing=progressive, scheme=vd_lod, grid=8x8x8, img=1600x1600.
-# Swept:  weight-mode ∈ {volume, volume_over_d2} × variant ∈ {ordered, random}.
-# Scenes: 8 (7 synthetic + bicycle). Uses test_utility_inmem.py (shuffle merged in).
-# Random control (SPEC Del 2): --shuffle-visible-seed within visible partition.
+# Swept:  weight-mode ∈ {screen_area, volume, volume_over_d2, random}.
+# Scenes: 8 (7 synthetic + bicycle). Uses test_utility_inmem.py.
+# Random control (SPEC Del 2): weight_mode=random (U[0,1] seed=42 in compute_gaussian_weights_v2).
 # Trace:  sparse_views_100_eval.json (matched to exp3 for cross-mode comparability).
 #
 # Env overrides:
@@ -34,9 +34,8 @@ check_gpu_free() {
 }
 
 SCENES="${SCENES:-bicycle drums ship mic ficus materials chair hotdog}"
-WEIGHT_MODES="${WEIGHT_MODES:-screen_area volume volume_over_d2}"
+WEIGHT_MODES="${WEIGHT_MODES:-screen_area volume_over_d2 random volume}"
 BUDGET_PCTS="${BUDGET_PCTS:-10 25 40 55 70 85 99 100}"
-SHUFFLE_SEED="${SHUFFLE_SEED:-42}"
 GRID_SHAPE="${GRID_SHAPE:-8 8 8}"
 NUM_LOD="${NUM_LOD:-1}"
 SCHEME="${SCHEME:-vd_lod}"
@@ -115,32 +114,6 @@ for scene in $SCENES; do
         conda run -n gsquic python "$UTIL_DIR/experiments/aggregate_timings.py" \
             --output-root "$OUT_DIR" || true
     done
-
-    # Random baseline — one per scene, weight-mode irrelevant
-    OUT_DIR="$OUT_BASE/$scene/random"
-    echo ""
-    echo "---- [$scene] weight_mode=random (baseline) ----"
-    mkdir -p "$OUT_DIR"
-    check_gpu_free
-    conda run -n gaussian_splatting python "$UTIL_DIR/test_utility_inmem.py" \
-        --ply "$PLY" \
-        --gt-ply "$PLY" \
-        --output-root "$OUT_DIR" \
-        --camera-trace "$TRACE" \
-        --grid-shape $GRID_SHAPE \
-        --budget-pct $BUDGET_PCTS \
-        --schemes "$SCHEME" \
-        --num-lod "$NUM_LOD" \
-        --camera-index "$CAMERA_INDEX" \
-        --packing-mode progressive \
-        --weight-mode screen_area \
-        --shuffle-visible-seed "$SHUFFLE_SEED" \
-        --img-w 1600 --img-h 1600 \
-        --scene "$scene" \
-        --group-by weight_mode \
-        --tiling-cache "$TILING_CACHE" \
-        --gt-renders-cache "$GT_CACHE" \
-        --save-rep-only
 done
 
 # Concat per-cell CSVs + plot

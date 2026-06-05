@@ -29,6 +29,7 @@ import datetime as _dt
 import json
 import math
 import socket
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -144,6 +145,70 @@ def evaluate_view(xyz: np.ndarray, c2w: np.ndarray, fov_x: float, fov_y: float,
 
 
 # ---------------------------------------------------------------------------- #
+# Render quality check                                                           #
+# ---------------------------------------------------------------------------- #
+def _render_quality(img_tensor, max_white: float, max_black: float,
+                    min_edge_var: float) -> tuple[bool, dict]:
+    """Return (passes: bool, stats: dict). img_tensor: float32 CHW [0,1] CPU/CUDA."""
+    img = img_tensor.detach().cpu().numpy()   # CHW float [0,1]
+    rgb = img.transpose(1, 2, 0)              # HWC
+    mean_c = rgb.mean(axis=2)                 # HW float
+    white_frac = float((mean_c > 0.92).mean())
+    black_frac = float((mean_c < 0.08).mean())
+    gray_u8 = (mean_c * 255).astype(np.float32)
+    gp = np.pad(gray_u8, 1, mode="edge")
+    lap = gp[:-2, 1:-1] + gp[2:, 1:-1] + gp[1:-1, :-2] + gp[1:-1, 2:] - 4 * gray_u8
+    edge_var = float(lap.var())
+    ok = white_frac <= max_white and black_frac <= max_black and edge_var >= min_edge_var
+    return ok, {"white_frac": white_frac, "black_frac": black_frac, "edge_var": edge_var}
+
+
+# ---------------------------------------------------------------------------- #
+# QA: trace position scatter plot                                                #
+# ---------------------------------------------------------------------------- #
+def _plot_trace_positions(frames: list, centroid: np.ndarray, radius: float,
+                          up_axis: int, out_path: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    positions = np.array([f["transform_matrix"] for f in frames])[:, :3, 3]
+    modes = [f.get("pose_mode", "inward") for f in frames]
+    color_map = {"inward": "steelblue", "outward": "limegreen"}
+    colors = [color_map.get(m, "gray") for m in modes]
+
+    # Scale sphere and axes to actual camera spread, not robust_radius
+    dists = np.linalg.norm(positions - centroid, axis=1)
+    display_r = float(np.percentile(dists, 95)) * 1.1
+    display_r = max(display_r, 0.1)
+
+    fig = plt.figure(figsize=(8, 7))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.scatter(positions[:, 0], positions[:, 1], positions[:, 2],
+               c=colors, s=10, alpha=0.7)
+    ax.scatter(*centroid, c="gold", s=80, marker="*", zorder=5, label="centroid")
+
+    u, v = np.mgrid[0:2*np.pi:24j, 0:np.pi:12j]
+    sx = centroid[0] + display_r * np.cos(u) * np.sin(v)
+    sy = centroid[1] + display_r * np.sin(u) * np.sin(v)
+    sz = centroid[2] + display_r * np.cos(v)
+    ax.plot_wireframe(sx, sy, sz, color="gray", alpha=0.15, linewidth=0.5)
+
+    from matplotlib.lines import Line2D
+    legend = [Line2D([0],[0], marker="o", color="w", markerfacecolor="steelblue", label="inward"),
+              Line2D([0],[0], marker="o", color="w", markerfacecolor="limegreen", label="outward"),
+              Line2D([0],[0], marker="*", color="w", markerfacecolor="gold", label="centroid")]
+    ax.legend(handles=legend, fontsize=8)
+    ax.set_title(f"{len(frames)} accepted cameras  (robust_r={radius:.2f})", fontsize=10)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(str(out_path), dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[trace-plot] {out_path}")
+
+
+# ---------------------------------------------------------------------------- #
 # Position samplers                                                              #
 # ---------------------------------------------------------------------------- #
 def sample_inside_out(rng: np.random.Generator, centroid: np.ndarray, radius: float,
@@ -209,9 +274,39 @@ def main() -> None:
                    help="Reject views where visible centers span less than this in NDC "
                         "(either axis). Forces 'scene fills frame'.")
     p.add_argument("--lookat-jitter-frac", type=float, default=0.1)
+    p.add_argument("--orbit-radius-abs-min", type=float, default=None,
+                   help="Close-orbit min radius in world units (overrides --orbit-radius-min × robust_radius).")
+    p.add_argument("--orbit-radius-abs-max", type=float, default=None,
+                   help="Close-orbit max radius in world units.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max-proposals", type=int, default=20_000)
     p.add_argument("--subsample-points", type=int, default=50_000)
+    # Render-quality filter (requires gaussian_splatting env when enabled)
+    p.add_argument("--render-check", action="store_true",
+                   help="Render each proposal and reject degenerate frames.")
+    p.add_argument("--ply-renderer", type=Path, default=None,
+                   help="PLY for GaussianModel renderer. Defaults to --ply.")
+    p.add_argument("--sh-degree", type=int, default=3)
+    p.add_argument("--white-bg", action="store_true")
+    p.add_argument("--gt-renders-dir", type=Path, default=None,
+                   help="Save accepted-camera PNGs here (reusable as --gt-renders-cache).")
+    p.add_argument("--max-white-frac", type=float, default=0.40)
+    p.add_argument("--max-black-frac", type=float, default=0.40)
+    p.add_argument("--min-edge-var", type=float, default=50.0,
+                   help="Laplacian variance threshold (uint8 scale).")
+    p.add_argument("--add-outward", type=int, default=0,
+                   help="After generating --n-views inward cameras, add this many outward-facing "
+                        "cameras by inverting the look direction of evenly-spaced accepted positions. "
+                        "Render-checked when --render-check is set. "
+                        "NOTE: skip for synthetic/object-only scenes — outward views see black background.")
+    p.add_argument("--full-sphere", action="store_true",
+                   help="Sample orbit cameras over the full sphere (elevation -90 to +90 deg) "
+                        "instead of the scene-type default hemisphere/band.")
+    # Recommended trace policy:
+    #   synthetic (object-only): --n-views 300, --full-sphere, no --add-outward → 300 inward views
+    #     outward skipped: synthetic bg is black → all outward views fail black_frame gate
+    #   indoor real:             --full-sphere, --add-outward 100          → ~300 views
+    #   outdoor real:            --orbit-radius-abs-min/max, --add-outward 100  → ~300 views
     args = p.parse_args()
 
     # Per-scene-type defaults
@@ -225,13 +320,17 @@ def main() -> None:
     if args.scene_type == "synthetic":
         up_axis = 1
         up_world = np.array([0.0, 1.0, 0.0])
-        elev_range_orbit = (0.05, 0.95)     # upper hemisphere
-        elev_range_inout = (-0.7, 0.9)      # mostly upper, allow some look-down
+        elev_range_orbit = (0.05, 0.95)
+        elev_range_inout = (-0.7, 0.9)
     else:  # mipnerf360
         up_axis = 2
         up_world = np.array([0.0, 0.0, 1.0])
         elev_range_orbit = (-0.4, 0.9)
         elev_range_inout = (-0.5, 0.7)
+
+    if args.full_sphere:
+        elev_range_orbit = (-1.0, 1.0)
+        elev_range_inout = (-1.0, 1.0)
 
     rng = np.random.default_rng(args.seed)
 
@@ -240,12 +339,49 @@ def main() -> None:
     centroid, radius = robust_scene_geometry(xyz, args.robust_radius_pct)
     print(f"[gen_sparse_views] N={len(xyz)} sampled  centroid={centroid}  robust_radius(p{args.robust_radius_pct:.0f})={radius:.3f}")
 
+    # Absolute orbit radius overrides (world units, bypass robust_radius scaling)
+    if args.orbit_radius_abs_min is not None:
+        args.orbit_radius_min = args.orbit_radius_abs_min / radius
+    if args.orbit_radius_abs_max is not None:
+        args.orbit_radius_max = args.orbit_radius_abs_max / radius
+
     fov_x = math.radians(args.fov_deg)
     fov_y = 2.0 * math.atan(math.tan(fov_x / 2.0) / (args.width / args.height))
 
+    # --- Renderer init (only when --render-check) ---
+    rend_gaussians = _gs_render_fn = _cam_loader = rend_pipeline = None
+    if args.render_check:
+        import sys, os, torch
+        _HERE = Path(__file__).resolve().parent
+        _WS = _HERE.parent.parent
+        _RROOT = _WS / "LapisGS-object-based-renderer"
+        sys.path.insert(0, str(_RROOT))
+        _DUMMY = _WS / "exp-dataset/chair/predictions/color/test/r_0.png"
+        os.environ.setdefault("LAPISGS_DUMMY_IMAGE", str(_DUMMY))
+        from gaussian_renderer_lapisgs import GaussianModel, render as _gs_render_fn  # type: ignore
+        from streaming_utils.camera_loader import load_camera_from_streaming_config as _cam_loader  # type: ignore
+        import torchvision.utils as _tvu  # type: ignore
+
+        class _Pipe:
+            convert_SHs_python = compute_cov3D_python = debug = antialiasing = False
+        rend_pipeline = _Pipe()
+
+        ply_rend = args.ply_renderer or args.ply
+        print(f"[render-check] loading GaussianModel from {ply_rend} ...")
+        rend_gaussians = GaussianModel(args.sh_degree)
+        rend_gaussians.load_ply(str(ply_rend))
+        if args.gt_renders_dir:
+            args.gt_renders_dir.mkdir(parents=True, exist_ok=True)
+        _bg = [1, 1, 1] if args.white_bg else [0, 0, 0]
+        bg_t = torch.tensor(_bg, dtype=torch.float32, device="cuda").view(3, 1, 1).expand(3, args.height, args.width).contiguous()
+        bg_d = torch.zeros(1, args.height, args.width, device="cuda")
+        gs_res = torch.ones(len(rend_gaussians.get_xyz), device="cuda")
+
     frames = []
-    counts = {"inside_out": 0, "close_orbit": 0}
+    counts = {"inward": 0}
     rejects = {"low_visible": 0, "low_spread": 0}
+    if args.render_check:
+        rejects.update({"white_blob": 0, "black_frame": 0, "low_edge": 0})
     proposals = 0
     accepted = 0
     while accepted < args.n_views and proposals < args.max_proposals:
@@ -256,14 +392,14 @@ def main() -> None:
                                           (args.inside_radius_min, args.inside_radius_max),
                                           elev_range_inout)
             c2w = forward_to_c2w(eye, fwd, up_world)
-            mode = "inside_out"
+            mode = "inward"
         else:
             eye, fwd = sample_close_orbit(rng, centroid, radius, up_axis,
                                            (args.orbit_radius_min, args.orbit_radius_max),
                                            elev_range_orbit,
                                            args.lookat_jitter_frac)
             c2w = forward_to_c2w(eye, fwd, up_world)
-            mode = "close_orbit"
+            mode = "inward"
 
         frac, sx, sy = evaluate_view(xyz, c2w, fov_x, fov_y)
         if frac < args.min_visible_frac:
@@ -272,6 +408,29 @@ def main() -> None:
         if min(sx, sy) < args.min_ndc_spread:
             rejects["low_spread"] += 1
             continue
+
+        # --- Render quality check ---
+        if args.render_check:
+            frame_tmp = {"file_path": "./test/r_tmp", "frame_index": 0,
+                         "transform_matrix": c2w.tolist(), "camera_angle_x": fov_x}
+            cam = _cam_loader(frame_tmp, width=args.width, height=args.height)
+            cam.original_image = None
+            with torch.no_grad():
+                rendered = _gs_render_fn(cam, rend_gaussians, rend_pipeline,
+                                         bg_t, bg_d, gs_res=gs_res)["render"].clamp(0, 1)
+            ok, qstats = _render_quality(rendered, args.max_white_frac,
+                                         args.max_black_frac, args.min_edge_var)
+            if not ok:
+                if qstats["white_frac"] > args.max_white_frac:
+                    rejects["white_blob"] += 1
+                elif qstats["black_frac"] > args.max_black_frac:
+                    rejects["black_frame"] += 1
+                else:
+                    rejects["low_edge"] += 1
+                continue
+            if args.gt_renders_dir:
+                gt_png = args.gt_renders_dir / f"camera_{accepted:03d}.png"
+                _tvu.save_image(rendered.cpu(), str(gt_png))
 
         frames.append({
             "file_path": f"./test/r_{accepted}",
@@ -288,6 +447,70 @@ def main() -> None:
     if accepted < args.n_views:
         print(f"[gen_sparse_views] WARNING: only {accepted}/{args.n_views} accepted. "
               "Loosen --min-visible-frac / --min-ndc-spread or raise --max-proposals.")
+
+    # --- Outward cameras: invert look direction, with sign-flip fallback ---
+    if args.add_outward > 0 and frames:
+        n_target = args.add_outward
+        out_rejects = {"white_blob": 0, "black_frame": 0, "low_edge": 0}
+        out_accepted = 0
+
+        def _try_outward(eye: np.ndarray, fwd: np.ndarray) -> bool:
+            nonlocal out_accepted
+            c2w_out = forward_to_c2w(eye, fwd, up_world)
+            if args.render_check:
+                frame_tmp = {"file_path": "./test/r_tmp", "frame_index": 0,
+                             "transform_matrix": c2w_out.tolist(), "camera_angle_x": fov_x}
+                cam = _cam_loader(frame_tmp, width=args.width, height=args.height)
+                cam.original_image = None
+                with torch.no_grad():
+                    rendered = _gs_render_fn(cam, rend_gaussians, rend_pipeline,
+                                             bg_t, bg_d, gs_res=gs_res)["render"].clamp(0, 1)
+                ok, qstats = _render_quality(rendered, args.max_white_frac,
+                                             args.max_black_frac, args.min_edge_var)
+                if not ok:
+                    if qstats["white_frac"] > args.max_white_frac:
+                        out_rejects["white_blob"] += 1
+                    elif qstats["black_frac"] > args.max_black_frac:
+                        out_rejects["black_frame"] += 1
+                    else:
+                        out_rejects["low_edge"] += 1
+                    return False
+                if args.gt_renders_dir:
+                    gt_png = args.gt_renders_dir / f"camera_{accepted + out_accepted:03d}.png"
+                    _tvu.save_image(rendered.cpu(), str(gt_png))
+            frames.append({
+                "file_path": f"./test/r_{accepted + out_accepted}",
+                "frame_index": accepted + out_accepted,
+                "transform_matrix": c2w_out.tolist(),
+                "pose_mode": "outward",
+            })
+            out_accepted += 1
+            return True
+
+        # Pass 1: exact outward (eye - centroid) for ALL inward positions
+        inward_snapshot = list(frames)
+        for f in inward_snapshot:
+            if out_accepted >= n_target:
+                break
+            eye = np.array(f["transform_matrix"])[:3, 3]
+            _try_outward(eye, eye - centroid)
+
+        # Pass 2: sign-flip fallback — flip each axis of the outward direction
+        if out_accepted < n_target:
+            for f in inward_snapshot:
+                for axis in range(3):
+                    if out_accepted >= n_target:
+                        break
+                    eye = np.array(f["transform_matrix"])[:3, 3]
+                    fwd = eye - centroid
+                    fwd[axis] *= -1
+                    _try_outward(eye, fwd)
+                if out_accepted >= n_target:
+                    break
+
+        n_tried = len(inward_snapshot)
+        print(f"[gen_sparse_views] outward: {out_accepted}/{n_target} accepted  "
+              f"tried={n_tried}+fallback  rejects: {out_rejects}")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps({
@@ -313,6 +536,53 @@ def main() -> None:
         },
     }, indent=2))
     print(f"[gen_sparse_views] wrote {args.out}")
+
+    # --- QA: trace position scatter plot (alongside review video) ---
+    if frames:
+        _HERE2 = Path(__file__).resolve().parent
+        _scene_tag = f"{args.out.parent.name}_{args.out.stem}"
+        _qa_dir = _HERE2.parent / "output" / "camera_rendered" / _scene_tag
+        _qa_dir.mkdir(parents=True, exist_ok=True)
+        trace_out = _qa_dir / f"{_scene_tag}_trace.png"
+        _plot_trace_positions(frames, centroid, radius, up_axis, trace_out)
+
+    # --- QA: render-check spatial stats + review video ---
+    if args.render_check and frames:
+        positions = np.array([f["transform_matrix"] for f in frames])[:, :3, 3]
+        print(f"[spatial] position std: {positions.std(axis=0).round(3)}")
+        vecs = positions - centroid
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True).clip(1e-8)
+        elevs = np.degrees(np.arcsin((vecs / norms)[:, up_axis].clip(-1, 1)))
+        print(f"[spatial] elevation deg: min={elevs.min():.1f} max={elevs.max():.1f} "
+              f"mean={elevs.mean():.1f} std={elevs.std():.1f}")
+        if len(positions) >= 2:
+            diffs = positions[:, None, :] - positions[None, :, :]
+            pairwise = np.sqrt((diffs ** 2).sum(axis=2))
+            mean_pdist = pairwise[np.triu_indices(len(positions), k=1)].mean()
+            print(f"[spatial] mean pairwise dist: {mean_pdist:.3f}")
+        bins = np.linspace(-90, 90, 7)
+        hist, _ = np.histogram(elevs, bins=bins)
+        bin_labels = [f"[{bins[i]:.0f},{bins[i+1]:.0f})" for i in range(len(bins) - 1)]
+        print(f"[spatial] elev histogram: { {b: int(h) for b, h in zip(bin_labels, hist)} }")
+        unit_vecs = vecs / norms
+        octant_signs = (unit_vecs > 0).astype(int)
+        octants = set(map(tuple, octant_signs))
+        hemi_fill = len(octants) / 8.0
+        print(f"[spatial] hemisphere fill: {hemi_fill:.0%}  ({len(octants)}/8 octants)")
+
+        if args.gt_renders_dir and accepted > 0:
+            video_out = _qa_dir / "review.mp4"
+            try:
+                subprocess.run([
+                    "ffmpeg", "-y", "-framerate", "5",
+                    "-i", str(args.gt_renders_dir / "camera_%03d.png"),
+                    "-vf", "scale=800:-2",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    str(video_out),
+                ], check=True, capture_output=True)
+                print(f"[review-video] {video_out}")
+            except Exception as exc:
+                print(f"[review-video] ffmpeg failed: {exc}")
 
 
 if __name__ == "__main__":

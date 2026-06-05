@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
-# Experiment 1 @1600² — weight-mode sweep, volume + volume_over_d2 only.
-# screen_area@1600² already exists in output/0601/exp3_packing/progressive/.
+# Experiment 1 @1600² — GS weight-mode sweep, all 10 scenes.
 #
 # Fixed:  packing=progressive, scheme=vd_lod, grid=8x8x8, img=1600x1600.
-# Swept:  weight-mode ∈ {screen_area, volume, volume_over_d2, random}.
-# Scenes: 8 (7 synthetic + bicycle). Uses test_utility_inmem.py.
-# Random control (SPEC Del 2): weight_mode=random (U[0,1] seed=42 in compute_gaussian_weights_v2).
-# Trace:  sparse_views_100_eval.json (matched to exp3 for cross-mode comparability).
+# Swept:  weight-mode ∈ {screen_area, volume_over_d2, volume, random}.
+# Scenes: all 10. Uses test_utility_inmem.py.
+# Random control: weight_mode=random (U[0,1] seed=42 in compute_gaussian_weights_v2).
 #
 # Env overrides:
-#   SCENES="chair drums ficus hotdog materials mic ship"
+#   SCENES="chair drums"
 #   WEIGHT_MODES="volume volume_over_d2"
 #   CUDA_VISIBLE_DEVICES=0
-#   OUTPUT_ROOT=.../output/0603/exp1_1600_vol_modes
+#   OUTPUT_ROOT=.../output/MMDD/exp1_gs_weights
 set -euo pipefail
 
 ROOT="/mnt/data1/samk/gs-quic/cs5262_tile_quic"
@@ -33,34 +31,20 @@ check_gpu_free() {
     echo "[GPU GUARD] GPU $gpu_idx: ${free_mib} MiB free — OK"
 }
 
-SCENES="${SCENES:-bicycle drums ship mic ficus materials chair hotdog}"
+SCENES="${SCENES:-bicycle garden stump chair drums ficus hotdog materials mic ship}"
 WEIGHT_MODES="${WEIGHT_MODES:-screen_area volume_over_d2 random volume}"
 BUDGET_PCTS="${BUDGET_PCTS:-10 25 40 55 70 85 99 100}"
 GRID_SHAPE="${GRID_SHAPE:-8 8 8}"
 NUM_LOD="${NUM_LOD:-1}"
 SCHEME="${SCHEME:-vd_lod}"
-CAMERA_INDEX="${CAMERA_INDEX:--1}"
-OUT_BASE="${OUTPUT_ROOT:-$UTIL_DIR/output/0603/exp1_1600_vol_modes}"
+OUT_BASE="${OUTPUT_ROOT:-$UTIL_DIR/output/0605/exp1_1600_vol_modes}"
 
-scene_ply() {
-    case "$1" in
-        chair)     echo "$ROOT/exp-dataset/chair/checkpoint/point_cloud/iteration_30000/point_cloud.ply" ;;
-        drums)     echo "$ROOT/exp-dataset/drums/checkpoint/point_cloud/iteration_30000/point_cloud.ply" ;;
-        ficus)     echo "$ROOT/exp-dataset/ficus/checkpoint/point_cloud/iteration_30000/point_cloud.ply" ;;
-        hotdog)    echo "$ROOT/exp-dataset/hotdog/checkpoint/point_cloud/iteration_30000/point_cloud.ply" ;;
-        materials) echo "$ROOT/exp-dataset/materials/checkpoint/point_cloud/iteration_30000/point_cloud.ply" ;;
-        mic)       echo "$ROOT/exp-dataset/mic/checkpoint/point_cloud/iteration_30000/point_cloud.ply" ;;
-        ship)      echo "$ROOT/exp-dataset/ship/checkpoint/point_cloud/iteration_30000/point_cloud.ply" ;;
-        bicycle)   echo "$ROOT/exp-dataset/bicycle/point_cloud.ply" ;;
-        *) echo "" ;;
-    esac
-}
-scene_trace() {
-    echo "$(dirname "$(scene_ply "$1")")/sparse_views_100_eval.json"
-}
+# All scenes expose canonical symlinks at exp-dataset/{scene}/:
+#   point_cloud.ply, sparse_views_eval.json, gt_renders_eval/
+DSET="$ROOT/exp-dataset"
 
 echo "=========================================="
-echo "Exp 1 @1600² — volume + volume_over_d2 weight modes"
+echo "Exp 1 @1600² — weight-mode sweep, 10 scenes"
 echo "OUTPUT_ROOT  : $OUT_BASE"
 echo "SCENES       : $SCENES"
 echo "WEIGHT_MODES : $WEIGHT_MODES"
@@ -71,18 +55,15 @@ echo "=========================================="
 mkdir -p "$OUT_BASE"
 
 for scene in $SCENES; do
-    PLY="$(scene_ply "$scene")"
-    TRACE="$(scene_trace "$scene")"
+    PLY="$DSET/$scene/point_cloud.ply"
+    TRACE="$DSET/$scene/sparse_views_eval.json"
+    GT_DIR="$DSET/$scene/gt_renders_eval"
 
-    if [[ -z "$PLY" || ! -f "$PLY" ]]; then
-        echo "[skip] $scene: PLY not found"; continue
-    fi
-    if [[ ! -f "$TRACE" ]]; then
-        echo "[skip] $scene: trace not found at $TRACE"; continue
-    fi
+    if [[ ! -f "$PLY" ]]; then echo "[skip] $scene: no point_cloud.ply"; continue; fi
+    if [[ ! -f "$TRACE" ]]; then echo "[skip] $scene: no sparse_views_eval.json"; continue; fi
+    if [[ ! -d "$GT_DIR" ]]; then echo "[skip] $scene: no gt_renders_eval/"; continue; fi
 
     TILING_CACHE="$OUT_BASE/$scene/.tiling_cache.npz"
-    GT_CACHE="$OUT_BASE/$scene/gt_renders"
     mkdir -p "$(dirname "$TILING_CACHE")"
 
     for wm in $WEIGHT_MODES; do
@@ -101,14 +82,14 @@ for scene in $SCENES; do
             --budget-pct $BUDGET_PCTS \
             --schemes "$SCHEME" \
             --num-lod "$NUM_LOD" \
-            --camera-index "$CAMERA_INDEX" \
+            --camera-index -1 \
             --packing-mode progressive \
             --weight-mode "$wm" \
             --img-w 1600 --img-h 1600 \
             --scene "$scene" \
             --group-by weight_mode \
             --tiling-cache "$TILING_CACHE" \
-            --gt-renders-cache "$GT_CACHE" \
+            --gt-renders-cache "$GT_DIR" \
             --save-rep-only
 
         conda run -n gsquic python "$UTIL_DIR/experiments/aggregate_timings.py" \

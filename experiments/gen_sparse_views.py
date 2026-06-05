@@ -302,6 +302,9 @@ def main() -> None:
     p.add_argument("--full-sphere", action="store_true",
                    help="Sample orbit cameras over the full sphere (elevation -90 to +90 deg) "
                         "instead of the scene-type default hemisphere/band.")
+    p.add_argument("--eval-start", type=int, default=150,
+                   help="After writing main JSON, also write _eval.json with frames[N:] reindexed "
+                        "0-based, and create gt_renders_300_eval/ symlinks. -1 to disable.")
     # Recommended trace policy:
     #   synthetic (object-only): --n-views 300, --full-sphere, no --add-outward → 300 inward views
     #     outward skipped: synthetic bg is black → all outward views fail black_frame gate
@@ -537,10 +540,36 @@ def main() -> None:
     }, indent=2))
     print(f"[gen_sparse_views] wrote {args.out}")
 
-    # --- QA: trace position scatter plot (alongside review video) ---
+    # --- Eval JSON + gt_renders_300_eval symlinks ---
+    if args.eval_start >= 0 and len(frames) > args.eval_start:
+        eval_out = args.out.with_name(args.out.stem + "_eval.json")
+        eval_frames = [dict(f, frame_index=i) for i, f in enumerate(frames[args.eval_start:])]
+        eval_out.write_text(json.dumps({
+            "camera_angle_x": fov_x,
+            "frames": eval_frames,
+            "generation": {"source": str(args.out), "eval_start": args.eval_start},
+        }, indent=2))
+        print(f"[gen_sparse_views] eval trace -> {eval_out} ({len(eval_frames)} cameras)")
+        if args.gt_renders_dir:
+            eval_gt = args.gt_renders_dir.parent / "gt_renders_300_eval"
+            eval_gt.mkdir(parents=True, exist_ok=True)
+            for i in range(len(eval_frames)):
+                dst = eval_gt / f"camera_{i:03d}.png"
+                if not dst.exists():
+                    dst.symlink_to(
+                        f"../{args.gt_renders_dir.name}/camera_{args.eval_start + i:03d}.png"
+                    )
+            print(f"[gen_sparse_views] eval gt symlinks -> {eval_gt} ({len(eval_frames)} links)")
+
+    # --- QA: trace position scatter plot + review video ---
+    _SKIP = {"point_cloud", "checkpoint", "iteration_30000", "iteration_7000"}
+    _scene_name = next(
+        (p.name for p in args.ply.resolve().parents if p.name not in _SKIP),
+        args.out.stem,
+    )
+    _scene_tag = f"{_scene_name}_views_{len(frames)}"
     if frames:
         _HERE2 = Path(__file__).resolve().parent
-        _scene_tag = f"{args.out.parent.name}_{args.out.stem}"
         _qa_dir = _HERE2.parent / "output" / "camera_rendered" / _scene_tag
         _qa_dir.mkdir(parents=True, exist_ok=True)
         trace_out = _qa_dir / f"{_scene_tag}_trace.png"

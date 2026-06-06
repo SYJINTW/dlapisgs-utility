@@ -89,6 +89,7 @@ for g in $GRIDS; do
             --camera-index -1 \
             --packing-mode progressive \
             --weight-mode screen_area \
+            --w-mode mean \
             --img-w 1600 --img-h 1600 \
             --scene "$scene" \
             --group-by grid_shape \
@@ -120,6 +121,7 @@ for g in $GRIDS; do
             --camera-index -1 \
             --packing-mode tile_strict \
             --weight-mode screen_area \
+            --w-mode mean \
             --img-w 1600 --img-h 1600 \
             --scene "$scene" \
             --group-by grid_shape \

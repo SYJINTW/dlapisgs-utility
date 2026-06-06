@@ -517,7 +517,7 @@ def main() -> None:
     parser.add_argument("--img-h", type=int, default=800)
     parser.add_argument("--w-norm", type=str, default="sum", choices=list(uc.NORM_MODES))
     parser.add_argument("--c-norm", type=str, default="sum", choices=list(uc.NORM_MODES))
-    parser.add_argument("--w-mode", type=str, default="sum", choices=list(uc.W_MODES))
+    parser.add_argument("--w-mode", type=str, default="mean", choices=list(uc.W_MODES))
     parser.add_argument("--c-kind", type=str, default="count",
                         choices=list(uc.COMPLEXITY_KINDS) + ["count"])
     parser.add_argument("--packing-mode", type=str, default="tile_partial",

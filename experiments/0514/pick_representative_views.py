@@ -66,6 +66,8 @@ def main() -> None:
         key = (r.get("scene", ""), r[args.group_by], float(r["budget_mb"]))
         by_cell.setdefault(key, []).append(r)
 
+    distinct_groups = {k[1] for k in by_cell}
+    use_group_subdir = len(distinct_groups) > 1
     index_rows = []
     for (scene, group_val, budget_mb), cell_rows in sorted(by_cell.items()):
         cell_rows.sort(key=lambda r: float(r["psnr"]))
@@ -96,7 +98,7 @@ def main() -> None:
                 "subset_png": str(subset_png), "gt_png": str(gt_png),
             })
 
-        out_dir = rep_root / str(group_val)
+        out_dir = rep_root / str(group_val) if use_group_subdir else rep_root
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{budget_tag}.png"
         fig.tight_layout(rect=(0, 0, 1, 0.97))

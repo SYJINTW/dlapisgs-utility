@@ -30,7 +30,7 @@ INVISIBLE_PRIORITY_EPS = 1e-2   # >0 to prevent invisible-tile starvation
 DISTANCE_EPS = 1e-3
 
 W_MODES = ("sum", "mean")
-WEIGHT_MODES = ("det_gamma_over_d2", "volume", "volume_over_d2", "screen_area", "random")
+WEIGHT_MODES = ("volume", "volume_over_d2", "screen_area", "random")
 NORM_MODES = ("none", "max", "minmax", "log1p", "sum")
 
 COMPLEXITY_KINDS = ("eigenentropy", "omnivariance", "voxel_entropy", "spectral_energy")
@@ -96,31 +96,6 @@ def normalize_term(x, mode="none", eps=1e-12):
 # ---------------------------------------------------------------------------
 # Gaussian weights
 # ---------------------------------------------------------------------------
-
-def compute_gaussian_weights(opacity, scale_0, scale_1, scale_2, gamma=1.0,
-                             xyz=None, cam_center=None):
-    """DEPRECATED: use compute_gaussian_weights_v2."""
-    if not isinstance(opacity, torch.Tensor):
-        opacity = torch.tensor(opacity, dtype=torch.float32)
-        scale_0 = torch.tensor(scale_0, dtype=torch.float32)
-        scale_1 = torch.tensor(scale_1, dtype=torch.float32)
-        scale_2 = torch.tensor(scale_2, dtype=torch.float32)
-
-    o_i = torch.sigmoid(opacity)
-    det_sigma = torch.exp(2.0 * (scale_0 + scale_1 + scale_2))
-    w_gi = o_i * (det_sigma ** gamma)
-
-    if xyz is not None and cam_center is not None:
-        if not isinstance(xyz, torch.Tensor):
-            xyz = torch.tensor(xyz, dtype=torch.float32)
-        if not isinstance(cam_center, torch.Tensor):
-            cam_center = torch.tensor(cam_center, dtype=torch.float32)
-        xyz = xyz.to(w_gi.device)
-        cam_center = cam_center.to(w_gi.device)
-        d2 = ((xyz - cam_center.unsqueeze(0)) ** 2).sum(dim=1).clamp(min=1e-6)
-        w_gi = w_gi / d2
-
-    return w_gi
 
 
 def project_covariance_2d(xyz, scale_0, scale_1, scale_2,

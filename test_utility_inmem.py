@@ -6,7 +6,7 @@ the rasterizer (diff_gaussian_rasterization_lapisgs) and all selection deps.
 
 Key difference from the test_utility.py + render_metrics.py pair:
   - No PLY files written (unless --save-ply).
-  - GT rendered once at startup, cached to gt_renders/.
+  - GT rendered once at startup to gt_renders/ (float in RAM; PNG saved for inspection only).
   - Per (camera, scheme, budget): select → subset GaussianModel in memory
     → render → PSNR/SSIM → save PNG. Zero disk roundtrip.
   - Representative views (worst/median/best) picked automatically at the end.
@@ -408,7 +408,7 @@ def _collect_rep_keys(summary_rows: list, group_by: str) -> set:
     keys: set = set()
     for cell_rows in by_cell.values():
         cell_rows.sort(key=lambda r: float(r["psnr"]))
-        for r in (cell_rows[0], cell_rows[len(cell_rows) // 2], cell_rows[-1]):
+        for r in (cell_rows[0], cell_rows[(len(cell_rows) - 1) // 2], cell_rows[-1]):
             keys.add((int(r["camera_index"]), float(r["budget_mb"]), r["scheme"]))
     return keys
 
@@ -448,7 +448,7 @@ def _pick_representative_views(output_root: Path, summary_rows: list, group_by: 
     for (scene, group_val, budget_mb), cell_rows in sorted(by_cell.items()):
         cell_rows.sort(key=lambda r: float(r["psnr"]))
         worst  = cell_rows[0]
-        median = cell_rows[len(cell_rows) // 2]
+        median = cell_rows[(len(cell_rows) - 1) // 2]
         best   = cell_rows[-1]
 
         budget_tag = f"budget_{_budget_tag(budget_mb)}"
@@ -492,6 +492,128 @@ def _pick_representative_views(output_root: Path, summary_rows: list, group_by: 
 
 
 # ---------------------------------------------------------------------------
+# Selection helpers (camera-level)
+# ---------------------------------------------------------------------------
+
+def _compute_camera_weights(sel_cam, opacity, scale_0, scale_1, scale_2,
+                             rot_0, rot_1, rot_2, rot_3, gs_xyz_t, device,
+                             weight_mode, img_w, img_h):
+    """Compute per-Gaussian weights for one camera view."""
+    cam_center = sel_cam.camera_center.to(device)
+    kw = dict(opacity=opacity, scale_0=scale_0, scale_1=scale_1, scale_2=scale_2,
+              xyz=gs_xyz_t, cam_center=cam_center)
+    if weight_mode == "screen_area":
+        if any(r is None for r in (rot_0, rot_1, rot_2, rot_3)):
+            raise RuntimeError("weight_mode=screen_area requires rot_0..rot_3 in PLY")
+        kw.update(rot_0=rot_0, rot_1=rot_1, rot_2=rot_2, rot_3=rot_3,
+                  world_view=sel_cam.world_view_transform,
+                  proj=sel_cam.projection_matrix,
+                  img_w=img_w, img_h=img_h,
+                  fov_x=getattr(sel_cam, "FoVx", None),
+                  fov_y=getattr(sel_cam, "FoVy", None))
+    return uc.compute_gaussian_weights_v2(weight_mode, **kw).to(device)
+
+
+def _build_greedy_order(packing_mode, scheme, utilities, visibility,
+                        tile_index_offsets, tile_flat_indices, w_gi,
+                        bytes_per_gaussian, max_budget_bytes, shuffle_visible_seed=None):
+    """Return (all_ordered, tile_cum_counts) for one (camera, scheme) pair."""
+    tile_cum_counts = None
+    if packing_mode == "progressive":
+        all_ordered = _greedy_order_progressive(
+            visibility, tile_index_offsets, tile_flat_indices,
+            w_gi, bytes_per_gaussian, max_budget_bytes,
+            shuffle_seed=shuffle_visible_seed)
+    elif packing_mode == "tile_strict":
+        all_ordered, tile_cum_counts = _greedy_order_tile_strict(
+            utilities, tile_index_offsets, tile_flat_indices, w_gi)
+        
+    elif packing_mode == "tile_partial":        
+        all_ordered = _greedy_order(
+            utilities, tile_index_offsets, tile_flat_indices,
+            w_gi, bytes_per_gaussian, max_budget_bytes)
+    else:
+        raise ValueError(f"Unknown packing_mode '{packing_mode}'.")
+    return all_ordered, tile_cum_counts
+
+
+def _rerender_rep_views(
+        rep_keys, sel_cameras, rend_cameras, rend_gs_full,
+        tile_index_offsets, tile_flat_indices, min_corners_t, max_corners_t, tile_centers,
+        opacity, scale_0, scale_1, scale_2, rot_0, rot_1, rot_2, rot_3, gs_xyz_t,
+        bytes_per_gaussian, max_budget_bytes, budget_list, budget_bytes_list,
+        oracle_data, base_output_path, device, args) -> None:
+    """Re-render and save PNGs for worst/median/best (camera, budget, scheme) combos."""
+    import collections as _col
+    _mb_to_bytes = dict(zip(budget_list, budget_bytes_list))
+    rep_by_cam: dict = _col.defaultdict(list)
+    for (ci, bm, sc) in rep_keys:
+        rep_by_cam[ci].append((bm, sc))
+
+    for camera_index in sorted(rep_by_cam):
+        sel_cam = sel_cameras[camera_index]
+        rend_cam = rend_cameras[camera_index]
+
+        distances = uc.calculate_distances(tile_centers, sel_cam.camera_center.to(device))
+        visibility = visibility_AABB_pytorch.batched_check_tiles_visible(
+            min_corners_t, max_corners_t, sel_cam, device=device)
+        w_gi = _compute_camera_weights(
+            sel_cam, opacity, scale_0, scale_1, scale_2,
+            rot_0, rot_1, rot_2, rot_3, gs_xyz_t, device,
+            args.weight_mode, args.img_w, args.img_h)
+        W_k, N_k = uc.compute_tile_weights_and_counts(
+            tile_index_offsets, tile_flat_indices, w_gi,
+            w_norm=args.w_norm, c_norm=args.c_norm, w_mode=args.w_mode)
+
+        needed_schemes = {sc for _, sc in rep_by_cam[camera_index]}
+        needs_c = any(s in ("vd_lod_c", "vd_lod_w_c") for s in needed_schemes)
+        if needs_c and args.c_kind != "count":
+            C_k = uc.compute_tile_complexity(
+                args.c_kind, tile_index_offsets, tile_flat_indices, w_gi, gs_xyz_t,
+                min_corners=min_corners_t, max_corners=max_corners_t)
+            C_k = uc.normalize_term(C_k, args.c_norm)
+        else:
+            C_k = N_k
+
+        for scheme in needed_schemes:
+            if scheme.startswith("oracle_"):
+                n_tiles = len(tile_index_offsets) - 1
+                utilities = _oracle_utilities(scheme, oracle_data, camera_index, n_tiles)
+            elif scheme == "ml":
+                continue  # ML rep-only not supported without model/features here
+            else:
+                include_lod = scheme != "vd"
+                include_w = scheme in ("vd_lod_w", "vd_lod_w_c")
+                include_c = scheme in ("vd_lod_c", "vd_lod_w_c")
+                utilities = uc.calculate_utility_param(
+                    visibility, distances, num_of_level=args.num_lod,
+                    weight_sum_tensor=W_k if include_w else None,
+                    complexity_tensor=C_k if include_c else None,
+                    include_lod=include_lod, include_w=include_w, include_c=include_c)
+
+            all_ordered, tile_cum_counts = _build_greedy_order(
+                args.packing_mode, scheme, utilities, visibility,
+                tile_index_offsets, tile_flat_indices, w_gi,
+                bytes_per_gaussian, max_budget_bytes, args.shuffle_visible_seed)
+
+            needed_budgets = [bm for bm, sc in rep_by_cam[camera_index] if sc == scheme]
+            for budget_mb in needed_budgets:
+                budget_bytes = _mb_to_bytes.get(budget_mb, round(budget_mb * 1024 * 1024))
+                selected_indices, _ = _select_at_budget(
+                    all_ordered, budget_bytes, bytes_per_gaussian,
+                    tile_cum_counts=tile_cum_counts)
+                sub_gs = _subset_gaussians(rend_gs_full, selected_indices)
+                rendered = _render_gs(sub_gs, rend_cam, args.white_bg)
+                del sub_gs
+                budget_tag = f"budget_{_budget_tag(budget_mb)}"
+                render_png = (base_output_path / "renders" / "ply" / budget_tag
+                              / scheme / f"camera_{camera_index:03d}.png")
+                render_png.parent.mkdir(parents=True, exist_ok=True)
+                torchvision.utils.save_image(rendered, str(render_png))
+                logger.info("[rep] cam={:03d} budget={} scheme={}", camera_index, budget_tag, scheme)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -510,7 +632,6 @@ def main() -> None:
     parser.add_argument("--num-lod", type=int, default=1)
     parser.add_argument("--scheme", type=str, default=None, choices=VALID_SCHEMES)
     parser.add_argument("--schemes", nargs="+", type=str, default=None)
-    parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--camera-index", type=int, default=0)
     parser.add_argument("--camera-indices", nargs="+", type=int, default=None)
     parser.add_argument("--img-w", type=int, default=800)
@@ -522,11 +643,10 @@ def main() -> None:
                         choices=list(uc.COMPLEXITY_KINDS) + ["count"])
     parser.add_argument("--packing-mode", type=str, default="tile_partial",
                         choices=["tile_partial", "tile_strict", "progressive"])
-    parser.add_argument("--weight-mode", type=str, default="det_gamma_over_d2",
+    parser.add_argument("--weight-mode", type=str, default="screen_area",
                         choices=list(uc.WEIGHT_MODES))
     parser.add_argument("--tiling-cache", type=str, default=None)
-    parser.add_argument("--gt-renders-cache", type=str, default=None,
-                        help="Shared GT render PNG dir across weight modes for same scene.")
+
     parser.add_argument("--ml-model-dir", type=str, default=None)
     parser.add_argument("--ml-model-type", type=str, default="lgbm",
                         choices=["lgbm", "xgb", "rf"])
@@ -596,6 +716,15 @@ def main() -> None:
         if not p.exists():
             raise FileNotFoundError(p)
 
+    # Validate ML model path at startup (fail fast, not at render time)
+    _ml_model = None
+    if "ml" in scheme_list:
+        _ml_model_pkl = Path(args.ml_model_dir) / f"{args.ml_model_type}.pkl"
+        if not _ml_model_pkl.exists():
+            raise FileNotFoundError(f"ML model not found: {_ml_model_pkl}")
+        with _timed("ml_model_load", []):
+            _ml_model = joblib.load(_ml_model_pkl)
+
     base_output_path = Path(args.output_root)
     log_path = base_output_path / "utility.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -604,17 +733,8 @@ def main() -> None:
     logger.info("ply={} gt_ply={} trace={}", ply_path, gt_ply_path, camera_trace)
 
     # --- Resolve budget_pct → MB ---
-    if budget_list is None:
-        _gs_tmp = io_3dgs.GaussianModelV2(str(ply_path))
-        _bpg = _bytes_per_gaussian(_gs_tmp)
-        _n = len(_gs_tmp.data["x"]["data"])
-        _full_bytes = _bpg * _n
-        budget_list = sorted(
-            (p / 100.0) * _full_bytes / (1024 * 1024) for p in args.budget_pct
-        )
-        logger.info("budget_pct={} resolved -> budgets_mb={}",
-                    args.budget_pct, [f"{b:.4f}" for b in budget_list])
-        del _gs_tmp
+    _budget_pct_pending = args.budget_pct if budget_list is None else None
+    _budget_bytes_list: list[int] | None = None  # filled after sel_gs load if needed
 
     output_root_for_meta = base_output_path
     _dump_run_params(output_root_for_meta, args, device)
@@ -642,7 +762,14 @@ def main() -> None:
 
     if tiling_cache_path is not None and tiling_cache_path.exists():
         with _timed("tiling_cache_load", timings):
-            _tc = np.load(str(tiling_cache_path))
+            _tc = np.load(str(tiling_cache_path), allow_pickle=True)
+            _cached_grid = tuple(_tc["grid_shape"].tolist()) if "grid_shape" in _tc else None
+            _req_grid = tuple(args.grid_shape)
+            if _cached_grid is not None and _cached_grid != _req_grid:
+                raise ValueError(
+                    f"--tiling-cache was built with grid_shape={_cached_grid} "
+                    f"but --grid-shape={_req_grid}. Use a different cache path."
+                )
             min_corners = _tc["min_corners"]
             max_corners = _tc["max_corners"]
             index_offsets = _tc["index_offsets"]
@@ -658,7 +785,8 @@ def main() -> None:
             tiling_cache_path.parent.mkdir(parents=True, exist_ok=True)
             np.savez(str(tiling_cache_path),
                      min_corners=min_corners, max_corners=max_corners,
-                     index_offsets=index_offsets, flat_indices=flat_indices)
+                     index_offsets=index_offsets, flat_indices=flat_indices,
+                     grid_shape=np.array(args.grid_shape, dtype=np.int32))
 
     min_corners_t = torch.tensor(min_corners, dtype=torch.float32, device=device)
     max_corners_t = torch.tensor(max_corners, dtype=torch.float32, device=device)
@@ -697,8 +825,8 @@ def main() -> None:
     assert len(sel_cameras) == len(rend_cameras), (
         f"Camera count mismatch: sel={len(sel_cameras)} rend={len(rend_cameras)}")
 
-    # --- Pre-render GT (once, cached) ---
-    gt_renders_dir = Path(args.gt_renders_cache) if args.gt_renders_cache else base_output_path / "gt_renders"
+    # --- Pre-render GT (once, cached in RAM) ---
+    gt_renders_dir = base_output_path / "gt_renders"
     gt_renders_dir.mkdir(parents=True, exist_ok=True)
     bg = [1, 1, 1] if args.white_bg else [0, 0, 0]
 
@@ -712,11 +840,6 @@ def main() -> None:
     with _timed("gt_render_all", timings, n=len(rend_cameras)):
         with torch.no_grad():
             for idx, cam in enumerate(tqdm(rend_cameras, desc="gt_render", leave=False)):
-                gt_png = gt_renders_dir / f"camera_{idx:03d}.png"
-                if gt_png.exists():
-                    frame_t = torchvision.io.read_image(str(gt_png)).float() / 255.0
-                    gt_renders.append(frame_t)
-                    continue
                 bg_color = torch.tensor(bg, dtype=torch.float32, device="cuda").view(3, 1, 1)
                 bg_color = bg_color.expand(3, cam.image_height, cam.image_width)
                 bg_depth = torch.zeros(1, cam.image_height, cam.image_width, device="cuda")
@@ -724,8 +847,8 @@ def main() -> None:
                                    gs_res=gt_gs_res)
                 frame_t = result["render"].clamp(0.0, 1.0)
                 gt_renders.append(frame_t.cpu())
-                torchvision.utils.save_image(frame_t, str(gt_png))
-    logger.success("GT rendered: {} frames cached to {}", len(gt_renders), gt_renders_dir)
+                torchvision.utils.save_image(frame_t, str(gt_renders_dir / f"camera_{idx:03d}.png"))
+    logger.success("GT rendered: {} frames to {}", len(gt_renders), gt_renders_dir)
     del gt_gaussians
     torch.cuda.empty_cache()
 
@@ -754,12 +877,23 @@ def main() -> None:
         )
 
     bytes_per_gaussian = _bytes_per_gaussian(sel_gs)
-    max_budget_bytes = int(max(budget_list) * 1024 * 1024)
+    if _budget_pct_pending is not None:
+        _full_n = len(sel_gs.data["x"]["data"])
+        _full_bytes = _full_n * bytes_per_gaussian
+        _budget_bytes_list = sorted(
+            round(p / 100.0 * _full_bytes) for p in _budget_pct_pending
+        )
+        budget_list = sorted(b / (1024 * 1024) for b in _budget_bytes_list)
+        logger.info("budget_pct={} resolved -> budget_bytes={} budget_mb={}",
+                    _budget_pct_pending, _budget_bytes_list,
+                    [f"{b:.4f}" for b in budget_list])
+    else:
+        _budget_bytes_list = [round(mb * 1024 * 1024) for mb in budget_list]
+    max_budget_bytes = max(_budget_bytes_list)
 
-    # --- ML: precompute static features ---
+    # --- ML: precompute static features (model already loaded at startup) ---
     ml_static_feats = ml_feature_names = None
     ml_include_b = False
-    _ml_model = None
     if "ml" in scheme_list:
         _ml_model_path = Path(args.ml_model_dir)
         ml_feature_names = json.loads((_ml_model_path / "feature_names.json").read_text())
@@ -768,8 +902,6 @@ def main() -> None:
             ml_static_feats = ml_features.build_static_features(
                 sel_gs.data, index_offsets, flat_indices
             )
-        with _timed("ml_model_load", timings):
-            _ml_model = joblib.load(Path(args.ml_model_dir) / f"{args.ml_model_type}.pkl")
 
     # --- Camera index list ---
     if args.camera_indices is not None:
@@ -802,6 +934,14 @@ def main() -> None:
                 f"oracle_dq.npz has {n_oracle_tiles} tiles but scene has {n_scene_tiles}. "
                 "Use the same --tiling-cache passed to exp4_oracle_dq.py."
             )
+        _oracle_cam_set = set(oracle_data["cam_idx_to_row"].keys())
+        _missing = [ci for ci in camera_indices if ci not in _oracle_cam_set]
+        if _missing:
+            logger.warning(
+                "oracle NPZ missing {}/{} requested cameras; those will fall back to tile-index order. "
+                "Missing: {}",
+                len(_missing), len(camera_indices), _missing[:10],
+            )
 
     logger.info("tiles={} cameras={} selected_indices={} bpg={}",
                 len(index_offsets) - 1, len(sel_cameras), camera_indices, bytes_per_gaussian)
@@ -820,6 +960,8 @@ def main() -> None:
     # --- Per-camera loop ---
     cam_pbar = tqdm(camera_indices, desc="cameras", unit="cam")
     for camera_index in cam_pbar:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         sel_cam = sel_cameras[camera_index]
         rend_cam = rend_cameras[camera_index]
         cam_futures = []
@@ -827,6 +969,7 @@ def main() -> None:
         _rend_peak_mib = 0
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
+        gt_render_gpu = gt_renders[camera_index].to(device)
 
         cam_pbar.set_postfix(idx=camera_index, stage="visibility")
         with _timed("visibility", timings, camera=camera_index):
@@ -838,31 +981,10 @@ def main() -> None:
         cam_pbar.set_postfix(idx=camera_index, stage="gaussian_weights")
         with _timed("gaussian_weights", timings, camera=camera_index,
                     weight_mode=args.weight_mode):
-            cam_center = sel_cam.camera_center.to(device)
-            if args.weight_mode == "det_gamma_over_d2":
-                w_gi = uc.compute_gaussian_weights(
-                    opacity, scale_0, scale_1, scale_2, gamma=args.gamma,
-                    xyz=gs_xyz_t, cam_center=cam_center,
-                ).to(device)
-                logger.debug(" THIS Weight_MODE is DEPRECATED, gaussian_weights: det_gamma_over_d2 with gamma={}", args.gamma)
-            else:
-                kw = dict(
-                    opacity=opacity, scale_0=scale_0, scale_1=scale_1, scale_2=scale_2,
-                    xyz=gs_xyz_t, cam_center=cam_center,
-                )
-                if args.weight_mode == "screen_area":
-                    if any(r is None for r in (rot_0, rot_1, rot_2, rot_3)):
-                        raise RuntimeError("weight_mode=screen_area requires rot_0..rot_3 in PLY")
-                    cam_w2v = sel_cam.world_view_transform.cpu().numpy()
-                    kw.update(
-                        rot_0=rot_0, rot_1=rot_1, rot_2=rot_2, rot_3=rot_3,
-                        world_view=sel_cam.world_view_transform,
-                        proj=sel_cam.projection_matrix,
-                        img_w=args.img_w, img_h=args.img_h,
-                        fov_x=getattr(sel_cam, "FoVx", None),
-                        fov_y=getattr(sel_cam, "FoVy", None),
-                    )
-                w_gi = uc.compute_gaussian_weights_v2(args.weight_mode, **kw).to(device)
+            w_gi = _compute_camera_weights(
+                sel_cam, opacity, scale_0, scale_1, scale_2,
+                rot_0, rot_1, rot_2, rot_3, gs_xyz_t, device,
+                args.weight_mode, args.img_w, args.img_h)
 
         cam_pbar.set_postfix(idx=camera_index, stage="tile_weights")
         with _timed("tile_weights", timings, camera=camera_index):
@@ -965,22 +1087,10 @@ def main() -> None:
 
             with _timed("greedy", timings, camera=camera_index, scheme=scheme,
                         packing_mode=args.packing_mode):
-                tile_cum_counts = None
-                if args.packing_mode == "progressive":
-                    all_ordered = _greedy_order_progressive(
-                        visibility, tile_index_offsets, tile_flat_indices,
-                        w_gi, bytes_per_gaussian, max_budget_bytes,
-                        shuffle_seed=args.shuffle_visible_seed,
-                    )
-                elif args.packing_mode == "tile_strict":
-                    all_ordered, tile_cum_counts = _greedy_order_tile_strict(
-                        utilities, tile_index_offsets, tile_flat_indices, w_gi,
-                    )
-                else:
-                    all_ordered = _greedy_order(
-                        utilities, tile_index_offsets, tile_flat_indices,
-                        w_gi, bytes_per_gaussian, max_budget_bytes,
-                    )
+                all_ordered, tile_cum_counts = _build_greedy_order(
+                    args.packing_mode, scheme, utilities, visibility,
+                    tile_index_offsets, tile_flat_indices, w_gi,
+                    bytes_per_gaussian, max_budget_bytes, args.shuffle_visible_seed)
 
             if torch.cuda.is_available():
                 _p = torch.cuda.max_memory_allocated() // (1024 * 1024)
@@ -988,8 +1098,9 @@ def main() -> None:
                 torch.cuda.reset_peak_memory_stats()
 
             # --- Per-budget loop ---
-            for budget_mb in tqdm(budget_list, desc="budgets", leave=False, unit="MB"):
-                budget_bytes = int(budget_mb * 1024 * 1024)
+            for budget_mb, budget_bytes in tqdm(
+                    zip(budget_list, _budget_bytes_list), desc="budgets",
+                    total=len(budget_list), leave=False, unit="MB"):
                 with _timed("select_at_budget", timings, camera=camera_index,
                             scheme=scheme, budget_mb=budget_mb):
                     selected_indices, used_bytes = _select_at_budget(
@@ -1016,7 +1127,7 @@ def main() -> None:
 
                 with _timed("metrics", timings, camera=camera_index,
                             scheme=scheme, budget_mb=budget_mb):
-                    m = _compute_metrics(rendered, gt_renders[camera_index].to(rendered.device))
+                    m = _compute_metrics(rendered, gt_render_gpu)
 
                 if not args.save_rep_only:
                     if png_executor:
@@ -1047,7 +1158,6 @@ def main() -> None:
                     "c_norm":             args.c_norm,
                     "packing_mode":       args.packing_mode,
                     "weight_mode":        args.weight_mode,
-                    "gamma":              args.gamma,
                     "grid_shape":         list(args.grid_shape),
                     "num_lod":            args.num_lod,
                 }
@@ -1086,7 +1196,7 @@ def main() -> None:
                         "num_lod": args.num_lod,
                         "w_norm": args.w_norm, "c_norm": args.c_norm,
                         "packing_mode": args.packing_mode,
-                        "weight_mode": args.weight_mode, "gamma": args.gamma,
+                        "weight_mode": args.weight_mode,
                     }
                     ply_dir.mkdir(parents=True, exist_ok=True)
                     output_ply.with_suffix(".json").write_text(
@@ -1105,14 +1215,12 @@ def main() -> None:
             timings.append({"stage": "gpu_peak_render", "camera": camera_index,
                             "peak_alloc_mib": _rend_peak_mib})
 
-        timings_path.write_text(json.dumps(timings, indent=2), encoding="utf-8")
-
     if executor:
         executor.shutdown(wait=True)
 
     if png_executor:
         for fut in png_futures:
-            fut.result()
+            fut.result(timeout=300)
         png_executor.shutdown(wait=True)
 
     # --- Write summary ---
@@ -1135,71 +1243,12 @@ def main() -> None:
     if args.save_rep_only and all_metric_rows:
         rep_keys = _collect_rep_keys(all_metric_rows, args.group_by)
         logger.info("save_rep_only: re-rendering {} (cam, budget, scheme) combos", len(rep_keys))
-        import collections as _col
-        rep_by_cam: dict = _col.defaultdict(list)
-        for (ci, bm, sc) in rep_keys:
-            rep_by_cam[ci].append((bm, sc))
-
-        for camera_index in sorted(rep_by_cam):
-            sel_cam = sel_cameras[camera_index]
-            rend_cam = rend_cameras[camera_index]
-            distances = uc.calculate_distances(tile_centers, sel_cam.camera_center.to(device))
-            visibility = visibility_AABB_pytorch.batched_check_tiles_visible(
-                min_corners_t, max_corners_t, sel_cam, device=device)
-            cam_center = sel_cam.camera_center.to(device)
-            kw = dict(opacity=opacity, scale_0=scale_0, scale_1=scale_1, scale_2=scale_2,
-                      xyz=gs_xyz_t, cam_center=cam_center)
-            if args.weight_mode == "screen_area":
-                kw.update(rot_0=rot_0, rot_1=rot_1, rot_2=rot_2, rot_3=rot_3,
-                          world_view=sel_cam.world_view_transform,
-                          proj=sel_cam.projection_matrix,
-                          img_w=args.img_w, img_h=args.img_h,
-                          fov_x=getattr(sel_cam, "FoVx", None),
-                          fov_y=getattr(sel_cam, "FoVy", None))
-            w_gi = uc.compute_gaussian_weights_v2(args.weight_mode, **kw).to(device)
-            W_k, _ = uc.compute_tile_weights_and_counts(
-                tile_index_offsets, tile_flat_indices, w_gi,
-                w_norm=args.w_norm, c_norm=args.c_norm, w_mode=args.w_mode)
-
-            needed_schemes = {sc for _, sc in rep_by_cam[camera_index]}
-            for scheme in needed_schemes:
-                include_lod = scheme != "vd"
-                include_w = scheme in ("vd_lod_w", "vd_lod_w_c")
-                include_c = scheme in ("vd_lod_c", "vd_lod_w_c")
-                utilities = uc.calculate_utility_param(
-                    visibility, distances, num_of_level=args.num_lod,
-                    weight_sum_tensor=W_k if include_w else None,
-                    complexity_tensor=None,
-                    include_lod=include_lod, include_w=include_w, include_c=include_c)
-                tile_cum_counts = None
-                if args.packing_mode == "progressive":
-                    all_ordered = _greedy_order_progressive(
-                        visibility, tile_index_offsets, tile_flat_indices,
-                        w_gi, bytes_per_gaussian, max_budget_bytes,
-                        shuffle_seed=args.shuffle_visible_seed)
-                elif args.packing_mode == "tile_strict":
-                    all_ordered, tile_cum_counts = _greedy_order_tile_strict(
-                        utilities, tile_index_offsets, tile_flat_indices, w_gi)
-                else:
-                    all_ordered = _greedy_order(
-                        utilities, tile_index_offsets, tile_flat_indices,
-                        w_gi, bytes_per_gaussian, max_budget_bytes)
-
-                needed_budgets = [bm for bm, sc in rep_by_cam[camera_index] if sc == scheme]
-                for budget_mb in needed_budgets:
-                    budget_bytes = int(budget_mb * 1024 * 1024)
-                    selected_indices, _ = _select_at_budget(
-                        all_ordered, budget_bytes, bytes_per_gaussian,
-                        tile_cum_counts=tile_cum_counts)
-                    sub_gs = _subset_gaussians(rend_gs_full, selected_indices)
-                    rendered = _render_gs(sub_gs, rend_cam, args.white_bg)
-                    del sub_gs
-                    budget_tag = f"budget_{_budget_tag(budget_mb)}"
-                    render_png = (base_output_path / "renders" / "ply" / budget_tag
-                                  / scheme / f"camera_{camera_index:03d}.png")
-                    render_png.parent.mkdir(parents=True, exist_ok=True)
-                    torchvision.utils.save_image(rendered, str(render_png))
-                    logger.info("[rep] cam={:03d} budget={} scheme={}", camera_index, budget_tag, scheme)
+        _rerender_rep_views(
+            rep_keys, sel_cameras, rend_cameras, rend_gs_full,
+            tile_index_offsets, tile_flat_indices, min_corners_t, max_corners_t, tile_centers,
+            opacity, scale_0, scale_1, scale_2, rot_0, rot_1, rot_2, rot_3, gs_xyz_t,
+            bytes_per_gaussian, max_budget_bytes, budget_list, _budget_bytes_list,
+            oracle_data, base_output_path, device, args)
 
     # --- Representative views ---
     if all_metric_rows:

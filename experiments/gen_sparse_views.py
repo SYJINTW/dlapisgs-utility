@@ -25,9 +25,11 @@ Output JSON matches Frustum-for-3DGS/camera/blender_camera.readCamerasFromTransf
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as _dt
 import json
 import math
+import os
 import socket
 import subprocess
 from pathlib import Path
@@ -380,6 +382,16 @@ def main() -> None:
         bg_d = torch.zeros(1, args.height, args.width, device="cuda")
         gs_res = torch.ones(len(rend_gaussians.get_xyz), device="cuda")
 
+    _debug_csv_f = _debug_csv_w = None
+    if args.render_check:
+        _dbg = os.environ.get("GEN_DEBUG_EDGEVAR")
+        if _dbg:
+            _dbg_path = Path(_dbg)
+            _dbg_path.parent.mkdir(parents=True, exist_ok=True)
+            _debug_csv_f = open(str(_dbg_path), "w", newline="")
+            _debug_csv_w = csv.writer(_debug_csv_f)
+            _debug_csv_w.writerow(["sin_elev_Z", "edge_var", "black_frac", "white_frac", "accepted"])
+
     frames = []
     counts = {"inward": 0}
     rejects = {"low_visible": 0, "low_spread": 0}
@@ -423,6 +435,13 @@ def main() -> None:
                                          bg_t, bg_d, gs_res=gs_res)["render"].clamp(0, 1)
             ok, qstats = _render_quality(rendered, args.max_white_frac,
                                          args.max_black_frac, args.min_edge_var)
+            if _debug_csv_w is not None:
+                _vec = eye - centroid
+                _d = float(np.linalg.norm(_vec))
+                _debug_csv_w.writerow([
+                    float(_vec[up_axis]) / max(_d, 1e-8),
+                    qstats["edge_var"], qstats["black_frac"], qstats["white_frac"], int(ok)
+                ])
             if not ok:
                 if qstats["white_frac"] > args.max_white_frac:
                     rejects["white_blob"] += 1
@@ -450,6 +469,10 @@ def main() -> None:
     if accepted < args.n_views:
         print(f"[gen_sparse_views] WARNING: only {accepted}/{args.n_views} accepted. "
               "Loosen --min-visible-frac / --min-ndc-spread or raise --max-proposals.")
+    if _debug_csv_f is not None:
+        _debug_csv_f.flush()
+        _debug_csv_f.close()
+        print(f"[debug-edgevar] wrote {_debug_csv_f.name}")
 
     # --- Outward cameras: invert look direction, with sign-flip fallback ---
     if args.add_outward > 0 and frames:

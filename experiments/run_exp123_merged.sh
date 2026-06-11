@@ -102,10 +102,10 @@ for scene in $SCENES; do
 
     # Inv 5b: tile_strict 8³ screen_area → oracle_loo ml  [prereq-gated]
     _oracle="$ORACLE_DIR/$scene/oracle_dq.npz"
-    _mlpkl="$ML_DIR/$scene/lgbm.pkl"
+    _mlpkl="$ML_DIR/$scene/rf.pkl"
     if [ -f "$_oracle" ] && [ -f "$_mlpkl" ]; then
         run_inv "$scene" strict_8_sa_b tile_strict "8 8 8" screen_area "oracle_loo ml" \
-            "--oracle-npz $_oracle --ml-model-dir $ML_DIR/$scene"
+            "--oracle-npz $_oracle --ml-model-dir $ML_DIR/$scene --ml-model-type rf"
     else
         echo "[SKIP] $scene/strict_8_sa_b: prereqs missing"
         [ -f "$_oracle" ] || echo "       missing: $_oracle"

@@ -301,7 +301,7 @@ def main() -> None:
         with torch.no_grad():
             for i, (c_global, cam) in enumerate(zip(camera_indices, cameras)):
                 img = _render_current(g, cam, args.white_bg)
-                full_renders.append(img)  # GPU float32
+                full_renders.append(img.half().cpu())  # keep off GPU; ~4 GB saved on large scenes
                 png_path = full_dir / f"camera_{c_global:03d}.png"
                 if not png_path.exists():
                     torchvision.utils.save_image(img, str(png_path))
@@ -310,12 +310,15 @@ def main() -> None:
                     if not pt_path.exists():
                         torch.save(img.half().cpu(), str(pt_path))
     logger.success("R_full rendered: {} frames", n_cams)
+    torch.cuda.empty_cache()
 
     # --- determinism self-test: render full scene twice, expect MSE ≈ 0 ----
     with _timed("determinism_check", timings):
         with torch.no_grad():
             img_check = _render_current(g, cameras[0], args.white_bg)
-        det_mse = F.mse_loss(img_check, full_renders[0]).item()
+            img_check2 = _render_current(g, cameras[0], args.white_bg)
+        det_mse = F.mse_loss(img_check, img_check2).item()
+        del img_check2
         if det_mse > 1e-10:
             logger.error(
                 "Rasterizer not deterministic: MSE(R_full, R_full)={:.3e}. "
@@ -388,7 +391,7 @@ def main() -> None:
                     if args.skip_existing and np.isfinite(mse_mat[ci, k]):
                         continue
                     img = _render_current(g, cam, args.white_bg)
-                    ref = full_renders[ci]
+                    ref = full_renders[ci].to(img.device, dtype=img.dtype)
                     mse_v, psnr_v = _mse_psnr(img, ref)
                     ssim_v = _ssim_val(img, ref)
                     mse_mat[ci, k] = mse_v
@@ -408,7 +411,8 @@ def main() -> None:
                         if args.skip_existing and np.isfinite(mse_aoi_mat[ci, k]):
                             continue
                         img = _render_current(g, cam, args.white_bg)
-                        mse_aoi_mat[ci, k], _ = _mse_psnr(img, full_renders[ci])
+                        ref = full_renders[ci].to(img.device, dtype=img.dtype)
+                        mse_aoi_mat[ci, k], _ = _mse_psnr(img, ref)
 
         if (ti + 1) % max(args.flush_every, 1) == 0:
             with _timed("flush_partial", timings, tiles_done=ti + 1):

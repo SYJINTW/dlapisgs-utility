@@ -50,7 +50,11 @@ for scene in $SCENES; do
     echo "--- [$scene] training RF (AC) ---  ($(date +%H:%M:%S))"
     mkdir -p "$out_dir"
 
-    conda run -n gsquic python "$UTIL/ml/train.py" \
+    # Train in the SELECTION env (gaussian_splatting, sklearn 1.0.2) so the
+    # pickled RF is loadable at selection time. Training in gsquic (sklearn 1.6)
+    # yields models the py3.7 selection env cannot unpickle (tree-node dtype
+    # gained `missing_go_to_left` in sklearn >=1.3).
+    conda run -n gaussian_splatting python "$UTIL/ml/train.py" \
         --oracle-npz "$oracle_npz" \
         --output-dir "$out_dir" \
         --ablations AC \
@@ -59,6 +63,7 @@ for scene in $SCENES; do
         > "$log" 2>&1
 
     ln -sf "AC/rf.pkl" "$flat_pkl"
+    ln -sf "AC/feature_names.json" "$out_dir/feature_names.json"  # predict.py needs both flat
     echo "[$scene] done -> $flat_pkl"
 done
 

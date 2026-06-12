@@ -221,7 +221,8 @@ def _bar_plot(agg: dict, order: list[str], labels: dict[str, str],
     ax.set_xticks(x)
     ax.set_xticklabels([str(b) for b in all_budgets], fontsize=10)
     pct_labels = bool(all_budgets) and isinstance(all_budgets[0], str)
-    ax.set_xlabel("Budget (% of full scene)" if pct_labels else "Budget (MiB)", fontsize=12)
+    _pct = r"\%" if plt.rcParams.get("text.usetex") else "%"
+    ax.set_xlabel(f"Budget ({_pct} of full scene)" if pct_labels else "Budget (MiB)", fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_title(title, fontsize=13)
     ax.grid(axis="y", alpha=0.25)
@@ -279,7 +280,8 @@ def _grid_plot(scenes_agg: dict[str, dict], order: list[str], labels: dict[str, 
         ax.set_xticks(x_pos)
         ax.set_xticklabels([str(b) for b in x_labels], fontsize=8, rotation=30, ha="right")
         ax.set_title(scene, fontsize=11)
-        ax.set_xlabel("Budget %", fontsize=10)
+        _pct = r"\%" if plt.rcParams.get("text.usetex") else "%"
+        ax.set_xlabel(f"Budget {_pct}", fontsize=10)
         if idx % ncols == 0:
             ax.set_ylabel(ylabel, fontsize=11)
         ax.set_ylim(*ylim)

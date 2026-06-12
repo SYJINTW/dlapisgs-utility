@@ -9,6 +9,8 @@ __pycache__/
 output/
 logs/
 plotting/paper/
+plotting/.tmp
+
 
 ml/models
 ml/models_clean

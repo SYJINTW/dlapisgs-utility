@@ -59,6 +59,10 @@ run_inv() {
 
     if [ ! -f "$ply" ];   then echo "[SKIP] $scene/$inv_tag: PLY not found: $ply";   return; fi
     if [ ! -f "$trace" ]; then echo "[SKIP] $scene/$inv_tag: trace not found: $trace"; return; fi
+    # Idempotent rerun: with SKIP_EXISTING=1, skip invocations already producing metrics.
+    if [ "${SKIP_EXISTING:-0}" = "1" ] && [ -f "$out/metrics/summary.csv" ]; then
+        echo "[SKIP-EXIST] $scene/$inv_tag: summary.csv present"; return
+    fi
 
     echo "[RUN ] $scene / $inv_tag  packing=$packing grid=$grid_str weight=$weight schemes=[$schemes]"
     # shellcheck disable=SC2086

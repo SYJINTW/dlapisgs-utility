@@ -39,7 +39,8 @@ SCENES="${*:-$ALL_SCENES}"
 
 BUDGETS="10 25 40 55 70 85 99 100"
 COMMON_ARGS="--num-lod 1 --camera-index -1 --img-w 1600 --img-h 1600
-             --w-mode mean --w-norm sum --c-norm sum"
+             --w-mode mean --w-norm sum --c-norm sum
+             --save-rep-only --png-workers 8"
 
 mkdir -p "$CACHE_DIR" "$LOG_DIR"
 

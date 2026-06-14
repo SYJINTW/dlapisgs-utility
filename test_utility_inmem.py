@@ -232,7 +232,9 @@ def _greedy_order_progressive(visibility_tile, tile_index_offsets, tile_flat_ind
     ordered = torch.cat([visible_sorted, invisible_sorted[:remaining]])
     return ordered.detach().cpu().numpy().astype(np.int64, copy=False)
 
-
+# [TODO] wrong implementation. 
+# the idea was sorting by marginal utility per tile, 
+# but this is sorting by total utility per tile, which is not the same.
 def _greedy_order_tile_strict(order_pairs, tile_index_offsets, tile_flat_indices, w_gi):
     chunks = []
     cum_counts = []
@@ -542,7 +544,9 @@ def _rerender_rep_views(
         tile_index_offsets, tile_flat_indices, min_corners_t, max_corners_t, tile_centers,
         opacity, scale_0, scale_1, scale_2, rot_0, rot_1, rot_2, rot_3, gs_xyz_t,
         bytes_per_gaussian, max_budget_bytes, budget_list, budget_bytes_list,
-        oracle_data, base_output_path, device, args) -> None:
+        oracle_data, base_output_path, device, args,
+        ml_model=None, ml_static_feats=None, ml_feature_names=None,
+        ml_include_b=False) -> None:
     """Re-render and save PNGs for worst/median/best (camera, budget, scheme) combos."""
     import collections as _col
     _mb_to_bytes = dict(zip(budget_list, budget_bytes_list))
@@ -575,12 +579,55 @@ def _rerender_rep_views(
         else:
             C_k = N_k
 
+        # ML camera features (only when an ml rep is needed for this camera)
+        ml_group_a = ml_group_b = None
+        if "ml" in needed_schemes:
+            import math as _math
+            np_visibility_all = (visibility.cpu().numpy()
+                                 if hasattr(visibility, "cpu") else np.asarray(visibility))
+            np_distances = (distances.cpu().numpy()
+                            if hasattr(distances, "cpu") else np.asarray(distances))
+            cam_w2v = sel_cam.world_view_transform.cpu().numpy()
+            cam_center_np = sel_cam.camera_center.cpu().numpy()
+            tile_centers_np = tile_centers.cpu().numpy()
+            _index_offsets = (tile_index_offsets.cpu().numpy()
+                              if hasattr(tile_index_offsets, "cpu") else np.asarray(tile_index_offsets))
+            _n_gs_per_tile = (_index_offsets[1:] - _index_offsets[:-1]).astype(np.float32)
+            ml_group_a = ml_features.build_group_a(
+                cam_center_np, cam_w2v[:3, 2],
+                float(getattr(sel_cam, "FoVx", _math.pi / 2)),
+                float(getattr(sel_cam, "FoVy", _math.pi / 2)),
+                tile_centers_np, _n_gs_per_tile, np_distances, np_visibility_all,
+            )
+            if ml_include_b:
+                if any(r is None for r in (rot_0, rot_1, rot_2, rot_3)):
+                    raise RuntimeError("ml scheme with Group B requires rot_0..rot_3 in PLY")
+                ml_group_b = ml_features.build_group_b(
+                    tile_index_offsets, tile_flat_indices,
+                    min_corners_t, max_corners_t,
+                    gs_xyz_t, opacity, scale_0, scale_1, scale_2,
+                    rot_0, rot_1, rot_2, rot_3,
+                    sel_cam.camera_center.to(device),
+                    sel_cam.world_view_transform, sel_cam.projection_matrix,
+                    args.img_w, args.img_h,
+                    _n_gs_per_tile, device,
+                    fov_x=getattr(sel_cam, "FoVx", None),
+                    fov_y=getattr(sel_cam, "FoVy", None),
+                )
+
         for scheme in needed_schemes:
             if scheme.startswith("oracle_"):
                 n_tiles = len(tile_index_offsets) - 1
                 utilities = _oracle_utilities(scheme, oracle_data, camera_index, n_tiles)
             elif scheme == "ml":
-                continue  # ML rep-only not supported without model/features here
+                utilities = ml_predict.predict_utility(
+                    args.ml_model_dir, args.ml_model_type,
+                    static_features=ml_static_feats,
+                    group_a=ml_group_a,
+                    group_b=ml_group_b,
+                    feature_names=ml_feature_names,
+                    model=ml_model,
+                )
             else:
                 include_lod = scheme != "vd"
                 include_w = scheme in ("vd_lod_w", "vd_lod_w_c")
@@ -1248,7 +1295,9 @@ def main() -> None:
             tile_index_offsets, tile_flat_indices, min_corners_t, max_corners_t, tile_centers,
             opacity, scale_0, scale_1, scale_2, rot_0, rot_1, rot_2, rot_3, gs_xyz_t,
             bytes_per_gaussian, max_budget_bytes, budget_list, _budget_bytes_list,
-            oracle_data, base_output_path, device, args)
+            oracle_data, base_output_path, device, args,
+            ml_model=_ml_model, ml_static_feats=ml_static_feats,
+            ml_feature_names=ml_feature_names, ml_include_b=ml_include_b)
 
     # --- Representative views ---
     if all_metric_rows:

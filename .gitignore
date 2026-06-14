@@ -9,6 +9,7 @@ __pycache__/
 output/
 logs/
 plotting/paper/
+plotting/cam_traces
 plotting/.tmp
 
 

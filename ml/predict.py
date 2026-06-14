@@ -37,8 +37,7 @@ def predict_utility(
         feature_names:   Column names matching training order.
 
     Returns:
-        np.ndarray shape (N_tiles, 2), dtype int64: (tile_idx, lod=0) sorted
-        descending by predicted score. Matches calculate_utility_param output format.
+        np.ndarray shape (N_tiles,), dtype float64: raw predicted utility scores.
     """
     if model is None:
         model_dir = Path(model_dir)
@@ -77,10 +76,5 @@ def predict_utility(
 
     X = X_all[:, feat_idx].astype(np.float32)
 
-    # ── Predict and sort ───────────────────────────────────────────────────
-    scores = model.predict(X).astype(np.float64)
-
-    N_tiles = len(scores)
-    order = np.argsort(-scores, kind="stable")
-    pairs = np.column_stack([order, np.zeros(N_tiles, dtype=np.int64)])
-    return pairs.astype(np.int64)
+    # ── Predict ───────────────────────────────────────────────────────────
+    return model.predict(X).astype(np.float64)   # (N_tiles,) raw scores

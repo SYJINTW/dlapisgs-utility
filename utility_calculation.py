@@ -342,10 +342,13 @@ def calculate_utility_param(
     include_c=False,
     beta=10.0,
 ):
-    """Rank (tile, lod) pairs by U(k,l) = log(β·(l+1)) · (v_k/d_k) [·W_k] [·C_k].
+    """Compute raw per-tile utility scores U(k) = (v_k/d_k) [·W_k] [·C_k].
 
-    Returns ndarray shape (N*num_of_level, 2) of (tile_index, lod_level) sorted
-    by descending utility. With include_lod=False or num_of_level=1, all lod=0.
+    Returns ndarray shape (N_tiles,) of unsorted raw scores. Sorting and LOD
+    expansion are handled by _sort_tiles in test_utility_inmem.py.
+
+    Note: num_of_level, include_lod, beta are unused and will be removed in a
+    follow-up cleanup once callers are updated.
     """
     if include_w and weight_sum_tensor is None:
         raise ValueError("weight_sum_tensor required when include_w=True")
@@ -357,17 +360,7 @@ def calculate_utility_param(
         scores = scores * weight_sum_tensor
     if include_c:
         scores = scores * complexity_tensor
-
-    if not include_lod or num_of_level <= 1:
-        idx = torch.argsort(scores, descending=True)
-        return torch.stack((idx, torch.zeros_like(idx)), dim=1).cpu().numpy()
-
-    levels = torch.arange(num_of_level, device=scores.device, dtype=torch.float32)
-    log_weights = torch.log(beta * (levels + 1.0))          # (num_of_level,)
-    utility_matrix = scores.unsqueeze(1) * log_weights.unsqueeze(0)  # (N, num_of_level)
-
-    flat = torch.argsort(utility_matrix.view(-1), descending=True)
-    return torch.stack((flat // num_of_level, flat % num_of_level), dim=1).cpu().numpy()
+    return scores.cpu().numpy()
 
 
 def calculate_utility_baseline(visibility_mask_tensor, tile_distances_tensor):

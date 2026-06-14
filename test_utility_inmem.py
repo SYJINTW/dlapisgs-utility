@@ -287,28 +287,26 @@ def _select_at_budget(all_ordered, budget_bytes, bytes_per_gaussian, tile_cum_co
     return selected, len(selected) * bytes_per_gaussian
 
 
-def _oracle_utilities(scheme, oracle_data, camera_index, n_tiles):
+def _oracle_scores(scheme, oracle_data, camera_index, n_tiles):
+    """Return raw score array (N_tiles,) or None if camera not in oracle."""
     cam_idx_to_row = oracle_data["cam_idx_to_row"]
     if camera_index not in cam_idx_to_row:
         logger.warning("camera {} not in oracle NPZ; {} falls back to tile-index order",
                        camera_index, scheme)
-        tile_order = np.arange(n_tiles, dtype=np.int64)
-        return np.stack([tile_order, np.zeros(n_tiles, dtype=np.int64)], axis=1)
+        return None
 
     row = cam_idx_to_row[camera_index]
     mse_loo = oracle_data["mse_loo"][row]
 
     if scheme == "oracle_loo":
-        scores = np.where(np.isfinite(mse_loo), mse_loo, -np.inf)
-        tile_order = np.argsort(scores)[::-1].astype(np.int64)
+        return np.where(np.isfinite(mse_loo), mse_loo, -np.inf)
 
     elif scheme == "oracle_aoi":
         mse_aoi = oracle_data["mse_aoi"]
         if mse_aoi is None:
             raise ValueError("oracle_aoi requires mse_aoi in oracle NPZ")
         aoi_row = mse_aoi[row]
-        scores = np.where(np.isfinite(aoi_row), -aoi_row, -np.inf)
-        tile_order = np.argsort(scores)[::-1].astype(np.int64)
+        return np.where(np.isfinite(aoi_row), -aoi_row, -np.inf)
 
     else:  # oracle_combined
         mse_aoi = oracle_data["mse_aoi"]
@@ -329,9 +327,57 @@ def _oracle_utilities(scheme, oracle_data, camera_index, n_tiles):
         loo_rank = _rank_safe(mse_loo, ascending=False)
         aoi_rank = _rank_safe(aoi_row, ascending=True)
         combined = (loo_rank + aoi_rank) / 2.0
-        tile_order = np.argsort(combined).astype(np.int64)
+        return -combined  # negate: descending sort → ascending rank order
 
-    return np.stack([tile_order, np.zeros(n_tiles, dtype=np.int64)], axis=1)
+
+def _sort_tiles(raw_scores, n_gs_per_tile, bytes_per_gaussian, greedy_key,
+                num_of_level=1, beta=10.0):
+    """Sort (tile, lod) pairs by greedy_key. raw_scores=None → tile-index order.
+
+    Owns LOD expansion: when num_of_level > 1, applies log(β·(ℓ+1)) weighting
+    and returns (N*num_of_level, 2) pairs. For marginal+multi-LOD, per-tile bytes
+    are used (approximation; per-LOD counts can be threaded in later if needed).
+    """
+    if raw_scores is None:
+        n = len(n_gs_per_tile)
+        return np.stack([np.arange(n, dtype=np.int64), np.zeros(n, dtype=np.int64)], axis=1)
+
+    if greedy_key == "marginal":
+        tile_bytes = np.where(n_gs_per_tile > 0, n_gs_per_tile * bytes_per_gaussian, 1.0)
+        scores = raw_scores / tile_bytes
+    else:
+        scores = raw_scores
+
+    if num_of_level <= 1:
+        order = np.argsort(-scores, kind="stable").astype(np.int64)
+        return np.stack([order, np.zeros(len(order), dtype=np.int64)], axis=1)
+
+    levels = np.arange(num_of_level, dtype=np.float64)
+    log_weights = np.log(beta * (levels + 1.0))
+    utility_matrix = scores[:, None] * log_weights[None, :]   # (N, num_of_level)
+    flat = np.argsort(-utility_matrix.ravel(), kind="stable").astype(np.int64)
+    N = len(scores)
+    return np.stack([flat // num_of_level, flat % num_of_level], axis=1)
+
+
+def _compute_raw_scores(scheme, *, oracle_data, camera_index, n_tiles,
+                         visibility, distances, num_lod, W_k, C_k,
+                         ml_predict_kwargs=None):
+    """Return raw score array (N_tiles,) or None (oracle camera-missing fallback)."""
+    if scheme.startswith("oracle_"):
+        return _oracle_scores(scheme, oracle_data, camera_index, n_tiles)
+    elif scheme == "ml":
+        return ml_predict.predict_utility(**ml_predict_kwargs)
+    else:
+        include_lod = scheme != "vd"
+        include_w = scheme in ("vd_lod_w", "vd_lod_w_c")
+        include_c = scheme in ("vd_lod_c", "vd_lod_w_c")
+        return uc.calculate_utility_param(
+            visibility, distances, num_of_level=num_lod,
+            weight_sum_tensor=W_k if include_w else None,
+            complexity_tensor=C_k if include_c else None,
+            include_lod=include_lod, include_w=include_w, include_c=include_c,
+        )
 
 
 def _write_ply(gs, selected_indices, output_path, ascii_ply):
@@ -580,6 +626,9 @@ def _rerender_rep_views(
             C_k = N_k
 
         # ML camera features (only when an ml rep is needed for this camera)
+        _index_offsets = (tile_index_offsets.cpu().numpy()
+                          if hasattr(tile_index_offsets, "cpu") else np.asarray(tile_index_offsets))
+        _n_gs_per_tile = (_index_offsets[1:] - _index_offsets[:-1]).astype(np.float32)
         ml_group_a = ml_group_b = None
         if "ml" in needed_schemes:
             import math as _math
@@ -590,9 +639,6 @@ def _rerender_rep_views(
             cam_w2v = sel_cam.world_view_transform.cpu().numpy()
             cam_center_np = sel_cam.camera_center.cpu().numpy()
             tile_centers_np = tile_centers.cpu().numpy()
-            _index_offsets = (tile_index_offsets.cpu().numpy()
-                              if hasattr(tile_index_offsets, "cpu") else np.asarray(tile_index_offsets))
-            _n_gs_per_tile = (_index_offsets[1:] - _index_offsets[:-1]).astype(np.float32)
             ml_group_a = ml_features.build_group_a(
                 cam_center_np, cam_w2v[:3, 2],
                 float(getattr(sel_cam, "FoVx", _math.pi / 2)),
@@ -615,28 +661,22 @@ def _rerender_rep_views(
                     fov_y=getattr(sel_cam, "FoVy", None),
                 )
 
+        ml_predict_kwargs = dict(
+            model_dir=args.ml_model_dir, model_type=args.ml_model_type,
+            static_features=ml_static_feats, group_a=ml_group_a,
+            group_b=ml_group_b, feature_names=ml_feature_names, model=ml_model,
+        )
+
         for scheme in needed_schemes:
-            if scheme.startswith("oracle_"):
-                n_tiles = len(tile_index_offsets) - 1
-                utilities = _oracle_utilities(scheme, oracle_data, camera_index, n_tiles)
-            elif scheme == "ml":
-                utilities = ml_predict.predict_utility(
-                    args.ml_model_dir, args.ml_model_type,
-                    static_features=ml_static_feats,
-                    group_a=ml_group_a,
-                    group_b=ml_group_b,
-                    feature_names=ml_feature_names,
-                    model=ml_model,
-                )
-            else:
-                include_lod = scheme != "vd"
-                include_w = scheme in ("vd_lod_w", "vd_lod_w_c")
-                include_c = scheme in ("vd_lod_c", "vd_lod_w_c")
-                utilities = uc.calculate_utility_param(
-                    visibility, distances, num_of_level=args.num_lod,
-                    weight_sum_tensor=W_k if include_w else None,
-                    complexity_tensor=C_k if include_c else None,
-                    include_lod=include_lod, include_w=include_w, include_c=include_c)
+            n_tiles = len(tile_index_offsets) - 1
+            raw_scores = _compute_raw_scores(
+                scheme, oracle_data=oracle_data, camera_index=camera_index,
+                n_tiles=n_tiles, visibility=visibility, distances=distances,
+                num_lod=args.num_lod, W_k=W_k, C_k=C_k,
+                ml_predict_kwargs=ml_predict_kwargs,
+            )
+            utilities = _sort_tiles(raw_scores, _n_gs_per_tile, bytes_per_gaussian,
+                                    args.greedy_key, num_of_level=args.num_lod)
 
             all_ordered, tile_cum_counts = _build_greedy_order(
                 args.packing_mode, scheme, utilities, visibility,
@@ -690,6 +730,9 @@ def main() -> None:
                         choices=list(uc.COMPLEXITY_KINDS) + ["count"])
     parser.add_argument("--packing-mode", type=str, default="tile_partial",
                         choices=["tile_partial", "tile_strict", "progressive"])
+    parser.add_argument("--greedy-key", type=str, default="utility",
+                        choices=["utility", "marginal"],
+                        help="Sort key: 'utility' = raw score, 'marginal' = score / tile_bytes.")
     parser.add_argument("--weight-mode", type=str, default="screen_area",
                         choices=list(uc.WEIGHT_MODES))
     parser.add_argument("--tiling-cache", type=str, default=None)
@@ -1077,11 +1120,11 @@ def main() -> None:
                      projection_matrix=cam_proj)
 
         # ML camera features
+        _n_gs_per_tile = (index_offsets[1:] - index_offsets[:-1]).astype(np.float32)
         ml_group_a = ml_group_b = None
         if "ml" in scheme_list:
             with _timed("ml_camera_features", timings, camera=camera_index):
                 import math as _math
-                _n_gs_per_tile = (index_offsets[1:] - index_offsets[:-1]).astype(np.float32)
                 _cam_fwd = cam_w2v[:3, 2]
                 ml_group_a = ml_features.build_group_a(
                     cam_center_np, _cam_fwd,
@@ -1105,32 +1148,24 @@ def main() -> None:
                         fov_y=getattr(sel_cam, "FoVy", None),
                     )
 
+        ml_predict_kwargs = dict(
+            model_dir=args.ml_model_dir, model_type=args.ml_model_type,
+            static_features=ml_static_feats, group_a=ml_group_a,
+            group_b=ml_group_b, feature_names=ml_feature_names, model=_ml_model,
+        )
+
         # --- Per-scheme loop ---
         for scheme in tqdm(scheme_list, desc="schemes", leave=False):
             with _timed("utility", timings, camera=camera_index, scheme=scheme):
-                if scheme.startswith("oracle_"):
-                    n_tiles = len(index_offsets) - 1
-                    utilities = _oracle_utilities(scheme, oracle_data, camera_index, n_tiles)
-                elif scheme == "ml":
-                    utilities = ml_predict.predict_utility(
-                        args.ml_model_dir, args.ml_model_type,
-                        static_features=ml_static_feats,
-                        group_a=ml_group_a,
-                        group_b=ml_group_b,
-                        feature_names=ml_feature_names,
-                        model=_ml_model,
-                    )
-                else:
-                    include_lod = scheme != "vd"
-                    include_w = scheme in ("vd_lod_w", "vd_lod_w_c")
-                    include_c = scheme in ("vd_lod_c", "vd_lod_w_c")
-                    utilities = uc.calculate_utility_param(
-                        visibility, distances,
-                        num_of_level=args.num_lod,
-                        weight_sum_tensor=W_k if include_w else None,
-                        complexity_tensor=C_k if include_c else None,
-                        include_lod=include_lod, include_w=include_w, include_c=include_c,
-                    )
+                n_tiles = len(index_offsets) - 1
+                raw_scores = _compute_raw_scores(
+                    scheme, oracle_data=oracle_data, camera_index=camera_index,
+                    n_tiles=n_tiles, visibility=visibility, distances=distances,
+                    num_lod=args.num_lod, W_k=W_k, C_k=C_k,
+                    ml_predict_kwargs=ml_predict_kwargs,
+                )
+                utilities = _sort_tiles(raw_scores, _n_gs_per_tile, bytes_per_gaussian,
+                                        args.greedy_key, num_of_level=args.num_lod)
 
             with _timed("greedy", timings, camera=camera_index, scheme=scheme,
                         packing_mode=args.packing_mode):

@@ -44,10 +44,10 @@ COMMON_ARGS="--num-lod 1 --camera-index -1 --img-w 1600 --img-h 1600
 
 mkdir -p "$CACHE_DIR" "$LOG_DIR"
 
-# run_inv SCENE INV_TAG PACKING GRID_3 WEIGHT SCHEMES [EXTRA_ARGS...]
+# run_case SCENE CASE_TAG PACKING GRID_3 WEIGHT SCHEMES [EXTRA_ARGS...]
 # GRID_3: three numbers, e.g. "8 8 8"
-run_inv() {
-    local scene="$1" inv_tag="$2" packing="$3" weight="$5" schemes="$6"
+run_case() {
+    local scene="$1" case_tag="$2" packing="$3" weight="$5" schemes="$6"
     local grid="$4"
     local grid_str="${grid// /x}"
     local extra="${7:-}"
@@ -55,17 +55,17 @@ run_inv() {
     local ply="$EXP/$scene/point_cloud.ply"
     local trace="$EXP/$scene/sparse_views_eval.json"
     local cache="$CACHE_DIR/${scene}_${grid_str}.npz"
-    local out="$OUT_BASE/$scene/$inv_tag"
-    local log="$LOG_DIR/${scene}_${inv_tag}.log"
+    local out="$OUT_BASE/$scene/$case_tag"
+    local log="$LOG_DIR/${scene}_${case_tag}.log"
 
-    if [ ! -f "$ply" ];   then echo "[SKIP] $scene/$inv_tag: PLY not found: $ply";   return; fi
-    if [ ! -f "$trace" ]; then echo "[SKIP] $scene/$inv_tag: trace not found: $trace"; return; fi
+    if [ ! -f "$ply" ];   then echo "[SKIP] $scene/$case_tag: PLY not found: $ply";   return; fi
+    if [ ! -f "$trace" ]; then echo "[SKIP] $scene/$case_tag: trace not found: $trace"; return; fi
     # Idempotent rerun: with SKIP_EXISTING=1, skip invocations already producing metrics.
     if [ "${SKIP_EXISTING:-0}" = "1" ] && [ -f "$out/metrics/summary.csv" ]; then
-        echo "[SKIP-EXIST] $scene/$inv_tag: summary.csv present"; return
+        echo "[SKIP-EXIST] $scene/$case_tag: summary.csv present"; return
     fi
 
-    echo "[RUN ] $scene / $inv_tag  packing=$packing grid=$grid_str weight=$weight schemes=[$schemes]"
+    echo "[RUN ] $scene / $case_tag  packing=$packing grid=$grid_str weight=$weight schemes=[$schemes]"
     # shellcheck disable=SC2086
     LAPISGS_DUMMY_IMAGE="$DUMMY_IMAGE" \
     conda run -n "$CONDA_ENV" python "$SCRIPT" \
@@ -82,7 +82,7 @@ run_inv() {
         $COMMON_ARGS \
         $extra \
         > "$log" 2>&1
-    echo "[DONE] $scene / $inv_tag  -> $log"
+    echo "[DONE] $scene / $case_tag  -> $log"
 }
 
 for scene in $SCENES; do
@@ -90,35 +90,35 @@ for scene in $SCENES; do
     echo "Scene: $scene   ($(date +%H:%M:%S))"
     echo "=============================="
 
-    # Inv 1: progressive 8³ screen_area → vd_lod  [exp1(screen_area) + exp3(progressive)]
-    run_inv "$scene" prog_8_sa     progressive "8 8 8" screen_area    "vd_lod"
+    # GS-progressive, frustum-culled, screen_area weight [exp1 + exp3 culled baseline]
+    run_case "$scene" gsprog_culled     progressive "8 8 8" screen_area    "vd_lod"
 
-    # Inv 2: progressive 8³ volume_over_d2 → vd_lod  [exp1]
-    run_inv "$scene" prog_8_vod2   progressive "8 8 8" volume_over_d2 "vd_lod"
+    # GS-progressive, volume/d² weight [exp1 weight ablation]
+    run_case "$scene" gsprog_vol_over_d2   progressive "8 8 8" volume_over_d2 "vd_lod"
 
-    # Inv 3: progressive 8³ volume → vd_lod  [exp1]
-    run_inv "$scene" prog_8_vol    progressive "8 8 8" volume         "vd_lod"
+    # GS-progressive, volume weight [exp1 weight ablation]
+    run_case "$scene" gsprog_volume    progressive "8 8 8" volume         "vd_lod"
 
-    # Inv 4: progressive 8³ random → vd_lod  [exp1 random baseline]
-    run_inv "$scene" prog_8_rand   progressive "8 8 8" random         "vd_lod"
+    # GS-progressive, random weight [exp1 control]
+    run_case "$scene" gsprog_random   progressive "8 8 8" random         "vd_lod"
 
-    # Inv 5a: tile_strict 8³ screen_area → vd_lod vd_lod_w  [exp2 + exp3(tile_strict)]
-    run_inv "$scene" strict_8_sa_a tile_strict "8 8 8" screen_area    "vd_lod vd_lod_w"
+    # Tiled, whole-tile packing → baseline + heuristic schemes [exp2 + exp3]
+    run_case "$scene" tiled_whole_baseline_heuristic tile_strict "8 8 8" screen_area    "vd_lod vd_lod_w"
 
-    # Inv 5b: tile_strict 8³ screen_area → oracle_loo ml  [prereq-gated]
+    # Tiled, whole-tile packing → oracle + ml schemes [prereq-gated]
     _oracle="$ORACLE_DIR/$scene/oracle_dq.npz"
     _mlpkl="$ML_DIR/$scene/rf.pkl"
     if [ -f "$_oracle" ] && [ -f "$_mlpkl" ]; then
-        run_inv "$scene" strict_8_sa_b tile_strict "8 8 8" screen_area "oracle_loo ml" \
+        run_case "$scene" tiled_whole_oracle_ml tile_strict "8 8 8" screen_area "oracle_loo ml" \
             "--oracle-npz $_oracle --ml-model-dir $ML_DIR/$scene --ml-model-type rf"
     else
-        echo "[SKIP] $scene/strict_8_sa_b: prereqs missing"
+        echo "[SKIP] $scene/tiled_whole_oracle_ml: prereqs missing"
         [ -f "$_oracle" ] || echo "       missing: $_oracle"
         [ -f "$_mlpkl"  ] || echo "       missing: $_mlpkl"
     fi
 
-    # Inv 6: progressive 1³ screen_area → vd_lod  [exp3 nocull baseline]
-    run_inv "$scene" prog_1_sa     progressive "1 1 1" screen_area    "vd_lod"
+    # GS-progressive, no culling (1³ grid), screen_area weight [exp3 no-cull baseline]
+    run_case "$scene" gsprog_nocull     progressive "1 1 1" screen_area    "vd_lod"
 
     echo ""
 done

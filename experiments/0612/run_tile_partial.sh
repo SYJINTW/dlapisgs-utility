@@ -2,11 +2,11 @@
 # tile_partial sweep — re-adds the packing mode dropped earlier (the
 # "tile_partial ~= tile_strict" finding was wrong; tile_partial partial-fills
 # tiles so it avoids the giant-tile budget-starvation that sinks tile_strict at
-# low budget). Produces partial_8_sa_{a,b} alongside the existing strict_8_sa_{a,b}
+# low budget). Produces tiled_partial_* dirs alongside the existing tiled_whole_* dirs
 # in the same OUT_BASE so exp2/exp3 can plot all packing modes together.
 #
-# exp2: tile_strict 4-scheme (unchanged, already on disk)
-# exp3: prog_cull + prog_no_cull + tile_strict + tile_partial
+# exp2: whole-tile, 4 schemes (unchanged, already on disk)
+# exp3: GS-progressive (culled/no-cull) + tiled (whole/partial)
 #
 # Env knobs (same defaults as run_exp123_merged.sh):
 #   GPU, OUT_BASE, CACHE_DIR, ORACLE_DIR, ML_DIR, LOG_DIR, SKIP_EXISTING
@@ -39,9 +39,9 @@ COMMON_ARGS="--num-lod 1 --camera-index -1 --img-w 1600 --img-h 1600
 
 mkdir -p "$CACHE_DIR" "$LOG_DIR"
 
-# run_inv SCENE INV_TAG PACKING GRID_3 WEIGHT SCHEMES [EXTRA_ARGS]
-run_inv() {
-    local scene="$1" inv_tag="$2" packing="$3" weight="$5" schemes="$6"
+# run_case SCENE CASE_TAG PACKING GRID_3 WEIGHT SCHEMES [EXTRA_ARGS]
+run_case() {
+    local scene="$1" case_tag="$2" packing="$3" weight="$5" schemes="$6"
     local grid="$4"
     local grid_str="${grid// /x}"
     local extra="${7:-}"
@@ -49,16 +49,16 @@ run_inv() {
     local ply="$EXP/$scene/point_cloud.ply"
     local trace="$EXP/$scene/sparse_views_eval.json"
     local cache="$CACHE_DIR/${scene}_${grid_str}.npz"
-    local out="$OUT_BASE/$scene/$inv_tag"
-    local log="$LOG_DIR/${scene}_${inv_tag}.log"
+    local out="$OUT_BASE/$scene/$case_tag"
+    local log="$LOG_DIR/${scene}_${case_tag}.log"
 
-    if [ ! -f "$ply" ];   then echo "[SKIP] $scene/$inv_tag: PLY not found: $ply";   return; fi
-    if [ ! -f "$trace" ]; then echo "[SKIP] $scene/$inv_tag: trace not found: $trace"; return; fi
+    if [ ! -f "$ply" ];   then echo "[SKIP] $scene/$case_tag: PLY not found: $ply";   return; fi
+    if [ ! -f "$trace" ]; then echo "[SKIP] $scene/$case_tag: trace not found: $trace"; return; fi
     if [ "${SKIP_EXISTING:-0}" = "1" ] && [ -f "$out/metrics/summary.csv" ]; then
-        echo "[SKIP-EXIST] $scene/$inv_tag: summary.csv present"; return
+        echo "[SKIP-EXIST] $scene/$case_tag: summary.csv present"; return
     fi
 
-    echo "[RUN ] $scene / $inv_tag  packing=$packing grid=$grid_str weight=$weight schemes=[$schemes]"
+    echo "[RUN ] $scene / $case_tag  packing=$packing grid=$grid_str weight=$weight schemes=[$schemes]"
     # shellcheck disable=SC2086
     LAPISGS_DUMMY_IMAGE="$DUMMY_IMAGE" \
     conda run -n "$CONDA_ENV" python "$SCRIPT" \
@@ -75,7 +75,7 @@ run_inv() {
         $COMMON_ARGS \
         $extra \
         > "$log" 2>&1
-    echo "[DONE] $scene / $inv_tag  -> $log"
+    echo "[DONE] $scene / $case_tag  -> $log"
 }
 
 for scene in $SCENES; do
@@ -84,16 +84,16 @@ for scene in $SCENES; do
     echo "=============================="
 
     # tile_partial 8³ screen_area → vd_lod vd_lod_w
-    run_inv "$scene" partial_8_sa_a tile_partial "8 8 8" screen_area "vd_lod vd_lod_w"
+    run_case "$scene" tiled_partial_baseline_heuristic tile_partial "8 8 8" screen_area "vd_lod vd_lod_w"
 
     # tile_partial 8³ screen_area → oracle_loo ml  [prereq-gated]
     _oracle="$ORACLE_DIR/$scene/oracle_dq.npz"
     _mlpkl="$ML_DIR/$scene/rf.pkl"
     if [ -f "$_oracle" ] && [ -f "$_mlpkl" ]; then
-        run_inv "$scene" partial_8_sa_b tile_partial "8 8 8" screen_area "oracle_loo ml" \
+        run_case "$scene" tiled_partial_oracle_ml tile_partial "8 8 8" screen_area "oracle_loo ml" \
             "--oracle-npz $_oracle --ml-model-dir $ML_DIR/$scene --ml-model-type rf"
     else
-        echo "[SKIP] $scene/partial_8_sa_b: prereqs missing"
+        echo "[SKIP] $scene/tiled_partial_oracle_ml: prereqs missing"
         [ -f "$_oracle" ] || echo "       missing: $_oracle"
         [ -f "$_mlpkl"  ] || echo "       missing: $_mlpkl"
     fi
@@ -102,4 +102,4 @@ for scene in $SCENES; do
 done
 
 echo "All scenes complete. ($(date +%H:%M:%S))"
-echo "Outputs: $OUT_BASE/*/partial_8_sa_{a,b}"
+echo "Outputs: $OUT_BASE/*/tiled_partial_{baseline_heuristic,oracle_ml}"

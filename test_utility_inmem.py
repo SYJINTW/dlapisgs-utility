@@ -298,36 +298,42 @@ def _oracle_scores(scheme, oracle_data, camera_index, n_tiles):
     row = cam_idx_to_row[camera_index]
     mse_loo = oracle_data["mse_loo"][row]
 
+    # All branches return a POSITIVE, LINEAR per-tile importance I_k (invisible/
+    # non-finite tiles get -inf so they sort last). This lets _sort_tiles divide by
+    # byte cost for the per-byte ("marginal") sort without sign/scale corruption.
     if scheme == "oracle_loo":
+        # I_k = MSE rise when tile k is dropped (already a positive ΔMSE).
         return np.where(np.isfinite(mse_loo), mse_loo, -np.inf)
 
     elif scheme == "oracle_aoi":
         mse_aoi = oracle_data["mse_aoi"]
-        if mse_aoi is None:
-            raise ValueError("oracle_aoi requires mse_aoi in oracle NPZ")
+        mse_blank = oracle_data.get("mse_blank")
+        if mse_aoi is None or mse_blank is None:
+            raise ValueError("oracle_aoi requires mse_aoi and mse_blank in oracle NPZ")
         aoi_row = mse_aoi[row]
-        return np.where(np.isfinite(aoi_row), -aoi_row, -np.inf)
+        blank_c = float(mse_blank[row])
+        # I_k = MSE this tile removes from a blank image (add-one-in ΔMSE).
+        # Clamp at 0: a tile alone worse than blank contributes no value.
+        imp = np.maximum(blank_c - aoi_row, 0.0)
+        return np.where(np.isfinite(aoi_row), imp, -np.inf)
 
     else:  # oracle_combined
         mse_aoi = oracle_data["mse_aoi"]
-        if mse_aoi is None:
-            raise ValueError("oracle_combined requires mse_aoi in oracle NPZ")
+        mse_blank = oracle_data.get("mse_blank")
+        if mse_aoi is None or mse_blank is None:
+            raise ValueError("oracle_combined requires mse_aoi and mse_blank in oracle NPZ")
         aoi_row = mse_aoi[row]
-
-        def _rank_safe(arr, ascending=False):
-            finite = np.isfinite(arr)
-            ranks = np.zeros(len(arr), dtype=np.float64)
-            sub = arr[finite]
-            order = np.argsort(sub) if ascending else np.argsort(sub)[::-1]
-            dense = np.empty(len(sub), dtype=np.float64)
-            dense[order] = np.arange(1, len(sub) + 1, dtype=np.float64)
-            ranks[finite] = dense
-            return ranks
-
-        loo_rank = _rank_safe(mse_loo, ascending=False)
-        aoi_rank = _rank_safe(aoi_row, ascending=True)
-        combined = (loo_rank + aoi_rank) / 2.0
-        return -combined  # negate: descending sort → ascending rank order
+        blank_c = float(mse_blank[row])
+        finite = np.isfinite(mse_loo) & np.isfinite(aoi_row)
+        # Combine the two LINEAR importances (not their rankings): each L1-normalized
+        # per camera so loo and aoi contribute on a common scale, then summed.
+        I_loo = np.where(finite, np.maximum(mse_loo, 0.0), 0.0)
+        I_aoi = np.where(finite, np.maximum(blank_c - aoi_row, 0.0), 0.0)
+        s_loo, s_aoi = I_loo.sum(), I_aoi.sum()
+        I_loo_n = I_loo / s_loo if s_loo > 0 else I_loo
+        I_aoi_n = I_aoi / s_aoi if s_aoi > 0 else I_aoi
+        combined = I_loo_n + I_aoi_n
+        return np.where(finite, combined, -np.inf)
 
 
 def _sort_tiles(raw_scores, n_gs_per_tile, bytes_per_gaussian, greedy_key,
@@ -367,7 +373,9 @@ def _compute_raw_scores(scheme, *, oracle_data, camera_index, n_tiles,
     if scheme.startswith("oracle_"):
         return _oracle_scores(scheme, oracle_data, camera_index, n_tiles)
     elif scheme == "ml":
-        return ml_predict.predict_utility(**ml_predict_kwargs)
+        # Model predicts log(mse_loo); exp() recovers the positive linear ΔMSE so the
+        # per-byte sort divides a real importance. exp is monotonic → plain sort unchanged.
+        return np.exp(ml_predict.predict_utility(**ml_predict_kwargs))
     else:
         include_lod = scheme != "vd"
         include_w = scheme in ("vd_lod_w", "vd_lod_w_c")
@@ -1012,9 +1020,11 @@ def main() -> None:
         _od = np.load(args.oracle_npz, allow_pickle=False)
         _cam_ids = _od["camera_indices"].astype(np.int32)
         _mse_aoi = _od["mse_aoi"] if "mse_aoi" in _od else None
+        _mse_blank = _od["mse_blank"] if "mse_blank" in _od else None
         oracle_data = {
             "mse_loo": _od["mse"].astype(np.float64),
             "mse_aoi": _mse_aoi.astype(np.float64) if _mse_aoi is not None else None,
+            "mse_blank": _mse_blank.astype(np.float64) if _mse_blank is not None else None,
             "cam_idx_to_row": {int(c): i for i, c in enumerate(_cam_ids)},
         }
         n_oracle_tiles = oracle_data["mse_loo"].shape[1]

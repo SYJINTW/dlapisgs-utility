@@ -459,6 +459,8 @@ def _collect_rep_keys(summary_rows: list, group_by: str) -> set:
         if r.get("psnr") in (None, ""):
             continue
         group_val = r.get(group_by, r.get("scheme", ""))
+        if isinstance(group_val, list):
+            group_val = tuple(group_val)
         key = (r.get("scene", ""), group_val, float(r["budget_mb"]))
         by_cell.setdefault(key, []).append(r)
     keys: set = set()
@@ -495,6 +497,8 @@ def _pick_representative_views(output_root: Path, summary_rows: list, group_by: 
         if r.get("psnr") in (None, ""):
             continue
         group_val = r.get(group_by, r.get("scheme", ""))
+        if isinstance(group_val, list):
+            group_val = tuple(group_val)
         key = (r.get("scene", ""), group_val, float(r["budget_mb"]))
         by_cell.setdefault(key, []).append(r)
 
@@ -746,7 +750,7 @@ def main() -> None:
     parser.add_argument("--tiling-cache", type=str, default=None)
 
     parser.add_argument("--ml-model-dir", type=str, default=None)
-    parser.add_argument("--ml-model-type", type=str, default="lgbm",
+    parser.add_argument("--ml-model-type", type=str, default="rf",
                         choices=["lgbm", "xgb", "rf"])
     parser.add_argument("--oracle-npz", type=str, default=None)
 

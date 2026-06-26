@@ -752,6 +752,10 @@ def main() -> None:
     parser.add_argument("--ml-model-dir", type=str, default=None)
     parser.add_argument("--ml-model-type", type=str, default="rf",
                         choices=["lgbm", "xgb", "rf"])
+    parser.add_argument("--ml-feature-cache", type=str, default="auto",
+                        choices=["auto", "off"],
+                        help="auto: use {ml-model-dir}/feature_cache.npz if present "
+                             "& tiling matches; off: always rebuild static feats from PLY")
     parser.add_argument("--oracle-npz", type=str, default=None)
 
     # --- Renderer args ---
@@ -1000,10 +1004,21 @@ def main() -> None:
         _ml_model_path = Path(args.ml_model_dir)
         ml_feature_names = json.loads((_ml_model_path / "feature_names.json").read_text())
         ml_include_b = any(n in set(ml_features.GROUP_B_NAMES) for n in ml_feature_names)
+        _cache_path = _ml_model_path / "feature_cache.npz"
         with _timed("ml_static_features", timings):
-            ml_static_feats = ml_features.build_static_features(
-                sel_gs.data, index_offsets, flat_indices
-            )
+            ml_static_feats = None
+            if args.ml_feature_cache == "auto" and _cache_path.exists():
+                try:
+                    ml_static_feats = ml_features.load_feature_cache(
+                        _cache_path, index_offsets)
+                    print(f"[ml] loaded static feature cache: {_cache_path}", flush=True)
+                except ValueError as e:
+                    print(f"[ml] feature_cache unusable ({e}) — rebuilding from PLY",
+                          flush=True)
+            if ml_static_feats is None:
+                ml_static_feats = ml_features.build_static_features(
+                    sel_gs.data, index_offsets, flat_indices
+                )
 
     # --- Camera index list ---
     if args.camera_indices is not None:

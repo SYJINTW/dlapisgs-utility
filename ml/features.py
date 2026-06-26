@@ -15,6 +15,7 @@ Training entry point:
     df, names = build_feature_matrix(oracle_npz_path)
 """
 
+import hashlib
 import json
 import math
 import sys
@@ -182,6 +183,68 @@ def build_static_features(gs_data: dict, index_offsets: np.ndarray,
             group_d[t, j * 4 + 3] = float(col.max())
 
     return np.hstack([group_c, group_d])  # (N_tiles, 134)
+
+
+# ─── static feature cache (Group C+D, shipped with the model) ─────────────────
+#
+# The (N_tiles, 134) static block is camera-invariant — same for every frame of a
+# scene. Caching it as a model artifact means a deployed selector never touches the
+# PLY at inference: per frame = Group A (camera scalars) + model.predict + greedy.
+# Tiling-match is validated by N_tiles + a checksum of index_offsets (the tiling is
+# deterministic from PLY+grid, so a matching checksum == identical tile ordering).
+
+CACHE_FEATURE_NAMES: list = GROUP_C_NAMES + GROUP_D_NAMES  # 134
+
+
+def _index_offsets_sha(index_offsets: np.ndarray) -> str:
+    arr = np.ascontiguousarray(index_offsets, dtype=np.int64)
+    return hashlib.sha1(arr.tobytes()).hexdigest()
+
+
+def save_feature_cache(path, static_feats: np.ndarray,
+                       index_offsets: np.ndarray) -> None:
+    """Write the (N_tiles, 134) static block + tiling fingerprint to path."""
+    np.savez(
+        str(path),
+        static=static_feats.astype(np.float32),
+        feature_names=np.array(CACHE_FEATURE_NAMES),
+        n_tiles=np.int64(static_feats.shape[0]),
+        index_offsets_sha=_index_offsets_sha(index_offsets),
+    )
+
+
+def load_feature_cache(path, index_offsets: np.ndarray) -> np.ndarray:
+    """Load a static cache, validating it matches the active tiling.
+
+    Raises ValueError on tiling mismatch (caller falls back to a live build).
+    Returns float32 (N_tiles, 134).
+    """
+    z = np.load(str(path), allow_pickle=True)
+    n_expected = len(index_offsets) - 1
+    n_cached = int(z["n_tiles"])
+    if n_cached != n_expected:
+        raise ValueError(
+            f"feature_cache n_tiles={n_cached} != active tiling {n_expected}")
+    sha_cached = str(z["index_offsets_sha"])
+    sha_active = _index_offsets_sha(index_offsets)
+    if sha_cached != sha_active:
+        raise ValueError("feature_cache tiling checksum mismatch")
+    return z["static"].astype(np.float32)
+
+
+def static_cache_from_oracle(oracle_npz_path):
+    """Build the (N_tiles, 134) static block from an oracle_dq.npz.
+
+    Identical to the selection-time path: same build_static_features call on the
+    same PLY + tiling. Returns (static_feats, index_offsets).
+    """
+    npz = np.load(str(oracle_npz_path), allow_pickle=True)
+    meta = json.loads(str(npz["gen_meta"].item()))
+    index_offsets = npz["index_offsets"]
+    flat_indices = npz["flat_indices"]
+    gs = io_3dgs.GaussianModelV2(meta["scene_ply"])
+    static_feats = build_static_features(gs.data, index_offsets, flat_indices)
+    return static_feats, index_offsets
 
 
 # ─── view-dependent features (Groups A + B) ───────────────────────────────────

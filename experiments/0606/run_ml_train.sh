@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ML model training — RF + AC ablation (best per 0527_ML_SPEC.md).
+# ML model training — RF + AC ablation (best per concluded_experiments.md).
 # Skips scenes where oracle_dq.npz not yet available.
 # Skips scenes where rf.pkl already exists (safe to rerun).
 #

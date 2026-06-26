@@ -30,7 +30,8 @@ from sklearn.model_selection import KFold
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
-from ml.features import build_feature_matrix, feature_names_for_ablation, ABLATION_NAMES  # noqa: E402
+from ml.features import (build_feature_matrix, feature_names_for_ablation,  # noqa: E402
+                         ABLATION_NAMES, static_cache_from_oracle, save_feature_cache)
 
 try:
     import xgboost as xgb
@@ -321,6 +322,11 @@ def train_scene(oracle_npz_path: str, output_dir: str, seed: int = 0,
     models_to_run = set(models) if models is not None else set(_ALL_MODELS)
     names_to_train = ablations if ablations is not None else list(ABLATION_NAMES)
 
+    # Static feature cache (Group C+D) — camera-invariant, shipped with the model so
+    # selection never rebuilds it from the PLY. Computed once; written into each
+    # ablation dir (where selection's --ml-model-dir points).
+    static_feats, cache_index_offsets = static_cache_from_oracle(oracle_npz_path)
+
     for ablation in names_to_train:
         feat_cols = feature_names_for_ablation(ablation)
         ablation_dir = out_root / ablation
@@ -422,7 +428,9 @@ def train_scene(oracle_npz_path: str, output_dir: str, seed: int = 0,
 
         (ablation_dir / "feature_names.json").write_text(json.dumps(feat_cols, indent=2))
         (ablation_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
-        print(f"  Saved to {ablation_dir}/", flush=True)
+        save_feature_cache(ablation_dir / "feature_cache.npz",
+                           static_feats, cache_index_offsets)
+        print(f"  Saved to {ablation_dir}/ (+ feature_cache.npz)", flush=True)
 
     print(f"\nDone: {out_root}", flush=True)
 

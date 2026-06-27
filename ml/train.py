@@ -31,7 +31,8 @@ HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
 from ml.features import (build_feature_matrix, feature_names_for_ablation,  # noqa: E402
-                         ABLATION_NAMES, static_cache_from_oracle, save_feature_cache)
+                         ABLATION_NAMES, static_cache_from_oracle, save_feature_cache,
+                         GROUP_B_NAMES, GROUP_F_NAMES)
 
 try:
     import xgboost as xgb
@@ -311,16 +312,24 @@ def train_scene(oracle_npz_path: str, output_dir: str, seed: int = 0,
                 lgbm_sweep: bool = False, xgb_sweep: bool = False):
     """Train all ablations for one scene. Saves models to output_dir/{ablation}/."""
     out_root = Path(output_dir)
+    models_to_run = set(models) if models is not None else set(_ALL_MODELS)
+    names_to_train = ablations if ablations is not None else list(ABLATION_NAMES)
+
+    # Only compute the expensive per-cam groups (B=EWA screen_area, F=SH eval) if
+    # some requested ablation actually uses them. Training AC alone skips both.
+    feats_needed = set().union(
+        *(set(feature_names_for_ablation(a)) for a in names_to_train))
+    need_b = bool(feats_needed & set(GROUP_B_NAMES))
+    need_f = bool(feats_needed & set(GROUP_F_NAMES))
+
     print(f"\n{'='*60}", flush=True)
-    print(f"Building feature matrix from: {oracle_npz_path}", flush=True)
-    df, all_names = build_feature_matrix(oracle_npz_path)
+    print(f"Building feature matrix from: {oracle_npz_path} "
+          f"(need_b={need_b} need_f={need_f})", flush=True)
+    df, all_names = build_feature_matrix(oracle_npz_path, need_b=need_b, need_f=need_f)
     print(f"  rows={len(df):,}  tiles={df['tile'].nunique()}  cameras={df['camera'].nunique()}", flush=True)
 
     df = df[df["log_mse_loo"].notna()].copy()
     print(f"  After nan filter: {len(df):,} rows", flush=True)
-
-    models_to_run = set(models) if models is not None else set(_ALL_MODELS)
-    names_to_train = ablations if ablations is not None else list(ABLATION_NAMES)
 
     # Static feature cache (Group C+D) — camera-invariant, shipped with the model so
     # selection never rebuilds it from the PLY. Computed once; written into each

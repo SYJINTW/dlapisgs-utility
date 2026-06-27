@@ -445,13 +445,21 @@ def build_group_f(
 
 # ─── training entry point ─────────────────────────────────────────────────────
 
-def build_feature_matrix(oracle_npz_path: str) -> "tuple[pd.DataFrame, list]":
-    """Build all features (A+B+C+D) from oracle_dq.npz for training.
+def build_feature_matrix(oracle_npz_path: str, need_b: bool = True,
+                         need_f: bool = True) -> "tuple[pd.DataFrame, list]":
+    """Build features from oracle_dq.npz for training.
+
+    Group B (per-cam EWA screen_area) and Group F (per-cam SH eval) are the only
+    expensive per-camera builds. They are skipped (zero-filled, schema preserved)
+    when need_b/need_f are False — e.g. training an ablation like AC that uses
+    neither. The DataFrame still carries all ALL_FEATURE_NAMES columns so column
+    slicing downstream is unchanged; skipped columns are just zeros and never
+    referenced by an ablation that excludes them.
 
     Returns:
         df:    DataFrame, one row per (camera, tile). Columns = ALL_FEATURE_NAMES
                + ["camera", "tile", "log_mse_loo"].
-        names: ALL_FEATURE_NAMES (length 160).
+        names: ALL_FEATURE_NAMES (length 166).
     """
     oracle_npz_path = Path(oracle_npz_path)
     npz = np.load(str(oracle_npz_path), allow_pickle=True)
@@ -507,6 +515,12 @@ def build_feature_matrix(oracle_npz_path: str) -> "tuple[pd.DataFrame, list]":
     N_tiles = len(n_gs_per_tile)
     tile_col = np.arange(N_tiles, dtype=np.int32)
 
+    # Zero placeholders for skipped (unused-by-ablation) per-cam groups.
+    _zero_b = np.zeros((N_tiles, len(GROUP_B_NAMES)), dtype=np.float32)
+    _zero_f = np.zeros((N_tiles, len(GROUP_F_NAMES)), dtype=np.float32)
+    if need_b and rot_0 is None:
+        raise RuntimeError("PLY missing rot_0..rot_3 — required for Group B (screen_area)")
+
     rows = []
     for cam_idx in camera_indices:
         cam_idx_int = int(cam_idx)
@@ -532,22 +546,26 @@ def build_feature_matrix(oracle_npz_path: str) -> "tuple[pd.DataFrame, list]":
             tile_centers_np, n_gs_per_tile, dist_np, vis_np,
         )
 
-        if rot_0 is None:
-            raise RuntimeError("PLY missing rot_0..rot_3 — required for Group B (screen_area)")
-        group_b = build_group_b(
-            tile_index_offsets_t, tile_flat_indices_t,
-            min_corners_t, max_corners_t,
-            gs_xyz_t, opacity, scale_0, scale_1, scale_2,
-            rot_0, rot_1, rot_2, rot_3,
-            cam_center_t, wv, cam.projection_matrix,
-            img_w, img_h, n_gs_per_tile, device,
-            fov_x=getattr(cam, "FoVx", None), fov_y=getattr(cam, "FoVy", None),
-        )
+        if need_b:
+            group_b = build_group_b(
+                tile_index_offsets_t, tile_flat_indices_t,
+                min_corners_t, max_corners_t,
+                gs_xyz_t, opacity, scale_0, scale_1, scale_2,
+                rot_0, rot_1, rot_2, rot_3,
+                cam_center_t, wv, cam.projection_matrix,
+                img_w, img_h, n_gs_per_tile, device,
+                fov_x=getattr(cam, "FoVx", None), fov_y=getattr(cam, "FoVy", None),
+            )
+        else:
+            group_b = _zero_b
 
-        group_f = build_group_f(
-            gs.data, flat_indices, index_offsets,
-            gs_xyz, cam_pos_np, gs.sh_deg,
-        )
+        if need_f:
+            group_f = build_group_f(
+                gs.data, flat_indices, index_offsets,
+                gs_xyz, cam_pos_np, gs.sh_deg,
+            )
+        else:
+            group_f = _zero_f
 
         X_cam = np.hstack([group_a, group_b, static_feats, group_f])  # (N_tiles, 166)
 

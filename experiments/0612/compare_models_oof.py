@@ -127,9 +127,12 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[{args.scene}] building features ...", flush=True)
-    df, _ = build_feature_matrix(args.oracle_npz)
-    df = df[df["log_mse_loo"].notna()].copy()
     feat_cols = feature_names_for_ablation(args.ablation)
+    from ml.features import GROUP_B_NAMES, GROUP_F_NAMES
+    need_b = bool(set(feat_cols) & set(GROUP_B_NAMES))
+    need_f = bool(set(feat_cols) & set(GROUP_F_NAMES))
+    df, _ = build_feature_matrix(args.oracle_npz, need_b=need_b, need_f=need_f)
+    df = df[df["log_mse_loo"].notna()].copy()
     print(f"[{args.scene}] {len(df):,} rows, {df['camera'].nunique()} cameras", flush=True)
 
     res, y, oof = run_cv(df, feat_cols, args.cv_folds, args.seed)

@@ -724,7 +724,7 @@ def main() -> None:
     parser.add_argument("--ply", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--camera-trace", required=True)
-    parser.add_argument("--grid-shape", nargs=3, type=int, default=[4, 4, 4])
+    parser.add_argument("--grid-shape", nargs=3, type=int, default=[8, 8, 8])
     parser.add_argument("--budget-mb", type=float, default=None)
     parser.add_argument("--budgets-mb", nargs="+", type=float, default=None)
     parser.add_argument("--budget-pct", nargs="+", type=float, default=None)
@@ -733,8 +733,8 @@ def main() -> None:
     parser.add_argument("--schemes", nargs="+", type=str, default=None)
     parser.add_argument("--camera-index", type=int, default=0)
     parser.add_argument("--camera-indices", nargs="+", type=int, default=None)
-    parser.add_argument("--img-w", type=int, default=800)
-    parser.add_argument("--img-h", type=int, default=800)
+    parser.add_argument("--img-w", type=int, default=1600)
+    parser.add_argument("--img-h", type=int, default=1600)
     parser.add_argument("--w-norm", type=str, default="sum", choices=list(uc.NORM_MODES))
     parser.add_argument("--c-norm", type=str, default="sum", choices=list(uc.NORM_MODES))
     parser.add_argument("--w-mode", type=str, default="mean", choices=list(uc.W_MODES))
@@ -742,9 +742,10 @@ def main() -> None:
                         choices=list(uc.COMPLEXITY_KINDS) + ["count"])
     parser.add_argument("--packing-mode", type=str, default="tile_partial",
                         choices=["tile_partial", "tile_strict", "progressive"])
-    parser.add_argument("--greedy-key", type=str, default="utility",
+    parser.add_argument("--greedy-key", type=str, default="marginal",
                         choices=["utility", "marginal"],
-                        help="Sort key: 'utility' = raw score, 'marginal' = score / tile_bytes.")
+                        help="Sort key: 'marginal' = score / tile_bytes (CANON, all tiled packing); "
+                             "'utility' = raw score (legacy).")
     parser.add_argument("--weight-mode", type=str, default="screen_area",
                         choices=list(uc.WEIGHT_MODES))
     parser.add_argument("--tiling-cache", type=str, default=None)
@@ -830,6 +831,12 @@ def main() -> None:
             raise FileNotFoundError(f"ML model not found: {_ml_model_pkl}")
         with _timed("ml_model_load", []):
             _ml_model = joblib.load(_ml_model_pkl)
+        # Per-frame inference is a tiny batch (~N_tiles rows). joblib n_jobs=-1
+        # (inherited from training) spins up a thread pool per predict call,
+        # adding ~100 ms of pure dispatch overhead that dwarfs the ~10-15 ms
+        # single-thread traversal. Force single-thread for realtime predict.
+        if hasattr(_ml_model, "n_jobs"):
+            _ml_model.n_jobs = 1
 
     base_output_path = Path(args.output_root)
     log_path = base_output_path / "utility.log"

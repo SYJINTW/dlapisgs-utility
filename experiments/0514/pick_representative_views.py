@@ -76,8 +76,15 @@ def main() -> None:
         best   = cell_rows[-1]
 
         budget_tag = f"budget_{_budget_tag(budget_mb)}"
+        meta = cell_rows[0]
+        pmode = meta.get("packing_mode", "")
+        wmode = meta.get("weight_mode", "")
+        grid  = meta.get("grid_shape", "")
         fig, axes = plt.subplots(3, 2, figsize=(8.0, 11.0))
-        fig.suptitle(f"{scene}  {args.group_by}={group_val}  {budget_tag}", fontsize=12)
+        fig.suptitle(
+            f"{scene}  {args.group_by}={group_val}  packing={pmode}  weight={wmode}  grid={grid}  {budget_tag}",
+            fontsize=10,
+        )
 
         for row_i, (rank, row) in enumerate((("worst", worst), ("median", median), ("best", best))):
             cam_idx = int(row["camera_index"])

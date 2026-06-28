@@ -109,30 +109,37 @@ def _load_overlay(overlay_csv: str | None, overlay_filter: list[str] | None,
 
 
 def _aggregate(rows: list[dict], group_by: str) -> dict[str, dict]:
-    buckets: dict[str, dict] = defaultdict(lambda: defaultdict(list))
+    # Two-stage: cam→scene mean, then CI over n_scenes (fixes 12× too-tight CI from pooling).
+    buckets: dict[str, dict] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for r in rows:
         key = r.get(group_by) or f"missing_{group_by}"
         bk = r["_budget_key"] if "_budget_key" in r else float(r["budget_mb"])
-        buckets[key][bk].append(r)
+        scene = r.get("scene", "_")
+        buckets[key][bk][scene].append(r)
     result: dict[str, dict] = {}
     for key, budgets in buckets.items():
         result[key] = {}
-        for bk, entries in budgets.items():
-            psnr_vals = np.minimum(
-                np.array([float(e["psnr"]) for e in entries]), PSNR_SATURATION_DB)
-            ssim_vals = np.array([float(e["ssim"]) for e in entries])
-            ngs_vals  = np.array([float(e.get("selected_gaussians", 0)) for e in entries])
-            n = len(entries)
+        for bk, scenes in budgets.items():
+            spsnr, sssim, sngs = [], [], []
+            n_cams = 0
+            for entries in scenes.values():
+                spsnr.append(np.minimum(
+                    np.array([float(e["psnr"]) for e in entries]), PSNR_SATURATION_DB).mean())
+                sssim.append(np.array([float(e["ssim"]) for e in entries]).mean())
+                sngs.append(np.array([float(e.get("selected_gaussians", 0)) for e in entries]).mean())
+                n_cams += len(entries)
+            spsnr = np.array(spsnr); sssim = np.array(sssim); sngs = np.array(sngs)
+            n = len(spsnr)
             ci = 1.96 / max(np.sqrt(n), 1.0)
             result[key][bk] = {
-                "psnr_mean": float(psnr_vals.mean()),
-                "psnr_ci95": float(psnr_vals.std(ddof=1) * ci) if n > 1 else 0.0,
-                "ssim_mean": float(ssim_vals.mean()),
-                "ssim_ci95": float(ssim_vals.std(ddof=1) * ci) if n > 1 else 0.0,
-                "ngs_mean":  float(ngs_vals.mean()),
-                "ngs_ci95":  float(ngs_vals.std(ddof=1) * ci) if n > 1 else 0.0,
+                "psnr_mean": float(spsnr.mean()),
+                "psnr_ci95": float(spsnr.std(ddof=1) * ci) if n > 1 else 0.0,
+                "ssim_mean": float(sssim.mean()),
+                "ssim_ci95": float(sssim.std(ddof=1) * ci) if n > 1 else 0.0,
+                "ngs_mean":  float(sngs.mean()),
+                "ngs_ci95":  float(sngs.std(ddof=1) * ci) if n > 1 else 0.0,
                 "n": n,
-                "n_cameras": len(set(e.get("camera_index", "") for e in entries)),
+                "n_cameras": n_cams,
             }
     return result
 

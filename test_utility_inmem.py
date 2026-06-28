@@ -166,7 +166,8 @@ def _yaml_safe(obj):
     return str(obj)
 
 
-def _dump_run_params(output_root: Path, args: argparse.Namespace, device: str) -> None:
+def _dump_run_params(output_root: Path, args: argparse.Namespace, device: str,
+                     derived=None) -> None:
     payload = {
         "run": {
             "timestamp": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -180,6 +181,8 @@ def _dump_run_params(output_root: Path, args: argparse.Namespace, device: str) -
         },
         "args": vars(args),
     }
+    if derived:
+        payload["derived"] = derived
     output_root.mkdir(parents=True, exist_ok=True)
     (output_root / "params.yaml").write_text(
         yaml.safe_dump(_yaml_safe(payload), sort_keys=False, default_flow_style=False),
@@ -752,10 +755,14 @@ def main() -> None:
     parser.add_argument("--img-w", type=int, default=1600)
     parser.add_argument("--img-h", type=int, default=1600)
     parser.add_argument("--w-norm", type=str, default="sum", choices=list(uc.NORM_MODES))
-    parser.add_argument("--c-norm", type=str, default="sum", choices=list(uc.NORM_MODES))
-    parser.add_argument("--w-mode", type=str, default="mean", choices=list(uc.W_MODES))
+    parser.add_argument("--c-norm", type=str, default="sum", choices=list(uc.NORM_MODES),
+                        help="C_k normalization. NOTE: C term unused by canonical schemes "
+                             "(vd_lod_w/ml/oracle_loo); only active for vd_lod_c/vd_lod_w_c.")
+    parser.add_argument("--w-mode", type=str, default="sum", choices=list(uc.W_MODES))
     parser.add_argument("--c-kind", type=str, default="count",
-                        choices=list(uc.COMPLEXITY_KINDS) + ["count"])
+                        choices=list(uc.COMPLEXITY_KINDS) + ["count"],
+                        help="C_k complexity signal. NOTE: C term unused by canonical schemes "
+                             "(vd_lod_w/ml/oracle_loo); only active for vd_lod_c/vd_lod_w_c.")
     parser.add_argument("--packing-mode", type=str, default="tile_partial",
                         choices=["tile_partial", "tile_strict", "progressive"])
     parser.add_argument("--greedy-key", type=str, default="marginal",
@@ -868,7 +875,6 @@ def main() -> None:
     _budget_bytes_list: list[int] | None = None  # filled after sel_gs load if needed
 
     output_root_for_meta = base_output_path
-    _dump_run_params(output_root_for_meta, args, device)
     timings: list = []
     if torch.cuda.is_available():
         _gs = _gpu_state()
@@ -1057,6 +1063,13 @@ def main() -> None:
         if args.camera_index >= len(sel_cameras):
             raise ValueError("--camera-index out of range")
         camera_indices = [args.camera_index]
+
+    _dump_run_params(output_root_for_meta, args, device, derived={
+        "scheme_list": scheme_list,
+        "budget_list_mb": budget_list,
+        "budget_bytes_list": _budget_bytes_list,
+        "camera_indices": camera_indices,
+    })
 
     # --- Oracle data ---
     oracle_data = None

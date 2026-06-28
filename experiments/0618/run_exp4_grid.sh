@@ -34,7 +34,7 @@ check_gpu_free() {
 }
 
 SCENES="${SCENES:-bicycle garden stump chair drums ficus hotdog materials mic ship}"
-GRIDS="${GRIDS:-1 2 4 8}"
+GRIDS="${GRIDS:-8 1 2 4 16}"
 BUDGET_PCTS="${BUDGET_PCTS:-10 25 40 55 70 85 99 100}"
 NUM_LOD="${NUM_LOD:-1}"
 OUT_BASE="${OUTPUT_ROOT:-$UTIL_DIR/output/0618/exp4_grid}"

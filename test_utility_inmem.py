@@ -72,6 +72,18 @@ from streaming_utils.camera_loader import load_camera_from_streaming_config  # n
 from utils.image_utils import psnr as gs_psnr  # noqa: E402  # type: ignore
 from utils.loss_utils import ssim as gs_ssim  # noqa: E402  # type: ignore
 
+try:
+    import lpips as _lpips_mod
+    _lpips_fn = None  # lazy-init on first use
+
+    def _get_lpips_fn():
+        global _lpips_fn
+        if _lpips_fn is None:
+            _lpips_fn = _lpips_mod.LPIPS(net="alex").cuda()
+        return _lpips_fn
+except ImportError:
+    _get_lpips_fn = None  # type: ignore
+
 
 VALID_SCHEMES = ["vd", "vd_lod", "vd_lod_w", "vd_lod_c", "vd_lod_w_c",
                  "ml",
@@ -408,12 +420,16 @@ def _load_trace(trace_path: Path) -> list:
     return data["frames"]
 
 
-def _compute_metrics(rendered: torch.Tensor, gt: torch.Tensor) -> dict:
+def _compute_metrics(rendered: torch.Tensor, gt: torch.Tensor, skip_lpips: bool = True) -> dict:
     r, g = rendered.unsqueeze(0), gt.unsqueeze(0)
-    return {
+    m = {
         "psnr": float(gs_psnr(r, g).mean().item()),
         "ssim": float(gs_ssim(r, g).item()),
     }
+    if not skip_lpips and _get_lpips_fn is not None:
+        with torch.no_grad():
+            m["lpips"] = float(_get_lpips_fn()(r * 2 - 1, g * 2 - 1).item())
+    return m
 
 
 def _subset_gaussians(full_gs: GaussianModel, selected_indices: np.ndarray) -> GaussianModel:
@@ -778,6 +794,8 @@ def main() -> None:
     parser.add_argument("--ply-workers", type=int, default=PLY_WORKERS,
                         help="Thread pool size for PLY writes (only used with --save-ply).")
     parser.add_argument("--ascii-ply", action="store_true")
+    parser.add_argument("--lpips", action="store_true",
+                        help="Compute LPIPS alongside PSNR/SSIM (off by default; requires lpips pkg).")
     parser.add_argument("--png-workers", type=int, default=0,
                         help="Thread pool size for async PNG writes. 0 = synchronous (default).")
     parser.add_argument("--save-rep-only", action="store_true",
@@ -1245,7 +1263,7 @@ def main() -> None:
 
                 with _timed("metrics", timings, camera=camera_index,
                             scheme=scheme, budget_mb=budget_mb):
-                    m = _compute_metrics(rendered, gt_render_gpu)
+                    m = _compute_metrics(rendered, gt_render_gpu, skip_lpips=not args.lpips)
 
                 if not args.save_rep_only:
                     if png_executor:
@@ -1268,6 +1286,7 @@ def main() -> None:
                     "camera_index":       camera_index,
                     "psnr":               m["psnr"],
                     "ssim":               m["ssim"],
+                    **( {"lpips": m["lpips"]} if "lpips" in m else {} ),
                     "used_bytes":         int(used_bytes),
                     "selected_gaussians": int(len(selected_indices)),
                     "n_selected_tiles":   int(selected_tiles.size),

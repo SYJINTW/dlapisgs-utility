@@ -24,7 +24,7 @@ case "$SCENE" in
   bicycle) PLY="${ROOT}/exp-dataset/bicycle/point_cloud.ply"
            TRACE="${ROOT}/exp-dataset/bicycle/sparse_views_100_eval.json" ;;
   *)       PLY="${ROOT}/exp-dataset/${SCENE}/checkpoint/point_cloud/iteration_30000/point_cloud.ply"
-           TRACE="${ROOT}/exp-dataset/${SCENE}/checkpoint/point_cloud/iteration_30000/sparse_views_100_eval.json" ;;
+           TRACE="${ROOT}/exp-dataset/${SCENE}/sparse_views_eval.json" ;;
 esac
 [ -f "$PLY" ]   || { echo "no PLY: $PLY"; exit 1; }
 [ -f "$TRACE" ] || { echo "no trace: $TRACE"; exit 1; }
@@ -42,7 +42,7 @@ conda run -n gaussian_splatting python test_utility_inmem.py \
   --grid-shape "$GRID" "$GRID" "$GRID" --camera-index "$CAM" --budget-pct "$BUD" \
   --schemes "$SCHEME" --num-lod 1 --packing-mode "$PACK" \
   --weight-mode screen_area --w-norm sum --c-norm sum --img-w 1600 --img-h 1600 \
-  --scene "$SCENE" \
+  --scene "$SCENE" --lpips \
   $EXTRA >/dev/null 2>&1
 
 MJ=$(find "${OUT}/metrics" -name "camera_$(printf '%03d' "$CAM").json" | head -1)
@@ -53,6 +53,8 @@ d=json.load(open('$MJ'))
 p=d['psnr']; mse=10**(-p/10) if p!=float('inf') else 0.0
 print(f\"  scene=$SCENE cam=$CAM budget=${BUD}% packing=$PACK scheme=$SCHEME\")
 print(f\"  n_gs={d['selected_gaussians']}  tiles={d.get('n_selected_tiles','-')}\")
-print(f\"  PSNR={p:.3f} dB   SSIM={d['ssim']:.4f}   MSE={mse:.3e}\")
+lp = d.get('lpips')
+lp_str = f\"   LPIPS={lp:.4f}\" if lp is not None else \"\"
+print(f\"  PSNR={p:.3f} dB   SSIM={d['ssim']:.4f}   MSE={mse:.3e}{lp_str}\")
 "
 echo "  render: $PNG"

@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Exp5 selection timing — all 10 scenes × all methods.
 # Usage:
-#   bash experiments/0628/run_timing.sh                 # all scenes, GPU 2
+#   bash experiments/0628/run_timing.sh                    # all scenes, GPU 2
 #   SCENES="chair drums" bash experiments/0628/run_timing.sh
 #   METHODS="heuristic ml" bash experiments/0628/run_timing.sh
 #   GPU=3 bash experiments/0628/run_timing.sh
 #
-# Output: output/0628/selection_timing/{scene}/{method}.json
-# oracle_online is slow (~8-14 min/scene) — include explicitly via METHODS override.
+# oracle_online (~8-14 min/scene, 80-140 min total):
+#   METHODS="oracle_online" GPU=3 bash experiments/0628/run_timing.sh
+#
+# Output: output/0628/selection_timing/{scene}/{method}/
+#   params.yaml  timings.json  summary.csv
+# Default budgets: 10 25 40 55 70 85 99 100 (8 levels, canonical)
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."   # dlapisgs-utility root

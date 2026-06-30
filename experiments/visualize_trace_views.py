@@ -108,6 +108,8 @@ def main() -> None:
                    help="Camera-axis arrow length as fraction of scene diagonal.")
     p.add_argument("--connect-trajectory", type=int, default=1,
                    help="1: draw a faded line connecting consecutive cameras (faux trajectory).")
+    p.add_argument("--split-at", type=int, default=150,
+                   help="Color cameras [0, N) as train (blue) and [N, end) as eval (orange). 0 = off (viridis by index).")
     p.add_argument("--cmap", default="viridis")
     p.add_argument("--width",  type=int, default=800)
     p.add_argument("--height", type=int, default=800)
@@ -136,9 +138,15 @@ def main() -> None:
         diag = float(np.linalg.norm(centers.max(axis=0) - centers.min(axis=0)))
     L = args.arrow_frac * diag
 
-    # Camera colormap by index
-    cmap = matplotlib.colormaps[args.cmap]
-    colors = cmap(np.linspace(0.0, 1.0, len(cams)))
+    # Camera colors: split train/eval or viridis by index
+    split_at = args.split_at if 0 < args.split_at < len(cams) else 0
+    if split_at:
+        TRAIN_COLOR = "#1f77b4"   # matplotlib tab:blue
+        EVAL_COLOR  = "#ff7f0e"   # matplotlib tab:orange
+        point_colors = [TRAIN_COLOR if i < split_at else EVAL_COLOR for i in range(len(cams))]
+    else:
+        cmap = matplotlib.colormaps[args.cmap]
+        point_colors = list(cmap(np.linspace(0.0, 1.0, len(cams))))
 
     fig = plt.figure(figsize=(14, 11))
     gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.0], width_ratios=[1.0, 1.0],
@@ -170,16 +178,11 @@ def main() -> None:
     if args.connect_trajectory:
         ax3d.plot(centers[:, 0], centers[:, 1], centers[:, 2],
                   color="black", alpha=0.25, linewidth=0.7)
-    for i in range(len(cams)):
-        c = centers[i]; col = colors[i]
-        ax3d.quiver(c[0], c[1], c[2], fwds[i, 0],   fwds[i, 1],   fwds[i, 2],
-                    length=L * 1.3, color="crimson", linewidth=0.8, alpha=0.9)
-        ax3d.quiver(c[0], c[1], c[2], rights[i, 0], rights[i, 1], rights[i, 2],
-                    length=L,       color=col,      linewidth=0.5, alpha=0.7)
-        ax3d.quiver(c[0], c[1], c[2], ups[i, 0],    ups[i, 1],    ups[i, 2],
-                    length=L,       color=col,      linewidth=0.5, alpha=0.7)
+    ax3d.quiver(centers[:, 0], centers[:, 1], centers[:, 2],
+                fwds[:, 0], fwds[:, 1], fwds[:, 2],
+                length=L * 0.25, color="crimson", linewidth=0.4, alpha=0.3, normalize=False)
     ax3d.scatter(centers[:, 0], centers[:, 1], centers[:, 2],
-                 c=np.arange(len(cams)), cmap=args.cmap, s=18, depthshade=True, alpha=0.95)
+                 c=point_colors, s=22, depthshade=True, alpha=0.95, zorder=5)
     ax3d.set_xlabel("X"); ax3d.set_ylabel("Y"); ax3d.set_zlabel("Z")
     ax3d.set_title(f"{args.trace.name}  —  {len(cams)} views  (3D iso)")
     # Force the 3D box to the camera region (set_axes_equal would otherwise use full data extent)
@@ -196,11 +199,10 @@ def main() -> None:
             ax.plot(centers[:, a], centers[:, b],
                     color="black", alpha=0.25, linewidth=0.6)
         ax.scatter(centers[:, a], centers[:, b],
-                   c=np.arange(len(cams)), cmap=args.cmap, s=20, alpha=0.9, zorder=3)
-        # forward arrows
+                   c=point_colors, s=20, alpha=0.9, zorder=3)
         ax.quiver(centers[:, a], centers[:, b], fwds[:, a], fwds[:, b],
-                  angles="xy", scale_units="xy", scale=1.0/L, color="crimson",
-                  width=0.0025, alpha=0.75)
+                  angles="xy", scale_units="xy", scale=5.0/L, color="crimson",
+                  width=0.002, alpha=0.25)
         ax.set_xlabel(label_a); ax.set_ylabel(label_b); ax.set_title(title)
         _set_equal_2d(ax, centers[:, a], centers[:, b])
 
@@ -208,18 +210,23 @@ def main() -> None:
     _panel(ax_xz, 0, 2, "X", "Z", "Front (XZ)")
     _panel(ax_yz, 1, 2, "Y", "Z", "Side  (YZ)")
 
-    # Single colorbar at right
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, len(cams) - 1))
-    sm.set_array([])
-    cbar_ax = fig.add_axes((0.93, 0.15, 0.012, 0.7))
-    cb = fig.colorbar(sm, cax=cbar_ax)
-    cb.set_label("frame_index", rotation=270, labelpad=15)
-
-    # Legend cheat sheet — bottom-right of figure so it doesn't crash the 3D title
+    # Legend
+    import matplotlib.patches as mpatches
     leg_x = 0.55; leg_y = 0.03
-    fig.text(leg_x, leg_y + 0.066, "● scatter = camera center (color = frame_index)", fontsize=9)
-    fig.text(leg_x, leg_y + 0.044, "→ red = forward direction", fontsize=9, color="crimson")
-    fig.text(leg_x, leg_y + 0.022, "→ colored = right / up axes", fontsize=9)
+    if split_at:
+        fig.text(leg_x, leg_y + 0.088,
+                 f"● train  (cams 0–{split_at-1})", fontsize=9, color=TRAIN_COLOR)
+        fig.text(leg_x, leg_y + 0.066,
+                 f"● eval   (cams {split_at}–{len(cams)-1})", fontsize=9, color=EVAL_COLOR)
+    else:
+        sm = plt.cm.ScalarMappable(cmap=matplotlib.colormaps[args.cmap],
+                                   norm=plt.Normalize(0, len(cams) - 1))
+        sm.set_array([])
+        cbar_ax = fig.add_axes((0.93, 0.15, 0.012, 0.7))
+        cb = fig.colorbar(sm, cax=cbar_ax)
+        cb.set_label("frame_index", rotation=270, labelpad=15)
+        fig.text(leg_x, leg_y + 0.066, "● scatter = camera center (color = frame_index)", fontsize=9)
+    fig.text(leg_x, leg_y + 0.022, "→ red = forward direction", fontsize=9, color="crimson")
     fig.text(leg_x, leg_y,         "— faded line = consecutive-frame trajectory", fontsize=9)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

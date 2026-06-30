@@ -15,11 +15,20 @@ import matplotlib.pyplot as plt
 
 PSNR_SAT = 60.0
 B_PANELS = [25, 55, 85]                       # budgets for fig (b) panels
-GRIDS = [1, 2, 4, 8]
+GRIDS = [1, 2, 4, 8, 16]
 SCHEME_ORDER = ["vd_lod", "vd_lod_w", "ml", "oracle_loo"]
-SCHEME_LABEL = {"vd_lod": "vd_lod (baseline)", "vd_lod_w": "vd_lod_w (heuristic)",
-                "ml": "ml (learned)", "oracle_loo": "oracle_loo (UB)"}
-GRID_COLOR = {1: "#d62728", 2: "#ff7f0e", 4: "#2ca02c", 8: "#1f77b4"}
+SCHEME_LABEL = {
+    "vd_lod":     "Heuristic (baseline)",
+    "vd_lod_w":   "Heuristic (ours)",
+    "ml":         "Learned (ours)",
+    "oracle_loo": "Proxy Oracle",
+}
+PACKING_LABEL = {
+    "progressive":  "GS Prog (culled)",
+    "tile_partial": "Tile Partial",
+    "tile_strict":  "Tile Strict",
+}
+GRID_COLOR = {1: "#d62728", 2: "#ff7f0e", 4: "#2ca02c", 8: "#1f77b4", 16: "#9467bd"}
 
 
 def load(csv):
@@ -57,13 +66,14 @@ def fig_a(df, packing, metric, out):
                 ys.append(m); es.append(c)
             ax.errorbar(xs, ys, yerr=es, marker="o", ms=4, capsize=3,
                         color=GRID_COLOR[g], label=f"{g}³")
-        ax.set_title(SCHEME_LABEL.get(sch, sch))
+        title = PACKING_LABEL[packing] if packing == "progressive" else SCHEME_LABEL.get(sch, sch)
+        ax.set_title(title)
         ax.set_xlabel("budget %"); ax.grid(alpha=.3)
         if metric == "psnr":
             ax.axhline(PSNR_SAT, ls=":", c="gray", lw=.8)
     axes[0][0].set_ylabel(metric.upper())
     axes[0][0].legend(title="grid")
-    fig.suptitle(f"exp4 (a) {metric.upper()} vs budget | packing={packing} "
+    fig.suptitle(f"exp4 (a) {metric.upper()} vs budget | packing={PACKING_LABEL.get(packing, packing)} "
                  f"| lines=grid | scene-level 95% CI (n=10)")
     fig.tight_layout()
     fig.savefig(out, dpi=130, bbox_inches="tight"); plt.close(fig)

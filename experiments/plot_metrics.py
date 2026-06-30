@@ -24,6 +24,10 @@ _SCHEME_LABELS = {
     "vd_lod":          "VD+LOD (baseline)",
     "vd_lod_w":        "VD+LOD+W (ours)",
     "ml":              "ML (ours)",
+    "prog_no_cull":    "Progressive (no cull, 1³)",
+    "prog_culled":     "Progressive (culled, 8³)",
+    "oracle_tp":       "Oracle tile_partial (8³)",
+    "ml_tp":           "ML tile_partial (8³)",
     "vd_lod_c":        "VD+LOD+C",
     "vd_lod_w_c":      "VD+LOD+W+C (proposed)",
     "vd_lod_w_sa":     "VD+LOD+W (screen_area)",
@@ -33,6 +37,7 @@ _SCHEME_LABELS = {
     "oracle_combined": "Oracle-combined",
 }
 _SCHEME_ORDER = [
+    "prog_no_cull", "prog_culled", "oracle_tp", "ml_tp",
     "vd_lod", "vd_lod_w", "ml", "vd_lod_w_sa", "vd_lod_w_vd2", "vd_lod_c", "vd_lod_w_c",
     "oracle_aoi", "oracle_combined", "oracle_loo",
 ]

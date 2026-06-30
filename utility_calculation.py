@@ -338,14 +338,18 @@ def calculate_utility_param(
     weight_sum_tensor=None,
     complexity_tensor=None,
     include_lod=True,
+    include_v=True,
+    include_d=True,
     include_w=False,
     include_c=False,
     beta=10.0,
 ):
-    """Compute raw per-tile utility scores U(k) = (v_k/d_k) [·W_k] [·C_k].
+    """Compute raw per-tile utility scores U(k) = [v_k] [/d_k] [·W_k] [·C_k].
 
-    Returns ndarray shape (N_tiles,) of unsorted raw scores. Sorting and LOD
-    expansion are handled by _sort_tiles in test_utility_inmem.py.
+    Each factor is an independent flag (include_v / include_d / include_w /
+    include_c), so a scheme can include or ablate any term without touching the
+    others. Returns ndarray shape (N_tiles,) of unsorted raw scores. Sorting and
+    LOD expansion are handled by _sort_tiles in test_utility_inmem.py.
 
     Note: num_of_level, include_lod, beta are unused and will be removed in a
     follow-up cleanup once callers are updated.
@@ -355,7 +359,11 @@ def calculate_utility_param(
     if include_c and complexity_tensor is None:
         raise ValueError("complexity_tensor required when include_c=True")
 
-    scores = _compute_base_scores(visibility_mask_tensor, tile_distances_tensor)
+    scores = torch.ones_like(tile_distances_tensor)
+    if include_v:
+        scores = scores * torch.where(visibility_mask_tensor, 1.0, INVISIBLE_PRIORITY_EPS)
+    if include_d:
+        scores = scores / (tile_distances_tensor + DISTANCE_EPS)
     if include_w:
         scores = scores * weight_sum_tensor
     if include_c:

@@ -203,7 +203,7 @@ def main() -> None:
     parser.add_argument("--sh-degree", type=int, default=3)
     parser.add_argument("--white-bg", action="store_true")
     parser.add_argument("--save-pt", action="store_true",
-                        help="Also dump R_full(c) as float16 .pt for reuse.")
+                        help="Also dump R_full(c) as float32 .pt for reuse.")
     parser.add_argument("--save-ablation-png", action="store_true",
                         help="Save R_-k(c) PNG per (tile, camera). ~30 GB on bicycle.")
     parser.add_argument("--flush-every", type=int, default=10,
@@ -294,21 +294,21 @@ def main() -> None:
     n_total = int(g.get_xyz.shape[0])
     logger.info("Scene loaded: N_total={} GS", n_total)
 
-    # --- full-scene reference renders (kept on GPU at float32) --------------
+    # --- full-scene reference renders (kept on CPU at float32) --------------
     logger.info("Rendering R_full(c) for {} cameras...", n_cams)
     full_renders: list[torch.Tensor] = []
     with _timed("full_render_all", timings, n=n_cams):
         with torch.no_grad():
             for i, (c_global, cam) in enumerate(zip(camera_indices, cameras)):
                 img = _render_current(g, cam, args.white_bg)
-                full_renders.append(img.half().cpu())  # keep off GPU; ~4 GB saved on large scenes
+                full_renders.append(img.float().cpu())  # off GPU, float32: .half() floored oracle ΔQ at ~77 dB
                 png_path = full_dir / f"camera_{c_global:03d}.png"
                 if not png_path.exists():
                     torchvision.utils.save_image(img, str(png_path))
                 if args.save_pt:
                     pt_path = full_dir / f"camera_{c_global:03d}.pt"
                     if not pt_path.exists():
-                        torch.save(img.half().cpu(), str(pt_path))
+                        torch.save(img.float().cpu(), str(pt_path))
     logger.success("R_full rendered: {} frames", n_cams)
     torch.cuda.empty_cache()
 

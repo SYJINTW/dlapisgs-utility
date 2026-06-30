@@ -85,9 +85,9 @@ except ImportError:
     _get_lpips_fn = None  # type: ignore
 
 
-VALID_SCHEMES = ["vd", "vd_lod", "vd_lod_w", "vd_lod_c", "vd_lod_w_c",
+VALID_SCHEMES = ["vd", "vd_lod", "vd_lod_w", "v_lod_w", "vd_lod_c", "vd_lod_w_c",
                  "ml",
-                 "oracle_loo", "oracle_aoi", "oracle_combined"]
+                 "oracle_loo", "oracle_loo_ssim", "oracle_aoi", "oracle_combined"]
 PLY_WORKERS = 4
 
 
@@ -272,7 +272,7 @@ def _greedy_order_tile_strict(order_pairs, tile_index_offsets, tile_flat_indices
 
 
 def _greedy_order(order_pairs, tile_index_offsets, tile_flat_indices, w_gi,
-                  bytes_per_gaussian, max_budget_bytes):
+                  bytes_per_gaussian, max_budget_bytes, gs_order="weight"):
     max_count = max_budget_bytes // bytes_per_gaussian
     chunks = []
     count = 0
@@ -284,10 +284,14 @@ def _greedy_order(order_pairs, tile_index_offsets, tile_flat_indices, w_gi,
         indices_for_tile = tile_flat_indices[start:end]
         if len(indices_for_tile) == 0:
             continue
-        tile_weights = w_gi[indices_for_tile]
-        sorted_tile = indices_for_tile[torch.argsort(tile_weights, descending=True)].cpu().numpy()
-        take = min(len(sorted_tile), max_count - count)
-        chunks.append(sorted_tile[:take])
+        if gs_order == "weight":
+            # "ours": within a partially-packed tile, keep the top-w(g_i) Gaussians.
+            tile_weights = w_gi[indices_for_tile]
+            ordered_tile = indices_for_tile[torch.argsort(tile_weights, descending=True)].cpu().numpy()
+        else:  # "ply": file/storage order, no per-Gaussian weight signal (baseline)
+            ordered_tile = indices_for_tile.cpu().numpy()
+        take = min(len(ordered_tile), max_count - count)
+        chunks.append(ordered_tile[:take])
         count += take
     return np.concatenate(chunks) if chunks else np.empty(0, dtype=np.int64)
 
@@ -319,6 +323,12 @@ def _oracle_scores(scheme, oracle_data, camera_index, n_tiles):
     if scheme == "oracle_loo":
         # I_k = MSE rise when tile k is dropped (already a positive ΔMSE).
         return np.where(np.isfinite(mse_loo), mse_loo, -np.inf)
+
+    elif scheme == "oracle_loo_ssim":
+        # I_k = ΔSSIM = 1 - SSIM(R_-k, R_full): structural-similarity drop when
+        # tile k is dropped. Larger = more important. Metric-matched to SSIM eval.
+        ssim_loo = oracle_data["ssim_loo"][row]
+        return np.where(np.isfinite(ssim_loo), 1.0 - ssim_loo, -np.inf)
 
     elif scheme == "oracle_aoi":
         mse_aoi = oracle_data["mse_aoi"]
@@ -393,13 +403,16 @@ def _compute_raw_scores(scheme, *, oracle_data, camera_index, n_tiles,
         return np.exp(ml_predict.predict_utility(**ml_predict_kwargs))
     else:
         include_lod = scheme != "vd"
-        include_w = scheme in ("vd_lod_w", "vd_lod_w_c")
+        include_v = True  # flag ready for future v-ablation; all current schemes keep visibility
+        include_d = scheme.startswith("vd")  # False only for v_lod_w (W_k already encodes ∝1/d²)
+        include_w = scheme in ("vd_lod_w", "vd_lod_w_c", "v_lod_w")
         include_c = scheme in ("vd_lod_c", "vd_lod_w_c")
         return uc.calculate_utility_param(
             visibility, distances, num_of_level=num_lod,
             weight_sum_tensor=W_k if include_w else None,
             complexity_tensor=C_k if include_c else None,
-            include_lod=include_lod, include_w=include_w, include_c=include_c,
+            include_lod=include_lod, include_v=include_v, include_d=include_d,
+            include_w=include_w, include_c=include_c,
         )
 
 
@@ -595,7 +608,8 @@ def _compute_camera_weights(sel_cam, opacity, scale_0, scale_1, scale_2,
 
 def _build_greedy_order(packing_mode, scheme, utilities, visibility,
                         tile_index_offsets, tile_flat_indices, w_gi,
-                        bytes_per_gaussian, max_budget_bytes, shuffle_visible_seed=None):
+                        bytes_per_gaussian, max_budget_bytes, shuffle_visible_seed=None,
+                        gs_order="weight"):
     """Return (all_ordered, tile_cum_counts) for one (camera, scheme) pair."""
     tile_cum_counts = None
     if packing_mode == "progressive":
@@ -607,10 +621,10 @@ def _build_greedy_order(packing_mode, scheme, utilities, visibility,
         all_ordered, tile_cum_counts = _greedy_order_tile_strict(
             utilities, tile_index_offsets, tile_flat_indices, w_gi)
         
-    elif packing_mode == "tile_partial":        
+    elif packing_mode == "tile_partial":
         all_ordered = _greedy_order(
             utilities, tile_index_offsets, tile_flat_indices,
-            w_gi, bytes_per_gaussian, max_budget_bytes)
+            w_gi, bytes_per_gaussian, max_budget_bytes, gs_order=gs_order)
     else:
         raise ValueError(f"Unknown packing_mode '{packing_mode}'.")
     return all_ordered, tile_cum_counts
@@ -712,7 +726,8 @@ def _rerender_rep_views(
             all_ordered, tile_cum_counts = _build_greedy_order(
                 args.packing_mode, scheme, utilities, visibility,
                 tile_index_offsets, tile_flat_indices, w_gi,
-                bytes_per_gaussian, max_budget_bytes, args.shuffle_visible_seed)
+                bytes_per_gaussian, max_budget_bytes, args.shuffle_visible_seed,
+                gs_order=args.gs_order)
 
             needed_budgets = [bm for bm, sc in rep_by_cam[camera_index] if sc == scheme]
             for budget_mb in needed_budgets:
@@ -765,6 +780,11 @@ def main() -> None:
                              "(vd_lod_w/ml/oracle_loo); only active for vd_lod_c/vd_lod_w_c.")
     parser.add_argument("--packing-mode", type=str, default="tile_partial",
                         choices=["tile_partial", "tile_strict", "progressive"])
+    parser.add_argument("--gs-order", type=str, default="weight",
+                        choices=["weight", "ply"],
+                        help="Intra-tile Gaussian order when a tile is partially packed "
+                             "(tile_partial). 'weight' = top-w(g_i) kept (ours); "
+                             "'ply' = file/storage order, no per-GS signal (baseline).")
     parser.add_argument("--greedy-key", type=str, default="marginal",
                         choices=["utility", "marginal"],
                         help="Sort key: 'marginal' = score / tile_bytes (CANON, all tiled packing); "
@@ -1080,6 +1100,7 @@ def main() -> None:
         _mse_blank = _od["mse_blank"] if "mse_blank" in _od else None
         oracle_data = {
             "mse_loo": _od["mse"].astype(np.float64),
+            "ssim_loo": _od["ssim"].astype(np.float64),
             "mse_aoi": _mse_aoi.astype(np.float64) if _mse_aoi is not None else None,
             "mse_blank": _mse_blank.astype(np.float64) if _mse_blank is not None else None,
             "cam_idx_to_row": {int(c): i for i, c in enumerate(_cam_ids)},
@@ -1239,7 +1260,8 @@ def main() -> None:
                 all_ordered, tile_cum_counts = _build_greedy_order(
                     args.packing_mode, scheme, utilities, visibility,
                     tile_index_offsets, tile_flat_indices, w_gi,
-                    bytes_per_gaussian, max_budget_bytes, args.shuffle_visible_seed)
+                    bytes_per_gaussian, max_budget_bytes, args.shuffle_visible_seed,
+                    gs_order=args.gs_order)
 
             if torch.cuda.is_available():
                 _p = torch.cuda.max_memory_allocated() // (1024 * 1024)

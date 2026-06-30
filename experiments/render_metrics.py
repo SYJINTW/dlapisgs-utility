@@ -224,18 +224,15 @@ def main() -> None:
     with _timed("gt_render_all", timings, n=len(cameras)):
         with torch.no_grad():
             for idx, cam in enumerate(cameras):
-                gt_persistent_path = gt_render_dir / f"camera_{idx:03d}.png"
-                if gt_persistent_path.exists():
-                    frame_tensor = torchvision.io.read_image(str(gt_persistent_path)).float().cuda() / 255.0
-                    gt_renders.append(frame_tensor)
-                    continue
                 bg_color = torch.tensor(bg, dtype=torch.float32, device="cuda").view(3, 1, 1)
                 bg_color = bg_color.expand(3, cam.image_height, cam.image_width)
                 bg_depth = torch.zeros(1, cam.image_height, cam.image_width, device="cuda")
                 result = render(cam, gt_gaussians, PIPELINE, bg_color, bg_depth, gs_res=gt_gs_res)
                 frame_tensor = result["render"].clamp(0.0, 1.0)
                 gt_renders.append(frame_tensor)
-                torchvision.utils.save_image(frame_tensor, str(gt_persistent_path))
+                # GT cache retired: PNG is viz-only, NEVER read back — uint8 roundtrip
+                # caps PSNR ~59 dB. Metric input stays the float32 tensor above.
+                torchvision.utils.save_image(frame_tensor, str(gt_render_dir / f"camera_{idx:03d}.png"))
     logger.success("GT rendered: {} frames", len(gt_renders))
     del gt_gaussians
 

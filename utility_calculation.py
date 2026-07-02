@@ -31,7 +31,7 @@ import tiling
 INVISIBLE_PRIORITY_EPS = 1e-2   # >0 to prevent invisible-tile starvation
 DISTANCE_EPS = 1e-3
 
-W_MODES = ("sum", "mean") #[TODO] remove mean mode; it is not used in experiments 
+W_MODES = ("sum",)
                           # and is not a good idea for utility scoring
 WEIGHT_MODES = ("volume", "volume_over_d2", "screen_area", "random")
 NORM_MODES = ("none", "max", "minmax", "log1p", "sum")
@@ -217,11 +217,9 @@ def compute_gaussian_weights_v2(weight_mode, *, opacity, scale_0, scale_1, scale
 # ---------------------------------------------------------------------------
 
 def compute_tile_weights_and_counts(tile_index_offsets, tile_flat_indices, w_gi,
-                                    w_norm="none", c_norm="max", w_mode="sum"):
-    """Compute W_k (aggregate Gaussian weight) and N_k (GS count) for all tiles.
+                                    w_norm="none", c_norm="max"):
+    """Compute W_k (aggregate Gaussian weight, W_k = Σw) and N_k (GS count) for all tiles.
 
-    w_mode 'sum': W_k = Σw (scales with tile density).
-    w_mode 'mean': W_k = Σw/N (size-invariant per-Gaussian quality).
     W is normalized by w_norm before return.
     """
     num_tiles = len(tile_index_offsets) - 1
@@ -233,10 +231,7 @@ def compute_tile_weights_and_counts(tile_index_offsets, tile_flat_indices, w_gi,
         seg_ids = _make_seg_ids(num_tiles, sizes, w_gi.device)
         W_k.scatter_add_(0, seg_ids, w_gi[tile_flat_indices])
 
-    if w_mode == "mean":
-        W_k = W_k / sizes.float().clamp(min=1).to(W_k.device)
-
-    return normalize_term(W_k, w_norm), N_k 
+    return normalize_term(W_k, w_norm), N_k
 
 
 def _voxelize(pts_n, w, seg_ids, num_tiles, voxel_n, device):

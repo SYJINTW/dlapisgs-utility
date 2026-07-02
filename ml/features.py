@@ -330,11 +330,11 @@ def build_group_b(tile_index_offsets_t: torch.Tensor,
 
     W_k_screen_t, _ = uc.compute_tile_weights_and_counts(
         tile_index_offsets_t, tile_flat_indices_t, w_screen,
-        w_norm="none", c_norm="none", w_mode="sum",
+        w_norm="none", c_norm="none",
     )
     W_k_vol_d2_t, _ = uc.compute_tile_weights_and_counts(
         tile_index_offsets_t, tile_flat_indices_t, w_vol_d2,
-        w_norm="none", c_norm="none", w_mode="sum",
+        w_norm="none", c_norm="none",
     )
 
     wbar_k_screen = (W_k_screen_t / safe_n).cpu().numpy()

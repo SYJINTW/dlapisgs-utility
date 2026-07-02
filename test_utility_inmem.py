@@ -374,7 +374,7 @@ def _rerender_rep_views(
             args.weight_mode, args.img_w, args.img_h)
         W_k, N_k = uc.compute_tile_weights_and_counts(
             tile_index_offsets, tile_flat_indices, w_gi,
-            w_norm=args.w_norm, c_norm=args.c_norm, w_mode=args.w_mode)
+            w_norm=args.w_norm, c_norm=args.c_norm)
 
         needed_schemes = {sc for _, sc in rep_by_cam[camera_index]}
         needs_c = any(s in ("vd_lod_c", "vd_lod_w_c") for s in needed_schemes)
@@ -489,7 +489,6 @@ def main() -> None:
     parser.add_argument("--c-norm", type=str, default="sum", choices=list(uc.NORM_MODES),
                         help="C_k normalization. NOTE: C term unused by canonical schemes "
                              "(vd_lod_w/ml/oracle_loo); only active for vd_lod_c/vd_lod_w_c.")
-    parser.add_argument("--w-mode", type=str, default="sum", choices=list(uc.W_MODES))
     parser.add_argument("--c-kind", type=str, default="count",
                         choices=list(uc.COMPLEXITY_KINDS) + ["count"],
                         help="C_k complexity signal. NOTE: C term unused by canonical schemes "
@@ -905,7 +904,7 @@ def main() -> None:
         with _timed("tile_weights", timings, camera=camera_index):
             W_k, N_k = uc.compute_tile_weights_and_counts(
                 tile_index_offsets, tile_flat_indices, w_gi,
-                w_norm=args.w_norm, c_norm=args.c_norm, w_mode=args.w_mode,
+                w_norm=args.w_norm, c_norm=args.c_norm,
             )
 
         needs_c = any(s in ("vd_lod_c", "vd_lod_w_c") for s in scheme_list)

@@ -1,12 +1,14 @@
 """Tile-utility scoring for view-conditioned 3DGS streaming.
 
-Computes U(k, l) = log(β·(l+1)) · (v_k / d_k) [· W_k] [· C_k] for each
-(tile, LOD-level) pair and returns them sorted by descending priority.
-
 Sub-components:
-  - Gaussian weights  : per-Gaussian saliency (volume, screen area, …)
+  - Gaussian weights  : per-Gaussian saliency (volume, volume over d^2, screen area, …)
   - Tile aggregation  : W_k (weight sum/mean) and C_k (complexity) per tile
   - Utility scoring   : ranked (tile, lod) output consumed by the packing step
+
+[TODO] OOP refactor and make this a class, so that future implementtation
+of integrating this module into streaming testbed would be easier. 
+Currently, the module is a collection of functions with no state.
+(find, no need to be stateful, but a class would be more organized and easier to integrate)
 """
 
 import math
@@ -15,7 +17,7 @@ import numpy as np
 from pathlib import Path
 import sys
 
-WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
+WORKSPACE_ROOT = Path(__file__).resolve().parents[1] # [TODO] check if import path hack is okay
 sys.path.insert(0, str(WORKSPACE_ROOT / "Frustum-for-3DGS"))
 import visibility_AABB_pytorch
 sys.path.insert(0, str(WORKSPACE_ROOT / "GGSP"))
@@ -29,7 +31,8 @@ import tiling
 INVISIBLE_PRIORITY_EPS = 1e-2   # >0 to prevent invisible-tile starvation
 DISTANCE_EPS = 1e-3
 
-W_MODES = ("sum", "mean")
+W_MODES = ("sum", "mean") #[TODO] remove mean mode; it is not used in experiments 
+                          # and is not a good idea for utility scoring
 WEIGHT_MODES = ("volume", "volume_over_d2", "screen_area", "random")
 NORM_MODES = ("none", "max", "minmax", "log1p", "sum")
 
@@ -52,22 +55,6 @@ def _make_seg_ids(num_tiles, sizes, device):
     return torch.repeat_interleave(torch.arange(num_tiles, device=device), sizes)
 
 
-def _voxelize(pts_n, w, seg_ids, num_tiles, voxel_n, device):
-    """Scatter weighted GS positions into a (num_tiles, voxel_n³) occupancy grid."""
-    N3 = voxel_n ** 3
-    vox_ijk = (pts_n.clamp(0.0, 1.0 - 1e-6) * voxel_n).long()
-    vox_flat = (vox_ijk[:, 0] * voxel_n * voxel_n
-                + vox_ijk[:, 1] * voxel_n
-                + vox_ijk[:, 2])
-    occ = torch.zeros(num_tiles * N3, dtype=torch.float32, device=device)
-    occ.scatter_add_(0, seg_ids * N3 + vox_flat, w)
-    return occ.view(num_tiles, N3)
-
-
-def _compute_base_scores(visibility_mask_tensor, tile_distances_tensor):
-    """Per-tile score v_k / d_k; invisible tiles get INVISIBLE_PRIORITY_EPS instead of 1."""
-    vis_factor = torch.where(visibility_mask_tensor, 1.0, INVISIBLE_PRIORITY_EPS)
-    return vis_factor / (tile_distances_tensor + DISTANCE_EPS)
 
 
 def normalize_term(x, mode="none", eps=1e-12):
@@ -197,7 +184,7 @@ def compute_gaussian_weights_v2(weight_mode, *, opacity, scale_0, scale_1, scale
         d2 = ((_t(xyz, o_i.device) - _t(cam_center, o_i.device).unsqueeze(0)) ** 2).sum(dim=1).clamp(min=1e-6)
         return o_i * vol / d2
 
-    if weight_mode == "screen_area":
+    if weight_mode == "screen_area": # this is bottleneck, [TODO] check if we can accelerate this
         required = [rot_0, rot_1, rot_2, rot_3, xyz, world_view, proj, img_w, img_h]
         if any(r is None for r in required):
             raise ValueError("screen_area requires rot_0..rot_3, xyz, world_view, proj, img_w, img_h")
@@ -220,15 +207,15 @@ def compute_gaussian_weights_v2(weight_mode, *, opacity, scale_0, scale_1, scale
 
 def compute_tile_weights_and_counts(tile_index_offsets, tile_flat_indices, w_gi,
                                     w_norm="none", c_norm="max", w_mode="sum"):
-    """Compute W_k (aggregate Gaussian weight) and C_k (GS count) for all tiles.
+    """Compute W_k (aggregate Gaussian weight) and N_k (GS count) for all tiles.
 
     w_mode 'sum': W_k = Σw (scales with tile density).
     w_mode 'mean': W_k = Σw/N (size-invariant per-Gaussian quality).
-    Both outputs are normalized by w_norm / c_norm before return.
+    W is normalized by w_norm before return.
     """
     num_tiles = len(tile_index_offsets) - 1
     sizes = tile_index_offsets[1:] - tile_index_offsets[:-1]
-    C_k = sizes.float()
+    N_k = sizes.float()
 
     W_k = torch.zeros(num_tiles, dtype=torch.float32, device=w_gi.device)
     if tile_flat_indices.numel() > 0:
@@ -238,8 +225,19 @@ def compute_tile_weights_and_counts(tile_index_offsets, tile_flat_indices, w_gi,
     if w_mode == "mean":
         W_k = W_k / sizes.float().clamp(min=1).to(W_k.device)
 
-    return normalize_term(W_k, w_norm), normalize_term(C_k, c_norm)
+    return normalize_term(W_k, w_norm), N_k 
 
+
+def _voxelize(pts_n, w, seg_ids, num_tiles, voxel_n, device):
+    """Scatter weighted GS positions into a (num_tiles, voxel_n³) occupancy grid."""
+    N3 = voxel_n ** 3
+    vox_ijk = (pts_n.clamp(0.0, 1.0 - 1e-6) * voxel_n).long()
+    vox_flat = (vox_ijk[:, 0] * voxel_n * voxel_n
+                + vox_ijk[:, 1] * voxel_n
+                + vox_ijk[:, 2])
+    occ = torch.zeros(num_tiles * N3, dtype=torch.float32, device=device)
+    occ.scatter_add_(0, seg_ids * N3 + vox_flat, w)
+    return occ.view(num_tiles, N3)
 
 def compute_tile_complexity(c_kind, tile_index_offsets, tile_flat_indices,
                             w_gi, xyz, *, min_corners, max_corners,
@@ -252,6 +250,8 @@ def compute_tile_complexity(c_kind, tile_index_offsets, tile_flat_indices,
       voxel_entropy  : entropy of weighted voxel occupancy (voxel_n³ grid)
       spectral_energy: fraction of voxel-FFT power above COMPLEXITY_SPECTRAL_FC cycles
     Tiles with fewer than sparse_guard Gaussians get 0 (statistics unreliable).
+    
+    Experiment showed that C_k term is not very useful for utility scoring, but it is included here for completeness and future experimentation.
     """
     if c_kind not in COMPLEXITY_KINDS:
         raise ValueError(f"unknown c_kind '{c_kind}'; valid: {COMPLEXITY_KINDS}")
@@ -362,18 +362,12 @@ def calculate_utility_param(
     scores = torch.ones_like(tile_distances_tensor)
     if include_v:
         scores = scores * torch.where(visibility_mask_tensor, 1.0, INVISIBLE_PRIORITY_EPS)
-    if include_d:
-        scores = scores / (tile_distances_tensor + DISTANCE_EPS)
     if include_w:
         scores = scores * weight_sum_tensor
     if include_c:
         scores = scores * complexity_tensor
+    if include_d: 
+        scores = scores / (tile_distances_tensor + DISTANCE_EPS)
+        # division by distance is last to avoid underflow
+        
     return scores.cpu().numpy()
-
-
-def calculate_utility_baseline(visibility_mask_tensor, tile_distances_tensor):
-    """Rank tiles by visibility/distance only (no LOD, weights, or complexity)."""
-    return calculate_utility_param(
-        visibility_mask_tensor, tile_distances_tensor,
-        num_of_level=1, include_lod=False,
-    )

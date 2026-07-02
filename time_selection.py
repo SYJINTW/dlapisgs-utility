@@ -243,7 +243,7 @@ def _time_method(
             with _timed("tile_weights", stages):
                 W_k, _ = uc.compute_tile_weights_and_counts(
                     tile_index_offsets, tile_flat_indices, w_gi,
-                    w_norm="sum", c_norm="sum", w_mode="sum")
+                    w_norm="sum", c_norm="sum")
 
             with _timed("utility", stages):
                 raw = uc.calculate_utility_param(
@@ -316,10 +316,23 @@ def _time_method(
         elif method == "oracle_online":
             rend_cam = rend_cameras[ci]
 
+            with _timed("visibility", stages):
+                vis = visibility_AABB_pytorch.batched_check_tiles_visible(
+                    min_corners_t, max_corners_t, cam, device=device)
+            np_vis = vis.cpu().numpy() if hasattr(vis, "cpu") else np.asarray(vis)
+
             with _timed("full_render", stages):
                 R_full = sc.render_gs(rend_gs_full, rend_cam, white_bg=False).detach()
 
             n_tiles = len(index_offsets) - 1
+            # perf 2026-07-02: previously LOO-rendered every non-empty tile in the scene
+            # grid (233/147 for chair/bicycle, PLAN.md item vii) -- the full grid, not a
+            # camera-visible subset, unlike every other method here. Now culls to the
+            # visible subset first (same cheap call vd_lod/heuristic already pay above).
+            # Invisible tiles keep the -inf placeholder -- matches the "no signal" floor
+            # selection_core.oracle_scores() already uses for missing/non-finite tiles;
+            # -inf only affects sort order, all tiles still get selected once budget
+            # saturates, so 100%-budget identity is unaffected.
             scores = np.full(n_tiles, -np.inf, dtype=np.float64)
             tile_render_t = 0.0
             n_scored = 0
@@ -327,7 +340,8 @@ def _time_method(
             for tile_idx in range(n_tiles):
                 start = int(index_offsets[tile_idx])
                 end   = int(index_offsets[tile_idx + 1])
-                if end == start:
+                if end == start or not np_vis[tile_idx]:
+                    # Skip empty tiles and invisible tiles
                     continue
                 gs_idx = tile_flat_indices[start:end]
 
@@ -426,6 +440,7 @@ def main() -> None:
     # --- Load tiling cache ---
     print("Loading tiling cache...", flush=True)
     tc = np.load(str(tiling_path))
+    cache_grid_shape = tc["grid_shape"].tolist() if "grid_shape" in tc else [8, 8, 8]
     min_corners   = tc["min_corners"].astype(np.float32)
     max_corners   = tc["max_corners"].astype(np.float32)
     index_offsets = tc["index_offsets"].astype(np.int64)
@@ -546,7 +561,7 @@ def main() -> None:
         "bpg":            int(bytes_per_gaussian),
         "n_tiles":        int(n_tiles),
         "timestamp":      datetime.datetime.now().isoformat(timespec="seconds"),
-        "grid_shape":     [8, 8, 8],
+        "grid_shape":     cache_grid_shape,
     }
 
     # --- Run each method ---

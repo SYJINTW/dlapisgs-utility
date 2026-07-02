@@ -94,6 +94,7 @@ from oracle_dq import (  # noqa: E402
     iter_tile_member_indices,
     load_tiling,
     n_gs_per_tile as _n_gs_per_tile,
+    ply_fingerprint,
     write_long_csv,
 )
 
@@ -293,6 +294,27 @@ def main() -> None:
         snaps = _snapshot_gaussians(g)
     n_total = int(g.get_xyz.shape[0])
     logger.info("Scene loaded: N_total={} GS", n_total)
+
+    if tiling.get("n_gs") is not None:
+        _xyz_np = g.get_xyz.detach().cpu().numpy()
+        _active_n_gs, _active_sha1 = ply_fingerprint(
+            _xyz_np[:, 0], _xyz_np[:, 1], _xyz_np[:, 2])
+        if tiling["n_gs"] != _active_n_gs:
+            raise ValueError(
+                f"--tiling-cache {args.tiling_cache} was built from a PLY with "
+                f"{tiling['n_gs']} Gaussians, but --ply {args.ply} has {_active_n_gs}. "
+                "Regenerate the tiling cache or point --ply at the right scene."
+            )
+        if tiling["xyz_sha1"] != _active_sha1:
+            raise ValueError(
+                f"--tiling-cache {args.tiling_cache} was built from a different PLY "
+                f"(same Gaussian count, different xyz content) than --ply {args.ply}. "
+                "Regenerate the tiling cache."
+            )
+    else:
+        logger.warning(
+            "--tiling-cache {} has no PLY fingerprint (pre-fix cache) -- "
+            "skipping PLY/tiling identity check.", args.tiling_cache)
 
     # --- full-scene reference renders (kept on CPU at float32) --------------
     logger.info("Rendering R_full(c) for {} cameras...", n_cams)

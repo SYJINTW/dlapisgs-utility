@@ -9,12 +9,30 @@ Oracle delta Q(tile)
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
 import numpy as np
+
+
+# --- PLY identity fingerprint -------------------------------------------------
+
+def ply_fingerprint(x, y, z) -> tuple[int, str]:
+    """(n_gs, sha1_hex) identity fingerprint for a PLY's Gaussian positions.
+
+    Used to bind a tiling cache / oracle artifact to the exact PLY it was built
+    from -- catches silent reuse of a stale cache after the source PLY changes
+    (retrain, re-densify) even when the Gaussian count coincidentally matches.
+    """
+    xyz = np.stack([np.asarray(x, dtype=np.float32),
+                    np.asarray(y, dtype=np.float32),
+                    np.asarray(z, dtype=np.float32)], axis=1)
+    n_gs = int(xyz.shape[0])
+    sha1 = hashlib.sha1(np.ascontiguousarray(xyz).tobytes()).hexdigest()
+    return n_gs, sha1
 
 
 # --- tiling loader -----------------------------------------------------------
@@ -28,6 +46,8 @@ def load_tiling(npz_path: str | Path) -> dict[str, np.ndarray]:
       - min_corners   (N_tiles, 3) float32  (passed through for traceability)
       - max_corners   (N_tiles, 3) float32
       - n_tiles       int
+      - n_gs          int or None    (PLY identity fingerprint, if cache has it)
+      - xyz_sha1      str or None    (PLY identity fingerprint, if cache has it)
 
     Note: cache schema produced by test_utility.py omits the `tile_keys`
     column that `GGSP/tiling.py` would normally save. Min/max corners
@@ -41,6 +61,8 @@ def load_tiling(npz_path: str | Path) -> dict[str, np.ndarray]:
         "max_corners": data["max_corners"].astype(np.float32, copy=False),
     }
     out["n_tiles"] = int(out["index_offsets"].shape[0] - 1)
+    out["n_gs"] = int(data["n_gs"]) if "n_gs" in data else None
+    out["xyz_sha1"] = str(data["xyz_sha1"]) if "xyz_sha1" in data else None
     return out
 
 

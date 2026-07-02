@@ -54,6 +54,7 @@ for _p in (
     WORKSPACE / "GGSP",
     WORKSPACE / "GS-Interface",
     HERE,
+    HERE / "experiments",
 ):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
@@ -63,6 +64,7 @@ import utility_calculation as uc  # noqa: E402
 import io_3dgs  # noqa: E402
 import selection_core as sc  # noqa: E402
 from ml import predict as ml_predict, features as ml_features  # noqa: E402
+from oracle_dq import ply_fingerprint  # noqa: E402
 
 from streaming_utils.camera_loader import load_camera_from_streaming_config  # noqa: E402  # type: ignore
 
@@ -431,6 +433,9 @@ def main() -> None:
     n_tiles       = len(index_offsets) - 1
     n_gs_per_tile = (index_offsets[1:] - index_offsets[:-1]).astype(np.int64)
     print(f"  tiles={n_tiles}", flush=True)
+    # PLY identity fingerprint (if cache has one) -- validated below once sel_gs loads.
+    _cached_n_gs  = int(tc["n_gs"]) if "n_gs" in tc else None
+    _cached_sha1  = str(tc["xyz_sha1"]) if "xyz_sha1" in tc else None
 
     min_corners_t      = torch.tensor(min_corners, dtype=torch.float32, device=device)
     max_corners_t      = torch.tensor(max_corners, dtype=torch.float32, device=device)
@@ -444,6 +449,25 @@ def main() -> None:
     bytes_per_gaussian = sc.bytes_per_gaussian(sel_gs)
     n_total_gs = len(sel_gs.data["x"]["data"])
     print(f"  n_gs={n_total_gs}  bpg={bytes_per_gaussian}", flush=True)
+
+    if _cached_n_gs is not None:
+        _active_n_gs, _active_sha1 = ply_fingerprint(
+            sel_gs.data["x"]["data"], sel_gs.data["y"]["data"], sel_gs.data["z"]["data"])
+        if _cached_n_gs != _active_n_gs:
+            raise ValueError(
+                f"--tiling-cache {tiling_path} was built from a PLY with {_cached_n_gs} "
+                f"Gaussians, but --ply {ply_path} has {_active_n_gs}. Regenerate the "
+                "tiling cache or point --ply at the right scene."
+            )
+        if _cached_sha1 != _active_sha1:
+            raise ValueError(
+                f"--tiling-cache {tiling_path} was built from a different PLY (same "
+                f"Gaussian count, different xyz content) than --ply {ply_path}. "
+                "Regenerate the tiling cache."
+            )
+    else:
+        print(f"  WARNING: {tiling_path} has no PLY fingerprint (pre-fix cache) -- "
+              "skipping PLY/tiling identity check.", flush=True)
 
     opacity = sel_gs.data["opacity"]["data"]
     scale_0 = sel_gs.data["scale_0"]["data"]
@@ -492,7 +516,8 @@ def main() -> None:
     if "ml" in args.methods:
         print("Loading ML model...", flush=True)
         ml_model_path = Path(args.ml_model_dir)
-        ml_model = ml_predict.load_model(args.ml_model_dir, args.ml_model_type)
+        ml_model = ml_predict.load_model(args.ml_model_dir, args.ml_model_type,
+                                         expected_n_gs=n_total_gs)
         ml_feature_names = json.loads((ml_model_path / "feature_names.json").read_text())
         cache_path = ml_model_path / "feature_cache.npz"
         if cache_path.exists():
@@ -555,11 +580,14 @@ def main() -> None:
         )
 
         # --- Output dirs ---
-        # gs_order only varies ml/oracle_online; suffix only when non-default so existing
-        # single-config output paths (ply, the default) don't change.
-        dir_name = method
+        # ml's dir_name must encode model_type -- otherwise two --methods ml runs with
+        # different --ml-model-type against the same --output-root/--scene silently
+        # overwrite each other's output.
+        # gs_order only varies ml/oracle_online further; suffix only when non-default so
+        # existing single-config output paths (ply, the default) don't change.
+        dir_name = f"ml_{args.ml_model_type}" if method == "ml" else method
         if method in ("ml", "oracle_online") and args.gs_order == "weight":
-            dir_name = f"{method}_wtord"
+            dir_name = f"{dir_name}_wtord"
         out_dir = Path(args.output_root) / args.scene / dir_name
         out_dir.mkdir(parents=True, exist_ok=True)
 

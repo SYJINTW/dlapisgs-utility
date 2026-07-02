@@ -322,6 +322,14 @@ def train_scene(oracle_npz_path: str, output_dir: str, seed: int = 0,
     need_b = bool(feats_needed & set(GROUP_B_NAMES))
     need_f = bool(feats_needed & set(GROUP_F_NAMES))
 
+    # Scene identity, for the predict-time guard against pointing --ml-model-dir at the
+    # wrong scene (ml/predict.py::load_model's expected_n_gs check) -- read directly from
+    # the oracle npz's gen_meta (same 2-line read static_cache_from_oracle does internally,
+    # ml/features.py:241-245) rather than threading a new return value through it.
+    _oracle_meta = json.loads(str(np.load(str(oracle_npz_path), allow_pickle=True)["gen_meta"].item()))
+    source_ply = _oracle_meta.get("scene_ply")
+    source_ply_n_gs = _oracle_meta.get("n_total_gs")
+
     print(f"\n{'='*60}", flush=True)
     print(f"Building feature matrix from: {oracle_npz_path} "
           f"(need_b={need_b} need_f={need_f})", flush=True)
@@ -431,6 +439,8 @@ def train_scene(oracle_npz_path: str, output_dir: str, seed: int = 0,
             "seed":           seed,
             "include_group_b": include_b,
             "include_group_d": include_d,
+            "source_ply":       source_ply,
+            "source_ply_n_gs":  source_ply_n_gs,
         }
         for model, s in cv_stats.items():
             metrics[model] = {**s, "rho_train_full": rho_train_full.get(model)}

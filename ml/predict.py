@@ -10,12 +10,13 @@ v_k is in Group A so the model learns visibility importance end-to-end.
 
 import json
 from pathlib import Path
+from typing import Optional
 
 import joblib
 import numpy as np
 
 
-def load_model(model_dir: str, model_type: str):
+def load_model(model_dir: str, model_type: str, expected_n_gs: Optional[int] = None):
     """Load a trained model once (startup, not the per-camera hot path) and force
     single-thread predict. Callers pass the returned object into predict_utility's
     model= kwarg so every camera call reuses it instead of reloading/repatching.
@@ -26,6 +27,13 @@ def load_model(model_dir: str, model_type: str):
     which never reads self.n_jobs (thread count is baked in at train time). Not currently
     a measurable stall for XGB (OpenMP pools persist across calls), so left in place but
     don't rely on this for XGB single-threading.
+
+    expected_n_gs, if given, is cross-checked against metrics.json's source_ply_n_gs
+    (written by ml/train.py at train time) -- catches pointing --ml-model-dir at the
+    wrong scene's directory, which otherwise silently applies one scene's learned splits
+    to another scene's correctly-computed features (feature names are scene-agnostic, so
+    nothing else raises). Models saved before this check existed (no metrics.json, or no
+    source_ply_n_gs field) skip the check with a warning, not a hard failure.
     """
     model_pkl = Path(model_dir) / f"{model_type}.pkl"
     if not model_pkl.exists():
@@ -33,6 +41,23 @@ def load_model(model_dir: str, model_type: str):
             f"Model not found: {model_pkl}. "
             f"Train first with: python ml/train.py --oracle-npz <path> --output-dir <dir>"
         )
+    if expected_n_gs is not None:
+        metrics_path = Path(model_dir) / "metrics.json"
+        if metrics_path.exists():
+            trained_n_gs = json.loads(metrics_path.read_text()).get("source_ply_n_gs")
+            if trained_n_gs is not None and trained_n_gs != expected_n_gs:
+                raise ValueError(
+                    f"Model at {model_dir} was trained on a PLY with {trained_n_gs} "
+                    f"Gaussians, but the current scene has {expected_n_gs}. "
+                    "Wrong --ml-model-dir for this scene?"
+                )
+            elif trained_n_gs is None:
+                print(f"[ml] {metrics_path} has no source_ply_n_gs -- skipping "
+                      "scene-identity check (model trained before this check existed).",
+                      flush=True)
+        else:
+            print(f"[ml] no metrics.json at {model_dir} -- skipping scene-identity "
+                  "check (model trained before this check existed).", flush=True)
     model = joblib.load(model_pkl)
     if hasattr(model, "n_jobs"):
         model.n_jobs = 1

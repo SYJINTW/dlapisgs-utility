@@ -51,6 +51,7 @@ WORKSPACE = HERE.parent
 sys.path.insert(0, str(WORKSPACE / "Frustum-for-3DGS"))
 sys.path.insert(0, str(WORKSPACE / "GGSP"))
 sys.path.insert(0, str(WORKSPACE / "GS-Interface"))
+sys.path.insert(0, str(HERE / "experiments"))
 
 import visibility_AABB_pytorch  # noqa: E402
 import tiling as ggsp_tiling  # noqa: E402
@@ -58,6 +59,7 @@ import utility_calculation as uc  # noqa: E402
 import io_3dgs  # noqa: E402  # pyright: ignore[reportMissingImports]
 from ml import predict as ml_predict, features as ml_features  # noqa: E402
 import selection_core as sc  # noqa: E402
+from oracle_dq import ply_fingerprint  # noqa: E402
 
 # Greedy/weight/render helpers live in selection_core.py (shared with time_selection.py, which
 # had near-duplicate copies). Aliased under the old names so every call site below is
@@ -582,14 +584,6 @@ def main() -> None:
         if not p.exists():
             raise FileNotFoundError(p)
 
-    # Load ML model at startup (fail fast, not at render time). load_model() also forces
-    # n_jobs=1 for realtime predict -- see its docstring for why (real for RandomForest,
-    # no-op for XGBoost) instead of restating that here.
-    _ml_model = None
-    if "ml" in scheme_list:
-        with _timed("ml_model_load", []):
-            _ml_model = ml_predict.load_model(args.ml_model_dir, args.ml_model_type)
-
     base_output_path = Path(args.output_root)
     log_path = base_output_path / "utility.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -615,6 +609,17 @@ def main() -> None:
     with _timed("ply_load_selection", timings):
         sel_gs = io_3dgs.GaussianModelV2(str(ply_path))
 
+    # Load ML model at startup (fail fast, not at render time). load_model() also forces
+    # n_jobs=1 for realtime predict -- see its docstring for why (real for RandomForest,
+    # no-op for XGBoost) instead of restating that here. Moved here (after sel_gs load,
+    # was before it) so expected_n_gs is available for the scene-identity check.
+    _ml_model = None
+    if "ml" in scheme_list:
+        with _timed("ml_model_load", []):
+            _ml_model = ml_predict.load_model(
+                args.ml_model_dir, args.ml_model_type,
+                expected_n_gs=len(sel_gs.data["x"]["data"]))
+
     # --- Load renderer model (GaussianModel, GPU tensors) ---
     with _timed("ply_load_renderer", timings):
         rend_gs_full = GaussianModel(args.sh_degree)
@@ -634,6 +639,26 @@ def main() -> None:
                     f"--tiling-cache was built with grid_shape={_cached_grid} "
                     f"but --grid-shape={_req_grid}. Use a different cache path."
                 )
+            if "n_gs" in _tc:
+                _cached_n_gs, _cached_sha1 = int(_tc["n_gs"]), str(_tc["xyz_sha1"])
+                _active_n_gs, _active_sha1 = ply_fingerprint(
+                    sel_gs.data["x"]["data"], sel_gs.data["y"]["data"], sel_gs.data["z"]["data"])
+                if _cached_n_gs != _active_n_gs:
+                    raise ValueError(
+                        f"--tiling-cache {tiling_cache_path} was built from a PLY with "
+                        f"{_cached_n_gs} Gaussians, but --ply {ply_path} has {_active_n_gs}. "
+                        "Regenerate the tiling cache or point --ply at the right scene."
+                    )
+                if _cached_sha1 != _active_sha1:
+                    raise ValueError(
+                        f"--tiling-cache {tiling_cache_path} was built from a different PLY "
+                        f"(same Gaussian count, different xyz content) than --ply {ply_path}. "
+                        "Regenerate the tiling cache."
+                    )
+            else:
+                logger.warning(
+                    "--tiling-cache {} has no PLY fingerprint (pre-fix cache) -- "
+                    "skipping PLY/tiling identity check.", tiling_cache_path)
             min_corners = _tc["min_corners"]
             max_corners = _tc["max_corners"]
             index_offsets = _tc["index_offsets"]
@@ -647,10 +672,13 @@ def main() -> None:
                 _build_tile_arrays(tile_aabbs, tile_indices, layer_idx=0)
         if tiling_cache_path is not None:
             tiling_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            _n_gs, _xyz_sha1 = ply_fingerprint(
+                sel_gs.data["x"]["data"], sel_gs.data["y"]["data"], sel_gs.data["z"]["data"])
             np.savez(str(tiling_cache_path),
                      min_corners=min_corners, max_corners=max_corners,
                      index_offsets=index_offsets, flat_indices=flat_indices,
-                     grid_shape=np.array(args.grid_shape, dtype=np.int32))
+                     grid_shape=np.array(args.grid_shape, dtype=np.int32),
+                     n_gs=np.int64(_n_gs), xyz_sha1=_xyz_sha1)
 
     min_corners_t = torch.tensor(min_corners, dtype=torch.float32, device=device)
     max_corners_t = torch.tensor(max_corners, dtype=torch.float32, device=device)

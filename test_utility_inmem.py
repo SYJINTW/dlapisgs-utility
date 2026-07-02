@@ -38,7 +38,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-import joblib
 import numpy as np
 import torch
 import yaml
@@ -60,11 +59,10 @@ import io_3dgs  # noqa: E402  # pyright: ignore[reportMissingImports]
 from ml import predict as ml_predict, features as ml_features  # noqa: E402
 import selection_core as sc  # noqa: E402
 
-# perf 2026-07-02: greedy/weight/render helpers moved to selection_core.py (shared with
-# experiments/0628/time_selection.py, which had near-duplicate copies). Aliased under the old
-# names so every call site below is unchanged -- only the definitions moved. _greedy_order in
-# particular is now the batched-lexsort version (was a per-tile Python loop with .cpu().numpy()
-# inside the loop; identity-checked against the old loop before the switch, see PLAN.md).
+# Greedy/weight/render helpers live in selection_core.py (shared with time_selection.py, which
+# had near-duplicate copies). Aliased under the old names so every call site below is
+# unchanged -- only the definitions moved. See selection_core.py::greedy_order's own docstring
+# for its current implementation and perf history -- don't restate it here, it'll go stale.
 _bytes_per_gaussian       = sc.bytes_per_gaussian
 _compute_camera_weights   = sc.compute_camera_weights
 _greedy_order_progressive = sc.greedy_order_progressive
@@ -584,26 +582,13 @@ def main() -> None:
         if not p.exists():
             raise FileNotFoundError(p)
 
-    # Validate ML model path at startup (fail fast, not at render time)
+    # Load ML model at startup (fail fast, not at render time). load_model() also forces
+    # n_jobs=1 for realtime predict -- see its docstring for why (real for RandomForest,
+    # no-op for XGBoost) instead of restating that here.
     _ml_model = None
     if "ml" in scheme_list:
-        _ml_model_pkl = Path(args.ml_model_dir) / f"{args.ml_model_type}.pkl"
-        if not _ml_model_pkl.exists():
-            raise FileNotFoundError(f"ML model not found: {_ml_model_pkl}")
         with _timed("ml_model_load", []):
-            _ml_model = joblib.load(_ml_model_pkl)
-        # Per-frame inference is a tiny batch (~N_tiles rows). joblib n_jobs=-1
-        # (inherited from training) spins up a thread pool per predict call,
-        # adding ~100 ms of pure dispatch overhead that dwarfs the ~10-15 ms
-        # single-thread traversal. Force single-thread for realtime predict.
-        # perf 2026-07-02: this guard is REAL for sklearn RandomForest (predict threads
-        # through n_jobs every call) but a no-op for XGBoost's sklearn wrapper -- its
-        # predict() takes the inplace_predict fast path, which never reads self.n_jobs
-        # (thread count is whatever was baked in at training time). Not currently a
-        # measurable stall for XGB (OpenMP pools persist across calls, unlike joblib's),
-        # so left as-is; don't assume this line "fixes" XGB predict threading.
-        if hasattr(_ml_model, "n_jobs"):
-            _ml_model.n_jobs = 1
+            _ml_model = ml_predict.load_model(args.ml_model_dir, args.ml_model_type)
 
     base_output_path = Path(args.output_root)
     log_path = base_output_path / "utility.log"

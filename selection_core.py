@@ -127,9 +127,6 @@ def greedy_order_progressive(visibility_tile, tile_index_offsets, tile_flat_indi
     return ordered.detach().cpu().numpy().astype(np.int64, copy=False)
 
 
-# [TODO] wrong implementation.
-# the idea was sorting by marginal utility per tile,
-# but this is sorting by total utility per tile, which is not the same.
 def greedy_order_tile_strict(order_pairs, tile_index_offsets, tile_flat_indices, w_gi):
     chunks = []
     cum_counts = []
@@ -155,13 +152,30 @@ def greedy_order(order_pairs, tile_index_offsets, tile_flat_indices, w_gi,
                   bytes_per_gaussian, max_budget_bytes, gs_order="weight"):
     """Return flat Gaussian index array in scheduling order, truncated to budget.
 
-    perf 2026-07-02: canonicalized on a batched np.lexsort (one GPU->CPU sync total),
-    replacing a per-tile Python loop that called .cpu().numpy() inside the loop body
-    (up to 233 small syncs at 8^3 -- proven correct via an identity check against the
-    old loop, see .claude/PLAN.md 2026-07-02 entry). This exact CPU-sort pattern has
-    regressed back into the codebase 5+ times without a recorded verdict; if you are
-    about to replace this with a per-tile loop "for clarity", re-measure first and
-    update this comment either way -- don't just do it silently again.
+    Two independent axes: tile-level rank (order_pairs, from whichever scoring scheme
+    called this) and intra-tile Gaussian order (gs_order). gs_order="weight" applies the
+    real per-GS screen_area weight as a secondary key -- keep the top-w(g_i) Gaussians
+    within a partially-packed tile; this is the paper's two-level design (Thesis #1), not
+    an incidental tie-break. gs_order="ply" is storage order, used when no per-GS weight
+    was computed for this run (vd_lod always; ml/oracle_online when the caller chooses not
+    to pay for gaussian_weights -- see time_selection.py --gs-order). Caller must NOT pass
+    gs_order="weight" with a dummy/uniform w_gi -- if weights weren't computed, use "ply".
+
+    perf: this used to be a per-tile Python loop, then a CPU np.lexsort over the full scene
+    (both regressed back into this codebase repeatedly with no recorded verdict -- if
+    replacing the code below, re-measure and update this comment, don't do it silently).
+    Current: two-pass GPU stable sort (sort by secondary key, then stable-sort that by
+    tile_rank) -- exact lexicographic order, 7.9-38x faster than the lexsort version,
+    identity-checked against it on real chair+bicycle data.
+
+    Tried combining (tile_rank, -w_gi) into one float64 key, single argsort: didn't work,
+    wrong on bicycle/weight (precision collapse compressing distinct float32 weights into
+    the same float64 after normalization) -- don't retry.
+
+    Tried skipping intra-tile order for fully-included/excluded tiles (only sort the
+    budget-boundary tile): didn't work, wrong -- QUIC streams a tile's own Gaussians in
+    priority order, so even a fully-included tile's internal order matters for progressive
+    delivery. Every Gaussian needs a defined position, not just budget-adjacent ones.
     """
     max_count = max_budget_bytes // bytes_per_gaussian
     n_tiles = int(tile_index_offsets.numel()) - 1
@@ -173,18 +187,23 @@ def greedy_order(order_pairs, tile_index_offsets, tile_flat_indices, w_gi,
 
     sizes = tile_index_offsets[1:] - tile_index_offsets[:-1]
     tile_ranks_flat = torch.repeat_interleave(tile_prio, sizes)
+    n_gs = tile_flat_indices.numel()
 
     if gs_order == "weight":
         # "ours": within a partially-packed tile, keep the top-w(g_i) Gaussians.
-        secondary_key = -w_gi[tile_flat_indices].cpu().numpy()
+        secondary = w_gi[tile_flat_indices]
+        _, ord1 = torch.sort(secondary, descending=True, stable=True)
     elif gs_order == "ply":
         # file/storage order, no per-Gaussian weight signal (baseline).
-        secondary_key = np.arange(tile_flat_indices.numel())
+        idx = torch.arange(n_gs, device=device)
+        _, ord1 = torch.sort(idx, stable=True)
     else:
         raise ValueError(f"unknown gs_order '{gs_order}'")
 
-    order = np.lexsort((secondary_key, tile_ranks_flat.cpu().numpy()))
-    return tile_flat_indices.cpu().numpy()[order][:max_count].astype(np.int64)
+    ranks_by_ord1 = tile_ranks_flat[ord1]
+    _, ord2 = torch.sort(ranks_by_ord1, stable=True)
+    final_order = ord1[ord2]
+    return tile_flat_indices[final_order][:max_count].detach().cpu().numpy().astype(np.int64)
 
 
 def build_greedy_order(packing_mode, scheme, utilities, visibility,

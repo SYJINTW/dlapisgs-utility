@@ -19,7 +19,9 @@ shared with test_utility_inmem.py, instead of local duplicate copies. This scrip
 per-stage timing instrumentation and output format — that part stays script-specific.
 
 Output per method: {output_root}/{scene}/{method}/
-  params.yaml, timings.json, summary.csv
+  params.yaml, timings.json, summary.csv (per-camera timing), budgets.csv (per-camera x
+  budget_pct sizing -- selected_gaussians/used_bytes, no timing columns; budget adds no
+  extra cost, see selection_core.py::greedy_order docstring)
 
 Run in gaussian_splatting conda env:
   CUDA_VISIBLE_DEVICES=2 conda run -n gaussian_splatting \\
@@ -41,7 +43,6 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-import joblib
 import numpy as np
 import torch
 import yaml
@@ -87,12 +88,17 @@ ALL_STAGE_COLS = [
     "ml_group_a", "ml_predict", "full_render", "tile_renders", "greedy",
 ]
 
+# summary.csv: one row per camera, pure timing (no budget dimension -- total_s is the cost
+# of computing the full-scene order once, budget doesn't change that, see selection_core.py).
 SUMMARY_COLS = (
-    ["scene", "budget_pct", "method", "camera_index",
-     "selected_gaussians", "used_bytes", "bytes_per_gaussian",
-     "total_s"]
+    ["scene", "method", "camera_index", "bytes_per_gaussian", "total_s"]
     + [f"{s}_s" for s in ALL_STAGE_COLS]
 )
+
+# budgets.csv: one row per camera x budget_pct, pure sizing -- no timing columns, so it can't
+# be mistaken for 150x8 independent timing samples.
+BUDGET_COLS = ["scene", "method", "camera_index", "budget_pct",
+               "selected_gaussians", "used_bytes"]
 
 
 # ---------------------------------------------------------------------------
@@ -208,9 +214,16 @@ def _time_method(
                 order_pairs = sc.sort_tiles(raw, n_gs_per_tile, bytes_per_gaussian, "marginal")
 
             with _timed("greedy", stages):
-                w_ones = torch.ones(n_total_gs, device=device)
+                # perf 2026-07-02: vd_lod never computes gaussian_weights (no W_k signal,
+                # canonical convention per run_exp2.sh) -- gs_order="ply" skips the
+                # w_gi[tile_flat_indices].cpu() pull entirely. Previously passed a full
+                # n_total_gs torch.ones() as a "weight" with implicit gs_order="weight" --
+                # same selection (all keys tied -> lexsort falls back to storage order
+                # anyway) but paid the full-scene GPU->CPU transfer for nothing.
+                w_dummy = torch.empty(0, device=device)
                 all_ordered = sc.greedy_order(order_pairs, tile_index_offsets, tile_flat_indices,
-                                              w_ones, bytes_per_gaussian, max_budget_bytes)
+                                              w_dummy, bytes_per_gaussian, max_budget_bytes,
+                                              gs_order="ply")
 
         # ── HEURISTIC (tile_partial, vd_lod_w, screen_area W_k) ─────────────
         elif method == "heuristic":
@@ -278,10 +291,24 @@ def _time_method(
                 ))
                 order_pairs = sc.sort_tiles(raw, n_gs_per_tile, bytes_per_gaussian, "marginal")
 
+            # perf 2026-07-02: ml's tile score never used W_k, but greedy previously still ran
+            # gs_order="weight" with a dummy uniform w_ones -- full GPU->CPU pull + meaningless
+            # sort. --gs-order makes this a real option: "ply" (default) skips gaussian_weights
+            # compute entirely; "weight" pays for real screen_area weights, measuring that cost
+            # for ml specifically (not what run_exp2.sh does today, but a real config to compare).
+            if args.gs_order == "weight":
+                with _timed("gaussian_weights", stages):
+                    w_gi = sc.compute_camera_weights(
+                        cam, opacity, scale_0, scale_1, scale_2,
+                        rot_0, rot_1, rot_2, rot_3, gs_xyz_t, device,
+                        "screen_area", args.img_w, args.img_h)
+            else:
+                w_gi = torch.empty(0, device=device)
+
             with _timed("greedy", stages):
-                w_ones = torch.ones(n_total_gs, device=device)
                 all_ordered = sc.greedy_order(order_pairs, tile_index_offsets, tile_flat_indices,
-                                              w_ones, bytes_per_gaussian, max_budget_bytes)
+                                              w_gi, bytes_per_gaussian, max_budget_bytes,
+                                              gs_order=args.gs_order)
 
         # ── ORACLE ONLINE (tile_partial, LOO via opacity-zero per tile) ───────
         elif method == "oracle_online":
@@ -317,11 +344,21 @@ def _time_method(
             stages["tile_renders"] = tile_render_t
             stages["n_tiles_scored"] = n_scored
 
+            # perf 2026-07-02: same gs_order coupling as ml above.
+            if args.gs_order == "weight":
+                with _timed("gaussian_weights", stages):
+                    w_gi = sc.compute_camera_weights(
+                        cam, opacity, scale_0, scale_1, scale_2,
+                        rot_0, rot_1, rot_2, rot_3, gs_xyz_t, device,
+                        "screen_area", args.img_w, args.img_h)
+            else:
+                w_gi = torch.empty(0, device=device)
+
             with _timed("greedy", stages):
                 order_pairs = sc.sort_tiles(scores, n_gs_per_tile, bytes_per_gaussian, "marginal")
-                w_ones = torch.ones(n_total_gs, device=device)
                 all_ordered = sc.greedy_order(order_pairs, tile_index_offsets, tile_flat_indices,
-                                              w_ones, bytes_per_gaussian, max_budget_bytes)
+                                              w_gi, bytes_per_gaussian, max_budget_bytes,
+                                              gs_order=args.gs_order)
 
         else:
             raise ValueError(f"Unknown method: {method}")
@@ -356,6 +393,14 @@ def main() -> None:
     parser.add_argument("--methods", nargs="+", required=True, choices=VALID_METHODS)
     parser.add_argument("--ml-model-dir", default=None)
     parser.add_argument("--ml-model-type", default="lgbm", choices=["rf", "lgbm", "xgb"])
+    parser.add_argument("--gs-order", default="ply", choices=["ply", "weight"],
+                        help="Intra-tile Gaussian order for ml/oracle_online. 'ply' (default) "
+                             "skips gaussian_weights compute entirely -- matches how these "
+                             "methods are actually deployed today (no W_k in their scoring). "
+                             "'weight' pays for real screen_area weights + sorts by them, for "
+                             "measuring the cost of that option. vd_lod always uses 'ply' "
+                             "(canonical convention, not user-selectable -- see run_exp2.sh). "
+                             "heuristic/progressive_* always use real weights, unaffected.")
     parser.add_argument("--budget-pct", nargs="+", type=int,
                         default=[10, 25, 40, 55, 70, 85, 99, 100])
     parser.add_argument("--camera-index",   type=int, default=-1)
@@ -447,15 +492,7 @@ def main() -> None:
     if "ml" in args.methods:
         print("Loading ML model...", flush=True)
         ml_model_path = Path(args.ml_model_dir)
-        ml_model = joblib.load(ml_model_path / f"{args.ml_model_type}.pkl")
-        # perf 2026-07-02: real fix for sklearn RandomForest (joblib n_jobs=-1 spins a thread
-        # pool per tiny-batch predict call, ~100ms dispatch overhead). No-op for XGBoost's
-        # sklearn wrapper -- its predict() takes the inplace_predict path, which never reads
-        # self.n_jobs (threading is baked in at train time). Not a measurable stall for XGB
-        # today (OpenMP pools persist across calls), so left in place but don't rely on this
-        # line for XGB single-threading.
-        if hasattr(ml_model, "n_jobs"):
-            ml_model.n_jobs = 1
+        ml_model = ml_predict.load_model(args.ml_model_dir, args.ml_model_type)
         ml_feature_names = json.loads((ml_model_path / "feature_names.json").read_text())
         cache_path = ml_model_path / "feature_cache.npz"
         if cache_path.exists():
@@ -474,6 +511,7 @@ def main() -> None:
         "methods":        args.methods,
         "ml_model_dir":   args.ml_model_dir,
         "ml_model_type":  args.ml_model_type,
+        "gs_order":       args.gs_order,
         "budget_pct":     args.budget_pct,
         "n_cameras_run":  len(camera_indices),
         "img_w":          args.img_w,
@@ -517,7 +555,12 @@ def main() -> None:
         )
 
         # --- Output dirs ---
-        out_dir = Path(args.output_root) / args.scene / method
+        # gs_order only varies ml/oracle_online; suffix only when non-default so existing
+        # single-config output paths (ply, the default) don't change.
+        dir_name = method
+        if method in ("ml", "oracle_online") and args.gs_order == "weight":
+            dir_name = f"{method}_wtord"
+        out_dir = Path(args.output_root) / args.scene / dir_name
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # params.yaml
@@ -544,12 +587,12 @@ def main() -> None:
 
         (out_dir / "timings.json").write_text(json.dumps(timings, indent=2))
 
-        # summary.csv — one row per (camera × budget_pct)
+        # summary.csv — one row per camera, pure timing, no budget duplication
         with open(out_dir / "summary.csv", "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=SUMMARY_COLS)
             writer.writeheader()
             for r in cam_results:
-                base = {
+                row = {
                     "scene":             args.scene,
                     "method":            method,
                     "camera_index":      r["camera"],
@@ -557,13 +600,23 @@ def main() -> None:
                     "total_s":           r["total_s"],
                 }
                 for stage in ALL_STAGE_COLS:
-                    base[f"{stage}_s"] = r["stages"].get(stage, "")
+                    row[f"{stage}_s"] = r["stages"].get(stage, "")
+                writer.writerow(row)
+
+        # budgets.csv — one row per (camera × budget_pct), sizing only, no timing columns
+        with open(out_dir / "budgets.csv", "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=BUDGET_COLS)
+            writer.writeheader()
+            for r in cam_results:
                 for b in r["budgets"]:
-                    row = {**base,
-                           "budget_pct":        b["budget_pct"],
-                           "selected_gaussians": b["selected_gaussians"],
-                           "used_bytes":         b["used_bytes"]}
-                    writer.writerow(row)
+                    writer.writerow({
+                        "scene":             args.scene,
+                        "method":            method,
+                        "camera_index":      r["camera"],
+                        "budget_pct":        b["budget_pct"],
+                        "selected_gaussians": b["selected_gaussians"],
+                        "used_bytes":         b["used_bytes"],
+                    })
 
         print(f"  saved: {out_dir}/", flush=True)
         print(f"  median={timings['median_s']*1000:.1f} ms  "

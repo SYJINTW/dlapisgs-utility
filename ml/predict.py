@@ -15,6 +15,30 @@ import joblib
 import numpy as np
 
 
+def load_model(model_dir: str, model_type: str):
+    """Load a trained model once (startup, not the per-camera hot path) and force
+    single-thread predict. Callers pass the returned object into predict_utility's
+    model= kwarg so every camera call reuses it instead of reloading/repatching.
+
+    n_jobs=1 is real for sklearn RandomForest (joblib n_jobs=-1 spins a thread pool per
+    tiny-batch predict call, ~100ms dispatch overhead vs ~10-15ms single-thread traversal).
+    No-op for XGBoost's sklearn wrapper -- its predict() takes the inplace_predict path,
+    which never reads self.n_jobs (thread count is baked in at train time). Not currently
+    a measurable stall for XGB (OpenMP pools persist across calls), so left in place but
+    don't rely on this for XGB single-threading.
+    """
+    model_pkl = Path(model_dir) / f"{model_type}.pkl"
+    if not model_pkl.exists():
+        raise FileNotFoundError(
+            f"Model not found: {model_pkl}. "
+            f"Train first with: python ml/train.py --oracle-npz <path> --output-dir <dir>"
+        )
+    model = joblib.load(model_pkl)
+    if hasattr(model, "n_jobs"):
+        model.n_jobs = 1
+    return model
+
+
 def predict_utility(
     model_dir: str,
     model_type: str,          # "lgbm" | "xgb" | "rf"

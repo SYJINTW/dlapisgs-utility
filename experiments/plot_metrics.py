@@ -23,7 +23,11 @@ import numpy as np
 _SCHEME_LABELS = {
     "vd_lod":          "VD+LOD (baseline)",
     "vd_lod_w":        "VD+LOD+W (ours)",
+    "v_lod_w":         "V+LOD+W (no distance)",
     "ml":              "ML (ours)",
+    "ml_rf":           "ML-RF",
+    "ml_lgbm":         "ML-LGBM",
+    "ml_xgb":          "ML-XGB",
     "prog_no_cull":    "Progressive (no cull, 1³)",
     "prog_culled":     "Progressive (culled, 8³)",
     "oracle_tp":       "Oracle tile_partial (8³)",
@@ -33,13 +37,15 @@ _SCHEME_LABELS = {
     "vd_lod_w_sa":     "VD+LOD+W (screen_area)",
     "vd_lod_w_vd2":    "VD+LOD+W (vol/d²)",
     "oracle_loo":      "Oracle-LOO (upper bound)",
+    "oracle_loo_ssim": "Oracle-LOO-SSIM (upper bound)",
     "oracle_aoi":      "Oracle-AOI",
     "oracle_combined": "Oracle-combined",
 }
 _SCHEME_ORDER = [
     "prog_no_cull", "prog_culled", "oracle_tp", "ml_tp",
-    "vd_lod", "vd_lod_w", "ml", "vd_lod_w_sa", "vd_lod_w_vd2", "vd_lod_c", "vd_lod_w_c",
-    "oracle_aoi", "oracle_combined", "oracle_loo",
+    "vd_lod", "vd_lod_w", "v_lod_w", "ml", "ml_rf", "ml_lgbm", "ml_xgb",
+    "vd_lod_w_sa", "vd_lod_w_vd2", "vd_lod_c", "vd_lod_w_c",
+    "oracle_aoi", "oracle_combined", "oracle_loo", "oracle_loo_ssim",
 ]
 _WEIGHT_MODE_ORDER  = ["det_gamma_over_d2", "volume", "volume_over_d2", "screen_area"]
 _WEIGHT_MODE_LABELS = {

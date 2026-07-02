@@ -3,20 +3,21 @@
 # Keeps the rendered PNG (LMG-style spot-check). Output under output/debug/.
 #
 # Usage:
-#   ./debug.sh <scene> [cam=0] [budget_pct=40] [grid=8] [packing=tile_strict] [scheme=vd_lod]
+#   ./debug.sh <scene> [cam=0] [budget_pct=40] [grid=8] [packing=tile_strict] [scheme=vd_lod] [gs_order=weight]
 # Examples:
 #   ./debug.sh chair                      # cam 0, 40%, 8³, tile_strict, vd_lod
 #   ./debug.sh chair 7 70 8 progressive   # progressive packing
 #   ./debug.sh chair 7 40 1 progressive   # no-cull (1³)
 #   ./debug.sh ship 12 25 8 tile_strict ml
+#   ./debug.sh chair 0 40 8 tile_partial vd_lod ply   # PLY-order baseline
 #
-# ml/oracle_loo schemes auto-wire their model-dir / oracle-npz if present.
+# ml/oracle_loo/oracle_loo_ssim schemes auto-wire their model-dir / oracle-npz if present.
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
-SCENE="${1:?usage: ./debug.sh <scene> [cam] [budget_pct] [grid] [packing] [scheme]}"
-CAM="${2:-0}"; BUD="${3:-40}"; GRID="${4:-8}"; PACK="${5:-tile_strict}"; SCHEME="${6:-vd_lod}"
+SCENE="${1:?usage: ./debug.sh <scene> [cam] [budget_pct] [grid] [packing] [scheme] [gs_order]}"
+CAM="${2:-0}"; BUD="${3:-40}"; GRID="${4:-8}"; PACK="${5:-tile_strict}"; SCHEME="${6:-vd_lod}"; GS_ORDER="${7:-weight}"
 ROOT="/mnt/data1/samk/gs-quic/cs5262_tile_quic"
 OUT="output/debug/${SCENE}_cam${CAM}_b${BUD}_g${GRID}_${PACK}_${SCHEME}"
 
@@ -29,11 +30,11 @@ esac
 [ -f "$PLY" ]   || { echo "no PLY: $PLY"; exit 1; }
 [ -f "$TRACE" ] || { echo "no trace: $TRACE"; exit 1; }
 
-EXTRA=""
-MODEL_DIR="ml/models_clean/${SCENE}/AC"
-ORACLE_NPZ="output/0527_clean/exp4_oracle_dq/eval/${SCENE}/oracle_dq.npz"
-[ "$SCHEME" = "ml" ]         && [ -d "$MODEL_DIR" ]   && EXTRA="$EXTRA --ml-model-dir $MODEL_DIR --ml-model-type rf"
-[ "$SCHEME" = "oracle_loo" ] && [ -f "$ORACLE_NPZ" ]  && EXTRA="$EXTRA --oracle-npz $ORACLE_NPZ"
+EXTRA="--gs-order $GS_ORDER"
+MODEL_DIR="output/ml_models/8/${SCENE}/AC"
+ORACLE_NPZ="output/oracle/8/eval/${SCENE}/oracle_dq.npz"
+[ "$SCHEME" = "ml" ]                                          && [ -d "$MODEL_DIR" ] && EXTRA="$EXTRA --ml-model-dir $MODEL_DIR --ml-model-type lgbm"
+{ [ "$SCHEME" = "oracle_loo" ] || [ "$SCHEME" = "oracle_loo_ssim" ]; } && [ -f "$ORACLE_NPZ" ] && EXTRA="$EXTRA --oracle-npz $ORACLE_NPZ"
 
 rm -rf "$OUT"; mkdir -p "$OUT"
 echo ">> select + render + metrics  $SCENE cam=$CAM budget=${BUD}% grid=${GRID}³ packing=$PACK scheme=$SCHEME"

@@ -794,7 +794,7 @@ def main() -> None:
     parser.add_argument("--tiling-cache", type=str, default=None)
 
     parser.add_argument("--ml-model-dir", type=str, default=None)
-    parser.add_argument("--ml-model-type", type=str, default="rf",
+    parser.add_argument("--ml-model-type", type=str, default="lgbm",
                         choices=["lgbm", "xgb", "rf"])
     parser.add_argument("--ml-feature-cache", type=str, default="auto",
                         choices=["auto", "off"],

@@ -157,6 +157,52 @@ def main():
                     s = d[split]
                     w.writerow([args.scene, m, split, s["rmse"], s["mae"], s["r2"], s["rho"]])
 
+    # save OOF predictions for later diagnostic use
+    import numpy as _np2
+    _oof_save = {"y_true": y}
+    for m in MODELS:
+        if m in oof:
+            _oof_save[f"{m}_oof"] = oof[m]
+    _np2.savez(str(out_dir / "oof_preds.npz"), **_oof_save)
+
+    # ── diagnostic: pred-vs-actual scatter + residual distribution ───────────
+    fig2, axes2 = plt.subplots(2, len(res), figsize=(5 * len(res), 9))
+    if len(res) == 1:
+        axes2 = axes2[:, None]
+    for ci, model in enumerate(res):
+        mask = np.isfinite(oof[model])
+        y_true = y[mask]
+        y_pred = oof[model][mask]
+        rho_val = res[model]["test"]["rho"]
+        r2_val = res[model]["test"]["r2"]
+        col = COLORS[model]
+
+        # top: pred vs actual
+        ax = axes2[0, ci]
+        ax.scatter(y_true, y_pred, s=4, alpha=0.25, color=col, rasterized=True)
+        lo, hi = min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())
+        ax.plot([lo, hi], [lo, hi], "k--", lw=1, alpha=0.6)
+        ax.set_xlabel("true log_mse_loo"); ax.set_ylabel("predicted (OOF)")
+        ax.set_title(f"{model.upper()}  ρ={rho_val:.3f}  R²={r2_val:.3f}")
+        ax.grid(alpha=0.2)
+
+        # bottom: residual histogram
+        ax = axes2[1, ci]
+        resid = y_pred - y_true
+        ax.hist(resid, bins=60, color=col, alpha=0.7, density=True)
+        ax.axvline(0, color="k", lw=1, ls="--")
+        ax.axvline(resid.mean(), color="red", lw=1, ls=":", label=f"mean={resid.mean():.2f}")
+        ax.set_xlabel("residual (pred − true)"); ax.set_ylabel("density")
+        ax.set_title(f"{model.upper()}  RMSE={res[model]['test']['rmse']:.3f}  MAE={res[model]['test']['mae']:.3f}")
+        ax.legend(fontsize=8); ax.grid(alpha=0.2)
+
+    fig2.suptitle(f"OOF diagnostics (test) — {args.scene}", fontsize=13)
+    fig2.tight_layout()
+    diag_out = out_dir / "oof_diagnostics.png"
+    fig2.savefig(str(diag_out), dpi=150)
+    plt.close(fig2)
+    print(f"[{args.scene}] saved {diag_out}", flush=True)
+
     # ── plot: train vs test bars for rho, R2, RMSE ──────────────────────────
     metr = [("rho", "Spearman ρ", True), ("r2", "R²", True), ("rmse", "RMSE", False)]
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.6))

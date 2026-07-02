@@ -105,9 +105,11 @@ def main():
     # --- PLY + bytes_per_gaussian ---
     print(f"[{args.scene}] loading PLY: {args.ply}")
     gs = io_3dgs.GaussianModelV2(args.ply)
-    bpg = int(np.sum([np.dtype(v["val_dtype"]).itemsize for v in gs.data.values()]))
+    bpg = sc.bytes_per_gaussian(gs)
     byte_k = (n_gs_per_tile * bpg).astype(np.float64)
     print(f"[{args.scene}] bytes_per_gaussian={bpg}")
+    gs_xyz = np.stack([gs.data["x"]["data"], gs.data["y"]["data"], gs.data["z"]["data"]], axis=1)
+    gs_xyz_t = torch.tensor(gs_xyz, dtype=torch.float32, device=device)
 
     # --- ML model + static features (loaded once, reused every camera) ---
     model_dir = Path(args.ml_model_dir)
@@ -147,10 +149,15 @@ def main():
         vis_np = visibility_t.float().cpu().numpy()
         dist_np = distances_t.cpu().numpy()
 
-        w_gi, _ = _screen_area_weights(gs, cam, device, args.img_w, args.img_h)
+        w_gi = sc.compute_camera_weights(
+            cam, gs.data["opacity"]["data"], gs.data["scale_0"]["data"],
+            gs.data["scale_1"]["data"], gs.data["scale_2"]["data"],
+            gs.data["rot_0"]["data"], gs.data["rot_1"]["data"],
+            gs.data["rot_2"]["data"], gs.data["rot_3"]["data"], gs_xyz_t, device,
+            "screen_area", args.img_w, args.img_h)
         W_k, N_k = uc.compute_tile_weights_and_counts(
             tile_index_offsets, tile_flat_indices, w_gi,
-            w_norm="none", c_norm="none", w_mode="sum")
+            w_norm="none", c_norm="none")
 
         cam_w2v = cam.world_view_transform.cpu().numpy()
         cam_center_np = cam.camera_center.cpu().numpy()

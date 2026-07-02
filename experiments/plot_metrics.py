@@ -173,7 +173,7 @@ def _data_ylim(values: list[float], metric: str) -> tuple[float, float]:
     lo, hi = min(vals), max(vals)
     if metric == "psnr":
         floor = max(0.0, np.floor((lo - 3) / 5) * 5)
-        ceil  = min(PSNR_SATURATION_DB * 1.05, max(PSNR_SATURATION_DB * 1.02, hi + 2))
+        ceil  = min(PSNR_SATURATION_DB * 1.05, max(PSNR_SATURATION_DB * 1.05, hi + 5))
         return floor, ceil
     floor = max(0.0, np.floor((lo - 0.03) * 20) / 20)
     return floor, min(1.005, hi + 0.02)

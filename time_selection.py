@@ -12,14 +12,20 @@ Methods:
   ml            — tile_partial, RF/LGBM/XGB predict; no gaussian_weights for scoring
   oracle_online — tile_partial, LOO computed live via opacity-zeroing per tile
 
+Relocated 2026-07-02 (was experiments/0628/time_selection.py) to repo root, alongside
+test_utility_inmem.py/utility_calculation.py — it's a main script, not a one-off. Selection
+logic (greedy packing, per-camera weights, render helpers) now imported from selection_core.py,
+shared with test_utility_inmem.py, instead of local duplicate copies. This script keeps its own
+per-stage timing instrumentation and output format — that part stays script-specific.
+
 Output per method: {output_root}/{scene}/{method}/
   params.yaml, timings.json, summary.csv
 
 Run in gaussian_splatting conda env:
   CUDA_VISIBLE_DEVICES=2 conda run -n gaussian_splatting \\
-    python experiments/0628/time_selection.py \\
+    python time_selection.py \\
     --ply <scene.ply> --tiling-cache <cache.npz> --camera-trace <eval.json> \\
-    --ml-model-dir output/0606/ml_models/<scene>/AC --ml-model-type rf \\
+    --ml-model-dir output/ml_models/8/<scene>/AC --ml-model-type rf \\
     --methods heuristic ml oracle_online --scene <scene> \\
     --output-root output/0628/selection_timing
 """
@@ -30,7 +36,6 @@ import csv
 import datetime
 import json
 import math
-import os
 import sys
 import time
 from contextlib import contextmanager
@@ -42,12 +47,12 @@ import torch
 import yaml
 
 HERE = Path(__file__).resolve().parent
-WORKSPACE = HERE.parents[2]
+WORKSPACE = HERE.parent
 for _p in (
     WORKSPACE / "Frustum-for-3DGS",
     WORKSPACE / "GGSP",
     WORKSPACE / "GS-Interface",
-    WORKSPACE / "dlapisgs-utility",
+    HERE,
 ):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
@@ -55,14 +60,9 @@ for _p in (
 import visibility_AABB_pytorch  # noqa: E402
 import utility_calculation as uc  # noqa: E402
 import io_3dgs  # noqa: E402
+import selection_core as sc  # noqa: E402
 from ml import predict as ml_predict, features as ml_features  # noqa: E402
 
-RENDERER_ROOT = WORKSPACE / "LapisGS-object-based-renderer"
-sys.path.insert(0, str(RENDERER_ROOT))
-_DUMMY = WORKSPACE / "exp-dataset" / "chair" / "predictions" / "color" / "test" / "r_0.png"
-os.environ.setdefault("LAPISGS_DUMMY_IMAGE", str(_DUMMY))
-
-from gaussian_renderer_lapisgs import GaussianModel, render as gs_render  # noqa: E402  # type: ignore
 from streaming_utils.camera_loader import load_camera_from_streaming_config  # noqa: E402  # type: ignore
 
 VALID_METHODS = [
@@ -95,16 +95,6 @@ SUMMARY_COLS = (
 )
 
 
-class _FakePipe:
-    convert_SHs_python = False
-    compute_cov3D_python = False
-    debug = False
-    antialiasing = False
-
-
-PIPELINE = _FakePipe()
-
-
 # ---------------------------------------------------------------------------
 # Timing context manager
 # ---------------------------------------------------------------------------
@@ -122,75 +112,6 @@ def _timed(name: str, store: dict):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _bytes_per_gaussian(sel_gs) -> int:
-    return int(np.sum([np.dtype(v["val_dtype"]).itemsize for v in sel_gs.data.values()]))
-
-
-def _compute_camera_weights(sel_cam, opacity, scale_0, scale_1, scale_2,
-                             rot_0, rot_1, rot_2, rot_3, gs_xyz_t, device,
-                             weight_mode: str, img_w: int, img_h: int):
-    cam_center = sel_cam.camera_center.to(device)
-    kw = dict(opacity=opacity, scale_0=scale_0, scale_1=scale_1, scale_2=scale_2,
-              xyz=gs_xyz_t, cam_center=cam_center)
-    if weight_mode == "screen_area":
-        kw.update(rot_0=rot_0, rot_1=rot_1, rot_2=rot_2, rot_3=rot_3,
-                  world_view=sel_cam.world_view_transform,
-                  proj=sel_cam.projection_matrix,
-                  img_w=img_w, img_h=img_h,
-                  fov_x=getattr(sel_cam, "FoVx", None),
-                  fov_y=getattr(sel_cam, "FoVy", None))
-    return uc.compute_gaussian_weights_v2(weight_mode, **kw).to(device)
-
-
-def _greedy_order_progressive(visibility, tile_index_offsets, tile_flat_indices,
-                               w_gi, bytes_per_gaussian: int, max_budget_bytes: int):
-    max_count = max_budget_bytes // bytes_per_gaussian
-    device = w_gi.device
-    vis = visibility.to(device=device, dtype=torch.bool)
-    sizes = tile_index_offsets[1:] - tile_index_offsets[:-1]
-    per_gs_vis = torch.repeat_interleave(vis, sizes)
-    if per_gs_vis.numel() == 0:
-        return np.empty(0, dtype=np.int64)
-    visible_gs   = tile_flat_indices[per_gs_vis]
-    invisible_gs = tile_flat_indices[~per_gs_vis]
-    visible_sorted   = visible_gs[torch.argsort(w_gi[visible_gs], descending=True)]
-    invisible_sorted = invisible_gs[torch.argsort(w_gi[invisible_gs], descending=True)]
-    if visible_sorted.numel() >= max_count:
-        return visible_sorted[:max_count].cpu().numpy().astype(np.int64)
-    remaining = max_count - int(visible_sorted.numel())
-    return torch.cat([visible_sorted, invisible_sorted[:remaining]]).cpu().numpy().astype(np.int64)
-
-
-def _greedy_order(order_pairs, tile_index_offsets, tile_flat_indices,
-                  w_gi, bytes_per_gaussian: int, max_budget_bytes: int):
-    max_count = max_budget_bytes // bytes_per_gaussian
-    n_tiles = int(tile_index_offsets.numel()) - 1
-    device = w_gi.device
-
-    # Assign priority rank to every tile (one scatter, no Python loop over tiles)
-    tile_prio = torch.zeros(n_tiles, dtype=torch.long, device=device)
-    tile_order_t = torch.as_tensor(order_pairs[:, 0], dtype=torch.long, device=device)
-    tile_prio[tile_order_t] = torch.arange(len(order_pairs), dtype=torch.long, device=device)
-
-    # Expand tile priority to per-GS in flat_indices order
-    sizes = tile_index_offsets[1:] - tile_index_offsets[:-1]
-    tile_ranks_flat = torch.repeat_interleave(tile_prio, sizes)  # (n_total_gs,)
-
-    w_flat = w_gi[tile_flat_indices].cpu().numpy()
-    order = np.lexsort((-w_flat, tile_ranks_flat.cpu().numpy()))
-    return tile_flat_indices.cpu().numpy()[order][:max_count].astype(np.int64)
-
-
-def _sort_tiles(raw_scores, n_gs_per_tile, bytes_per_gaussian: int, greedy_key: str):
-    if greedy_key == "marginal":
-        byte_k = np.where(n_gs_per_tile > 0, n_gs_per_tile * bytes_per_gaussian, 1.0)
-        scores = raw_scores / byte_k
-    else:
-        scores = raw_scores
-    order = np.argsort(-scores, kind="stable").astype(np.int64)
-    return np.stack([order, np.zeros(len(order), dtype=np.int64)], axis=1)
-
-
 def _budget_slices(all_ordered, budget_pcts, total_scene_bytes, bytes_per_gaussian):
     """Compute n_gs selected at each budget pct. Untimed — O(1) per budget."""
     slices = []
@@ -205,26 +126,6 @@ def _budget_slices(all_ordered, budget_pcts, total_scene_bytes, bytes_per_gaussi
     return slices
 
 
-def _render_gs(gaussians: GaussianModel, camera, white_bg: bool) -> torch.Tensor:
-    bg = [1, 1, 1] if white_bg else [0, 0, 0]
-    bg_color = torch.tensor(bg, dtype=torch.float32, device="cuda").view(3, 1, 1)
-    bg_color = bg_color.expand(3, camera.image_height, camera.image_width)
-    bg_depth = torch.zeros(1, camera.image_height, camera.image_width, device="cuda")
-    gs_res = torch.ones(len(gaussians.get_xyz), device="cuda")
-    with torch.no_grad():
-        result = gs_render(camera, gaussians, PIPELINE, bg_color, bg_depth, gs_res=gs_res)
-    return result["render"].clamp(0.0, 1.0)
-
-
-def _load_trace(trace_path: Path) -> list:
-    with open(trace_path) as f:
-        data = json.load(f)
-    angle_x = data["camera_angle_x"]
-    for frame in data["frames"]:
-        frame["camera_angle_x"] = angle_x
-    return data["frames"]
-
-
 # ---------------------------------------------------------------------------
 # Per-method timing
 # ---------------------------------------------------------------------------
@@ -235,7 +136,7 @@ def _time_method(
     sel_cameras,
     rend_cameras,
     sel_gs,
-    rend_gs_full: GaussianModel | None,
+    rend_gs_full,
     tile_index_offsets,    # torch.long
     tile_flat_indices,     # torch.long
     min_corners_t,
@@ -260,8 +161,11 @@ def _time_method(
 
     cam_results = []
     for ci in camera_indices:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # perf 2026-07-02: dropped the per-camera torch.cuda.empty_cache() that used to sit
+        # here. Measured with/without on bicycle (heaviest scene), method=heuristic, 10 cams:
+        # median 1645ms (without) vs 1552ms (with) -- no measurable difference, well inside
+        # the ~150-250ms per-camera run-to-run spread. Real deployment wouldn't call this
+        # every frame either. If you add it back, re-measure and update this note.
         stages: dict = {}
         cam = sel_cameras[ci]
         all_ordered: np.ndarray | None = None
@@ -276,13 +180,13 @@ def _time_method(
                 dists = uc.calculate_distances(tile_centers, cam.camera_center.to(device))
 
             with _timed("gaussian_weights", stages):
-                w_gi = _compute_camera_weights(
+                w_gi = sc.compute_camera_weights(
                     cam, opacity, scale_0, scale_1, scale_2,
                     rot_0, rot_1, rot_2, rot_3, gs_xyz_t, device,
-                    weight_mode=wm, img_w=args.img_w, img_h=args.img_h)
+                    wm, args.img_w, args.img_h)
 
             with _timed("greedy", stages):
-                all_ordered = _greedy_order_progressive(
+                all_ordered = sc.greedy_order_progressive(
                     vis, tile_index_offsets, tile_flat_indices,
                     w_gi, bytes_per_gaussian, max_budget_bytes)
 
@@ -301,12 +205,12 @@ def _time_method(
                 )
                 if hasattr(raw, "cpu"):
                     raw = raw.cpu().numpy()
-                order_pairs = _sort_tiles(raw, n_gs_per_tile, bytes_per_gaussian, "marginal")
+                order_pairs = sc.sort_tiles(raw, n_gs_per_tile, bytes_per_gaussian, "marginal")
 
             with _timed("greedy", stages):
                 w_ones = torch.ones(n_total_gs, device=device)
-                all_ordered = _greedy_order(order_pairs, tile_index_offsets, tile_flat_indices,
-                                            w_ones, bytes_per_gaussian, max_budget_bytes)
+                all_ordered = sc.greedy_order(order_pairs, tile_index_offsets, tile_flat_indices,
+                                              w_ones, bytes_per_gaussian, max_budget_bytes)
 
         # ── HEURISTIC (tile_partial, vd_lod_w, screen_area W_k) ─────────────
         elif method == "heuristic":
@@ -316,10 +220,10 @@ def _time_method(
                 dists = uc.calculate_distances(tile_centers, cam.camera_center.to(device))
 
             with _timed("gaussian_weights", stages):
-                w_gi = _compute_camera_weights(
+                w_gi = sc.compute_camera_weights(
                     cam, opacity, scale_0, scale_1, scale_2,
                     rot_0, rot_1, rot_2, rot_3, gs_xyz_t, device,
-                    weight_mode="screen_area", img_w=args.img_w, img_h=args.img_h)
+                    "screen_area", args.img_w, args.img_h)
 
             with _timed("tile_weights", stages):
                 W_k, _ = uc.compute_tile_weights_and_counts(
@@ -334,11 +238,11 @@ def _time_method(
                 )
                 if hasattr(raw, "cpu"):
                     raw = raw.cpu().numpy()
-                order_pairs = _sort_tiles(raw, n_gs_per_tile, bytes_per_gaussian, "marginal")
+                order_pairs = sc.sort_tiles(raw, n_gs_per_tile, bytes_per_gaussian, "marginal")
 
             with _timed("greedy", stages):
-                all_ordered = _greedy_order(order_pairs, tile_index_offsets, tile_flat_indices,
-                                            w_gi, bytes_per_gaussian, max_budget_bytes)
+                all_ordered = sc.greedy_order(order_pairs, tile_index_offsets, tile_flat_indices,
+                                              w_gi, bytes_per_gaussian, max_budget_bytes)
 
         # ── ML (tile_partial, group_a + model.predict — no gaussian_weights) ─
         elif method == "ml":
@@ -372,20 +276,19 @@ def _time_method(
                     feature_names=ml_feature_names,
                     model=ml_model,
                 ))
-                order_pairs = _sort_tiles(raw, n_gs_per_tile, bytes_per_gaussian, "marginal")
+                order_pairs = sc.sort_tiles(raw, n_gs_per_tile, bytes_per_gaussian, "marginal")
 
             with _timed("greedy", stages):
                 w_ones = torch.ones(n_total_gs, device=device)
-                all_ordered = _greedy_order(order_pairs, tile_index_offsets, tile_flat_indices,
-                                            w_ones, bytes_per_gaussian, max_budget_bytes)
+                all_ordered = sc.greedy_order(order_pairs, tile_index_offsets, tile_flat_indices,
+                                              w_ones, bytes_per_gaussian, max_budget_bytes)
 
         # ── ORACLE ONLINE (tile_partial, LOO via opacity-zero per tile) ───────
         elif method == "oracle_online":
             rend_cam = rend_cameras[ci]
-            w_gi = None  # intra-tile ordering uses w_ones in greedy
 
             with _timed("full_render", stages):
-                R_full = _render_gs(rend_gs_full, rend_cam, white_bg=False).detach()
+                R_full = sc.render_gs(rend_gs_full, rend_cam, white_bg=False).detach()
 
             n_tiles = len(index_offsets) - 1
             scores = np.full(n_tiles, -np.inf, dtype=np.float64)
@@ -404,7 +307,7 @@ def _time_method(
                 rend_gs_full._opacity.data[gs_idx] = -100.0
 
                 t0 = time.perf_counter()
-                R_k = _render_gs(rend_gs_full, rend_cam, white_bg=False)
+                R_k = sc.render_gs(rend_gs_full, rend_cam, white_bg=False)
                 scores[tile_idx] = float(((R_full - R_k) ** 2).mean().item())
                 tile_render_t += time.perf_counter() - t0
 
@@ -415,10 +318,10 @@ def _time_method(
             stages["n_tiles_scored"] = n_scored
 
             with _timed("greedy", stages):
-                order_pairs = _sort_tiles(scores, n_gs_per_tile, bytes_per_gaussian, "marginal")
+                order_pairs = sc.sort_tiles(scores, n_gs_per_tile, bytes_per_gaussian, "marginal")
                 w_ones = torch.ones(n_total_gs, device=device)
-                all_ordered = _greedy_order(order_pairs, tile_index_offsets, tile_flat_indices,
-                                            w_ones, bytes_per_gaussian, max_budget_bytes)
+                all_ordered = sc.greedy_order(order_pairs, tile_index_offsets, tile_flat_indices,
+                                              w_ones, bytes_per_gaussian, max_budget_bytes)
 
         else:
             raise ValueError(f"Unknown method: {method}")
@@ -452,7 +355,7 @@ def main() -> None:
     parser.add_argument("--camera-trace", required=True)
     parser.add_argument("--methods", nargs="+", required=True, choices=VALID_METHODS)
     parser.add_argument("--ml-model-dir", default=None)
-    parser.add_argument("--ml-model-type", default="rf", choices=["rf", "lgbm", "xgb"])
+    parser.add_argument("--ml-model-type", default="lgbm", choices=["rf", "lgbm", "xgb"])
     parser.add_argument("--budget-pct", nargs="+", type=int,
                         default=[10, 25, 40, 55, 70, 85, 99, 100])
     parser.add_argument("--camera-index",   type=int, default=-1)
@@ -493,7 +396,7 @@ def main() -> None:
     # --- Load selection PLY ---
     print("Loading selection PLY...", flush=True)
     sel_gs = io_3dgs.GaussianModelV2(str(ply_path))
-    bytes_per_gaussian = _bytes_per_gaussian(sel_gs)
+    bytes_per_gaussian = sc.bytes_per_gaussian(sel_gs)
     n_total_gs = len(sel_gs.data["x"]["data"])
     print(f"  n_gs={n_total_gs}  bpg={bytes_per_gaussian}", flush=True)
 
@@ -514,9 +417,9 @@ def main() -> None:
     rend_cameras = None
     if "oracle_online" in args.methods:
         print("Loading renderer PLY (oracle_online)...", flush=True)
-        rend_gs_full = GaussianModel(sh_degree=3)
+        rend_gs_full = sc.GaussianModel(sh_degree=3)
         rend_gs_full.load_ply(str(ply_path))
-        frames = _load_trace(trace_path)
+        frames = sc.load_trace(trace_path)
         rend_cameras = [
             load_camera_from_streaming_config(f, width=args.img_w, height=args.img_h)
             for f in frames
@@ -545,6 +448,12 @@ def main() -> None:
         print("Loading ML model...", flush=True)
         ml_model_path = Path(args.ml_model_dir)
         ml_model = joblib.load(ml_model_path / f"{args.ml_model_type}.pkl")
+        # perf 2026-07-02: real fix for sklearn RandomForest (joblib n_jobs=-1 spins a thread
+        # pool per tiny-batch predict call, ~100ms dispatch overhead). No-op for XGBoost's
+        # sklearn wrapper -- its predict() takes the inplace_predict path, which never reads
+        # self.n_jobs (threading is baked in at train time). Not a measurable stall for XGB
+        # today (OpenMP pools persist across calls), so left in place but don't rely on this
+        # line for XGB single-threading.
         if hasattr(ml_model, "n_jobs"):
             ml_model.n_jobs = 1
         ml_feature_names = json.loads((ml_model_path / "feature_names.json").read_text())

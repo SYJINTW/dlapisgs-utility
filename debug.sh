@@ -23,7 +23,7 @@ OUT="output/debug/${SCENE}_cam${CAM}_b${BUD}_g${GRID}_${PACK}_${SCHEME}"
 
 case "$SCENE" in
   bicycle) PLY="${ROOT}/exp-dataset/bicycle/point_cloud.ply"
-           TRACE="${ROOT}/exp-dataset/bicycle/sparse_views_100_eval.json" ;;
+           TRACE="${ROOT}/exp-dataset/bicycle/sparse_views_eval.json" ;;
   *)       PLY="${ROOT}/exp-dataset/${SCENE}/checkpoint/point_cloud/iteration_30000/point_cloud.ply"
            TRACE="${ROOT}/exp-dataset/${SCENE}/sparse_views_eval.json" ;;
 esac

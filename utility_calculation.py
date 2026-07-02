@@ -160,11 +160,22 @@ def compute_gaussian_weights_v2(weight_mode, *, opacity, scale_0, scale_1, scale
     volume: sigmoid(o)·det(Σ)^0.5  |  volume_over_d2: volume/d²
     screen_area: sigmoid(o)·π·√det(Σ_2D)  |  random: U(0,1) seeded baseline
     """
-    if not isinstance(opacity, torch.Tensor):
-        opacity = torch.as_tensor(opacity, dtype=torch.float32)
-        scale_0 = torch.as_tensor(scale_0, dtype=torch.float32)
-        scale_1 = torch.as_tensor(scale_1, dtype=torch.float32)
-        scale_2 = torch.as_tensor(scale_2, dtype=torch.float32)
+    # perf 2026-07-02: opacity/scale arrive as plain numpy from PLY load and were cast via
+    # torch.as_tensor() with no device, landing on CPU. Since project_covariance_2d (below)
+    # derives its device from o_i.device, this silently ran the whole screen_area path (incl.
+    # dragging the GPU-resident xyz tensor back to CPU) on CPU every call. Fixed: resolve
+    # device from xyz/cam_center (always GPU tensors at every real call site) via _t().
+    # Measured (chair 258k GS / bicycle 6.0M GS, single-camera median of 15 reps, RTX GPU):
+    # chair 33.8ms(CPU) -> 9.0ms(GPU) [3.8x]; bicycle 888ms(CPU) -> 218ms(GPU) [4.1x]. Real,
+    # measured win -- kept. Do not silently re-add a bare torch.as_tensor() without device in
+    # this function again; if you do and it's NOT faster, revert and update this note instead.
+    target_device = (xyz.device if isinstance(xyz, torch.Tensor)
+                      else cam_center.device if isinstance(cam_center, torch.Tensor)
+                      else "cpu")
+    opacity = _t(opacity, target_device)
+    scale_0 = _t(scale_0, target_device)
+    scale_1 = _t(scale_1, target_device)
+    scale_2 = _t(scale_2, target_device)
     o_i = torch.sigmoid(opacity)
 
     if weight_mode == "random":

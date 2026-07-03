@@ -2,9 +2,10 @@
 """Plot PSNR and SSIM vs budget from a render+metrics sweep.
 
 Subcommands:
-  single  one CSV, one scene, line plot  (x-axis: budget MiB)
-  grid    multi-scene subplot grid       (x-axis: budget %)
-  bar     cross-scene aggregate bars     (x-axis: budget %)
+  single  one CSV, one scene, line plot          (x-axis: budget MiB)
+  grid    multi-scene subplot grid, lines         (x-axis: budget %)
+  line    cross-scene aggregate, connected line   (x-axis: budget %) -- default cross-scene view
+  bar     cross-scene aggregate bars               (x-axis: budget %) -- unordered categories only
 """
 from __future__ import annotations
 
@@ -256,6 +257,45 @@ def _bar_plot(agg: dict, order: list[str], labels: dict[str, str],
     print(f"Wrote {out_path}")
 
 
+def _agg_line_plot(agg: dict, order: list[str], labels: dict[str, str],
+                    metric: str, ylabel: str, title: str, out_path: Path,
+                    hline: tuple[float, str] | None = None) -> None:
+    """Cross-scene aggregate, connected line (budget %% x-axis). Same data as
+    `_bar_plot` but a trend across an ordered x-axis reads as a line, not bars."""
+    all_budgets = sorted({b for k in agg for b in agg[k]}, key=_bk_sort)
+    groups = [k for k in order if k in agg]
+    x = np.arange(len(all_budgets))
+
+    fig, ax = plt.subplots(figsize=(8.5, 5.2))
+    all_means: list[float] = []
+    for i, key in enumerate(groups):
+        y   = [agg[key].get(b, {}).get(f"{metric}_mean", float("nan")) for b in all_budgets]
+        err = [agg[key].get(b, {}).get(f"{metric}_ci95",  0.0) for b in all_budgets]
+        all_means.extend(v for b, v in zip(all_budgets, y) if b in agg[key])
+        ax.errorbar(x, y, yerr=err, marker=MARKERS[i % len(MARKERS)],
+                    color=COLORS[i % len(COLORS)], linewidth=1.8, markersize=6,
+                    capsize=3, label=labels.get(key, key))
+    ax.set_ylim(*_data_ylim(all_means, metric))
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(b) for b in all_budgets], fontsize=10)
+    pct_labels = bool(all_budgets) and isinstance(all_budgets[0], str)
+    _pct = r"\%" if plt.rcParams.get("text.usetex") else "%"
+    ax.set_xlabel(f"Budget ({_pct} of full scene)" if pct_labels else "Budget (MiB)", fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(title, fontsize=13)
+    ax.grid(alpha=0.25)
+    if hline:
+        y_ref, hlabel = hline
+        ax.axhline(y_ref, color="gray", linestyle=":", linewidth=1.2, zorder=0)
+        ax.text(len(all_budgets) - 1, y_ref, f" {hlabel}", fontsize=9,
+                color="gray", va="bottom", ha="right")
+    ax.legend(fontsize=10)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"Wrote {out_path}")
+
+
 def _grid_plot(scenes_agg: dict[str, dict], order: list[str], labels: dict[str, str],
                metric: str, ylabel: str, suptitle: str, out_path: Path,
                hline: tuple[float, str] | None = None, ncols: int = 4) -> None:
@@ -421,6 +461,36 @@ def cmd_grid(args: argparse.Namespace) -> None:
                ncols=args.ncols)
 
 
+def cmd_line(args: argparse.Namespace) -> None:
+    summary_csv = Path(args.summary_csv)
+    if not summary_csv.exists():
+        raise FileNotFoundError(summary_csv)
+    rows = _read_csv(summary_csv)
+    print(f"Loaded {len(rows)} rows from {summary_csv}, grouping by '{args.group_by}'")
+    rows = _apply_filters(rows, args.filters, args.excludes)
+    _apply_budget_labels(rows, args.budget_pcts)
+    o_rows = _load_overlay(args.overlay_csv, args.overlay_filter,
+                           args.overlay_rename, args.overlay_schemes)
+    if o_rows:
+        _apply_budget_labels(o_rows, args.budget_pcts)
+        rows.extend(o_rows)
+    agg = _aggregate(rows, args.group_by)
+    order, labels = _resolve_order_and_labels(agg, args.group_by)
+
+    n_cameras = max(v["n_cameras"] for s in agg.values() for v in s.values())
+    n_groups  = len([k for k in order if k in agg])
+    suffix    = f" — {args.title_suffix}" if args.title_suffix else ""
+    base      = f"{n_groups} {args.group_by}s (mean ± 95% CI, {n_cameras} cameras/budget){suffix}"
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _agg_line_plot(agg, order, labels, "psnr", "PSNR (dB, clamped 60)",
+                   f"PSNR vs Budget — {base}", out_dir / "psnr_vs_budget.png",
+                   hline=(PSNR_SATURATION_DB, "saturated (≥60 dB)"))
+    _agg_line_plot(agg, order, labels, "ssim", "SSIM",
+                   f"SSIM vs Budget — {base}", out_dir / "ssim_vs_budget.png")
+
+
 def cmd_bar(args: argparse.Namespace) -> None:
     summary_csv = Path(args.summary_csv)
     if not summary_csv.exists():
@@ -487,14 +557,24 @@ def main() -> None:
                    help="Real scenes first; rest appended alphabetically.")
     p.add_argument("--ncols", type=int, default=4)
 
+    p = sub.add_parser("line", parents=[common],
+                       help="Aggregate connected-line plot across scenes (budget %% x-axis). "
+                            "Default cross-scene view — use this unless the groups are "
+                            "unordered categories.")
+    p.add_argument("--summary-csv", required=True,
+                   help="Combined summary_all.csv covering all scenes.")
+    p.add_argument("--budget-pcts", nargs="+", type=float, required=True, metavar="PCT")
+
     p = sub.add_parser("bar", parents=[common],
-                       help="Aggregate bar chart across scenes (budget %% x-axis).")
+                       help="Aggregate bar chart across scenes (budget %% x-axis). "
+                            "Only for unordered categorical comparisons; a budget sweep "
+                            "should use 'line' instead.")
     p.add_argument("--summary-csv", required=True,
                    help="Combined summary_all.csv covering all scenes.")
     p.add_argument("--budget-pcts", nargs="+", type=float, required=True, metavar="PCT")
 
     args = parser.parse_args()
-    {"single": cmd_single, "grid": cmd_grid, "bar": cmd_bar}[args.cmd](args)
+    {"single": cmd_single, "grid": cmd_grid, "line": cmd_line, "bar": cmd_bar}[args.cmd](args)
 
 
 if __name__ == "__main__":

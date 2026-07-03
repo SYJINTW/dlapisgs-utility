@@ -94,7 +94,7 @@ from utils.image_utils import psnr as gs_psnr  # noqa: E402  # type: ignore
 from utils.loss_utils import ssim as gs_ssim  # noqa: E402  # type: ignore
 
 VALID_SCHEMES = ["vd", "vd_lod", "vd_lod_w", "v_lod_w", "vd_lod_c", "vd_lod_w_c",
-                 "ml",
+                 "ml", "ml_blend",
                  "oracle_loo", "oracle_loo_ssim", "oracle_aoi", "oracle_combined"]
 PLY_WORKERS = 4
 
@@ -353,7 +353,7 @@ def _rerender_rep_views(
         bytes_per_gaussian, max_budget_bytes, budget_list, budget_bytes_list,
         oracle_data, base_output_path, device, args,
         ml_model=None, ml_static_feats=None, ml_feature_names=None,
-        ml_include_b=False) -> None:
+        ml_include_b=False, ml_include_g=False, ml_blend_models=None) -> None:
     """Re-render and save PNGs for worst/median/best (camera, budget, scheme) combos."""
     import collections as _col
     _mb_to_bytes = dict(zip(budget_list, budget_bytes_list))
@@ -390,8 +390,8 @@ def _rerender_rep_views(
         _index_offsets = (tile_index_offsets.cpu().numpy()
                           if hasattr(tile_index_offsets, "cpu") else np.asarray(tile_index_offsets))
         _n_gs_per_tile = (_index_offsets[1:] - _index_offsets[:-1]).astype(np.float32)
-        ml_group_a = ml_group_b = None
-        if "ml" in needed_schemes:
+        ml_group_a = ml_group_b = ml_group_g = None
+        if any(s in ("ml", "ml_blend") for s in needed_schemes):
             import math as _math
             np_visibility_all = (visibility.cpu().numpy()
                                  if hasattr(visibility, "cpu") else np.asarray(visibility))
@@ -406,6 +406,9 @@ def _rerender_rep_views(
                 float(getattr(sel_cam, "FoVy", _math.pi / 2)),
                 tile_centers_np, _n_gs_per_tile, np_distances, np_visibility_all,
             )
+            if ml_include_g:
+                ml_group_g = ml_features.build_group_g(
+                    cam_center_np, cam_w2v[:3, 2], tile_centers_np)
             if ml_include_b:
                 if any(r is None for r in (rot_0, rot_1, rot_2, rot_3)):
                     raise RuntimeError("ml scheme with Group B requires rot_0..rot_3 in PLY")
@@ -426,6 +429,7 @@ def _rerender_rep_views(
             model_dir=args.ml_model_dir, model_type=args.ml_model_type,
             static_features=ml_static_feats, group_a=ml_group_a,
             group_b=ml_group_b, feature_names=ml_feature_names, model=ml_model,
+            group_g=ml_group_g, models=ml_blend_models,
         )
 
         for scheme in needed_schemes:
@@ -510,7 +514,7 @@ def main() -> None:
 
     parser.add_argument("--ml-model-dir", type=str, default=None)
     parser.add_argument("--ml-model-type", type=str, default="lgbm",
-                        choices=["lgbm", "xgb", "rf"])
+                        choices=["lgbm", "xgb", "rf", "lgbm_rank"])
     parser.add_argument("--ml-feature-cache", type=str, default="auto",
                         choices=["auto", "off"],
                         help="auto: use {ml-model-dir}/feature_cache.npz if present "
@@ -567,8 +571,8 @@ def main() -> None:
     else:
         raise ValueError("Either --schemes or --scheme must be provided")
 
-    if "ml" in scheme_list and args.ml_model_dir is None:
-        raise ValueError("--ml-model-dir required for ml scheme")
+    if any(s in ("ml", "ml_blend") for s in scheme_list) and args.ml_model_dir is None:
+        raise ValueError("--ml-model-dir required for ml/ml_blend scheme")
     if any(s.startswith("oracle_") for s in scheme_list) and args.oracle_npz is None:
         raise ValueError("--oracle-npz required for oracle_* schemes")
 
@@ -618,6 +622,12 @@ def main() -> None:
             _ml_model = ml_predict.load_model(
                 args.ml_model_dir, args.ml_model_type,
                 expected_n_gs=len(sel_gs.data["x"]["data"]))
+
+    _ml_blend_models = None
+    if "ml_blend" in scheme_list:
+        with _timed("ml_blend_models_load", []):
+            _ml_blend_models = ml_predict.load_blend_models(
+                args.ml_model_dir, expected_n_gs=len(sel_gs.data["x"]["data"]))
 
     # --- Load renderer model (GaussianModel, GPU tensors) ---
     with _timed("ply_load_renderer", timings):
@@ -787,10 +797,12 @@ def main() -> None:
     # --- ML: precompute static features (model already loaded at startup) ---
     ml_static_feats = ml_feature_names = None
     ml_include_b = False
-    if "ml" in scheme_list:
+    ml_include_g = False
+    if any(s in ("ml", "ml_blend") for s in scheme_list):
         _ml_model_path = Path(args.ml_model_dir)
         ml_feature_names = json.loads((_ml_model_path / "feature_names.json").read_text())
         ml_include_b = any(n in set(ml_features.GROUP_B_NAMES) for n in ml_feature_names)
+        ml_include_g = any(n in set(ml_features.GROUP_G_NAMES) for n in ml_feature_names)
         _cache_path = _ml_model_path / "feature_cache.npz"
         with _timed("ml_static_features", timings):
             ml_static_feats = None
@@ -944,8 +956,8 @@ def main() -> None:
 
         # ML camera features
         _n_gs_per_tile = (index_offsets[1:] - index_offsets[:-1]).astype(np.float32)
-        ml_group_a = ml_group_b = None
-        if "ml" in scheme_list:
+        ml_group_a = ml_group_b = ml_group_g = None
+        if any(s in ("ml", "ml_blend") for s in scheme_list):
             with _timed("ml_camera_features", timings, camera=camera_index):
                 import math as _math
                 _cam_fwd = cam_w2v[:3, 2]
@@ -955,6 +967,9 @@ def main() -> None:
                     float(getattr(sel_cam, "FoVy", _math.pi / 2)),
                     tile_centers_np, _n_gs_per_tile, np_distances, np_visibility_all,
                 )
+                if ml_include_g:
+                    ml_group_g = ml_features.build_group_g(
+                        cam_center_np, _cam_fwd, tile_centers_np)
                 if ml_include_b:
                     if any(r is None for r in (rot_0, rot_1, rot_2, rot_3)):
                         raise RuntimeError("ml scheme with Group B requires rot_0..rot_3 in PLY")
@@ -975,6 +990,7 @@ def main() -> None:
             model_dir=args.ml_model_dir, model_type=args.ml_model_type,
             static_features=ml_static_feats, group_a=ml_group_a,
             group_b=ml_group_b, feature_names=ml_feature_names, model=_ml_model,
+            group_g=ml_group_g, models=_ml_blend_models,
         )
 
         # --- Per-scheme loop ---
@@ -1157,7 +1173,8 @@ def main() -> None:
             bytes_per_gaussian, max_budget_bytes, budget_list, _budget_bytes_list,
             oracle_data, base_output_path, device, args,
             ml_model=_ml_model, ml_static_feats=ml_static_feats,
-            ml_feature_names=ml_feature_names, ml_include_b=ml_include_b)
+            ml_feature_names=ml_feature_names, ml_include_b=ml_include_b,
+            ml_include_g=ml_include_g, ml_blend_models=_ml_blend_models)
 
     # --- Representative views ---
     if all_metric_rows:

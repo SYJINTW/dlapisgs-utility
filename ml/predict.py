@@ -73,6 +73,7 @@ def predict_utility(
     group_b: "np.ndarray | None",   # (N_tiles, 12)  — Group B or None
     feature_names: list,            # list[str] from feature_names.json
     model=None,                     # pre-loaded model; if None, load from disk
+    group_g: "np.ndarray | None" = None,  # (N_tiles, 1) — Group G (viewpoint-interaction) or None
 ) -> np.ndarray:
     """Predict tile utility and return sorted (tile_idx, lod=0) pairs.
 
@@ -84,6 +85,8 @@ def predict_utility(
         group_b:         Group B per-camera features. Shape (N_tiles, 12), or None
                          if model was trained without Group B.
         feature_names:   Column names matching training order.
+        group_g:         Group G (viewpoint-interaction) per-camera feature. Shape
+                         (N_tiles, 1), or None if model was trained without Group G.
 
     Returns:
         np.ndarray shape (N_tiles,), dtype float64: raw predicted utility scores.
@@ -98,21 +101,26 @@ def predict_utility(
             )
         model = joblib.load(model_pkl)
 
-    # ── Assemble full feature matrix [A | B | C | D] ──────────────────────
+    # ── Assemble full feature matrix [A | B | C | D | G] ──────────────────
+    parts = [group_a]
     if group_b is not None:
-        X_all = np.hstack([group_a, group_b, static_features])  # (N_tiles, 160)
-    else:
-        X_all = np.hstack([group_a, static_features])            # (N_tiles, 148 or 132)
+        parts.append(group_b)
+    parts.append(static_features)
+    if group_g is not None:
+        parts.append(group_g)
+    X_all = np.hstack(parts)
 
     # ── Select columns matching training feature order ─────────────────────
     # Build column name → index map from ALL_FEATURE_NAMES order used in X_all.
-    # The order in X_all depends on whether group_b is present.
+    # The order in X_all depends on whether group_b/group_g are present.
     from ml.features import (GROUP_A_NAMES, GROUP_B_NAMES,
-                              GROUP_C_NAMES, GROUP_D_NAMES)
+                              GROUP_C_NAMES, GROUP_D_NAMES, GROUP_G_NAMES)
+    all_col_names = GROUP_A_NAMES[:]
     if group_b is not None:
-        all_col_names = GROUP_A_NAMES + GROUP_B_NAMES + GROUP_C_NAMES + GROUP_D_NAMES
-    else:
-        all_col_names = GROUP_A_NAMES + GROUP_C_NAMES + GROUP_D_NAMES
+        all_col_names += GROUP_B_NAMES
+    all_col_names += GROUP_C_NAMES + GROUP_D_NAMES
+    if group_g is not None:
+        all_col_names += GROUP_G_NAMES
 
     col_map = {name: i for i, name in enumerate(all_col_names)}
     try:
@@ -127,3 +135,59 @@ def predict_utility(
 
     # ── Predict ───────────────────────────────────────────────────────────
     return model.predict(X).astype(np.float64)   # (N_tiles,) raw scores
+
+
+_BLEND_MODEL_TYPES = ("rf", "lgbm", "xgb")
+
+
+def load_blend_models(model_dir: str, model_types=_BLEND_MODEL_TYPES,
+                       expected_n_gs: Optional[int] = None) -> dict:
+    """Load whichever of rf/lgbm/xgb.pkl exist in model_dir (startup, once).
+
+    Mirrors load_model's n_jobs=1 + scene-identity guard for each present model type.
+    Missing model files are skipped, not an error -- a dir with only 2 of 3 pkls still
+    works for blending.
+    """
+    models = {}
+    for model_type in model_types:
+        if (Path(model_dir) / f"{model_type}.pkl").exists():
+            models[model_type] = load_model(model_dir, model_type, expected_n_gs=expected_n_gs)
+    if not models:
+        raise FileNotFoundError(
+            f"No {model_types} models found in {model_dir} for ml_blend scheme.")
+    return models
+
+
+def predict_utility_blend(
+    model_dir: str,
+    *,
+    static_features: np.ndarray,
+    group_a: np.ndarray,
+    group_b: "np.ndarray | None",
+    feature_names: list,
+    group_g: "np.ndarray | None" = None,
+    models: "dict | None" = None,
+) -> np.ndarray:
+    """Average per-tile importance across the RF/LGBM/XGB models already trained for
+    one scene/ablation (no retrain). Each model predicts log(mse_loo); exponentiate
+    per-model first (recovers linear ΔMSE, the space the greedy per-byte key sorts in),
+    then average -- averaging in linear space, not log space.
+
+    models: dict model_type -> loaded model (from load_blend_models), reused across
+    cameras. If None, loads every model in model_dir fresh (slow -- prefer preloading).
+
+    Returns:
+        np.ndarray shape (N_tiles,): blended positive-linear importance.
+    """
+    if models is None:
+        models = load_blend_models(model_dir)
+
+    linear_preds = [
+        np.exp(predict_utility(
+            model_dir, model_type,
+            static_features=static_features, group_a=group_a, group_b=group_b,
+            feature_names=feature_names, group_g=group_g, model=model,
+        ))
+        for model_type, model in models.items()
+    ]
+    return np.mean(linear_preds, axis=0)

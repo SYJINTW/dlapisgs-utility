@@ -34,6 +34,7 @@ EXTRA="--gs-order $GS_ORDER"
 MODEL_DIR="output/ml_models/8/${SCENE}/AC"
 ORACLE_NPZ="output/oracle/8/eval/${SCENE}/oracle_dq.npz"
 [ "$SCHEME" = "ml" ]                                          && [ -d "$MODEL_DIR" ] && EXTRA="$EXTRA --ml-model-dir $MODEL_DIR --ml-model-type lgbm"
+[ "$SCHEME" = "ml_blend" ]                                     && [ -d "$MODEL_DIR" ] && EXTRA="$EXTRA --ml-model-dir $MODEL_DIR"
 { [ "$SCHEME" = "oracle_loo" ] || [ "$SCHEME" = "oracle_loo_ssim" ]; } && [ -f "$ORACLE_NPZ" ] && EXTRA="$EXTRA --oracle-npz $ORACLE_NPZ"
 
 rm -rf "$OUT"; mkdir -p "$OUT"

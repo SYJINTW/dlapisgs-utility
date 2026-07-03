@@ -1,12 +1,15 @@
 """Per-camera Spearman ρ: marginal keys vs oracle value-per-byte.
 
 Decisive comparison:
-  ρ(baseline_key,  ΔMSE/byte)  — (v_c/d_c) / byte_k
-  ρ(heuristic_key, ΔMSE/byte)  — (v_c/d_c · W_k) / byte_k
+  ρ(baseline_key,  ΔMSE/byte)  — (v_c/d_c) / byte_k                 [vd_lod]
+  ρ(v_lod_w_key,   ΔMSE/byte)  — (v_c · W_k) / byte_k                [v_lod_w -- no /d,
+                                  W_k already encodes ∝1/d² via screen_area projection]
 
 Supporting:
   ρ(W_k, ΔMSE)               — raw W_k vs oracle importance
   ρ(W_k_resid_after_N_k, ΔMSE/byte) — W_k after OLS-removing N_k component
+  ρ(1/d, ΔMSE)               — raw distance signal vs oracle importance
+  ρ(1/d_resid_after_N_k, ΔMSE/byte) — 1/d after OLS-removing N_k component
 
 Unit of observation: tile, at a given camera (visible tiles only).
 Aggregate: median + IQR of per-camera ρ values.
@@ -73,7 +76,7 @@ args_g = None  # set in main, used by _screen_area_weights
 
 
 def _iqr(arr):
-    return float(np.percentile(arr, 75) - np.percentile(arr, 25))
+    return float(np.nanpercentile(arr, 75) - np.nanpercentile(arr, 25))
 
 
 def main():
@@ -138,6 +141,12 @@ def main():
     rho_heuristic = []
     rho_wk_raw    = []
     rho_wk_resid  = []
+    rho_d_raw     = []
+    rho_d_resid   = []
+    rho_nk_raw    = []
+    rho_vk_raw    = []
+    rho_nk_resid_vk = []
+    rho_vk_resid_nk = []
 
     for ci in cam_indices:
         cam = cameras[ci]
@@ -151,7 +160,7 @@ def main():
         w_sc, _ = _screen_area_weights(gs, cam, device)
         Wk, _ = uc.compute_tile_weights_and_counts(
             tile_index_offsets, tile_flat_indices, w_sc,
-            w_norm="none", c_norm="none", w_mode="sum",
+            w_norm="none", c_norm="none",
         )
         Wk_np = Wk.cpu().numpy()                              # (N,)
 
@@ -164,31 +173,77 @@ def main():
         bk   = byte_k[mask]
         Wk_m = Wk_np[mask]
         Nk_m = n_gs[mask].astype(np.float64)
-        truth_per_byte = mse_loo[ci][mask] / bk
+        oracle_val_per_byte = mse_loo[ci][mask] / bk
 
-        rho_baseline.append( scipy.stats.spearmanr(vd / bk,          truth_per_byte)[0])
-        rho_heuristic.append(scipy.stats.spearmanr(vd * Wk_m / bk,   truth_per_byte)[0])
+        rho_baseline.append( scipy.stats.spearmanr(vd / bk,          oracle_val_per_byte)[0])
+        # v_lod_w = v*W_k (no /d -- selection_core.py:342 include_d=False for v_lod_w,
+        # "W_k already encodes ∝1/d²" via its own screen_area projection). v≡1 post-mask,
+        # so this reduces to Wk_m/bk. NOT vd_lod_w (which would double-count distance).
+        rho_heuristic.append(scipy.stats.spearmanr(Wk_m / bk,        oracle_val_per_byte)[0])
         rho_wk_raw.append(   scipy.stats.spearmanr(Wk_m,              mse_loo[ci][mask])[0])
+        # vd == 1/(dist+eps) here since vis[mask] is always 1 post-mask (visible-only
+        # population) -- v itself has zero variance in this subset, so vd IS the distance
+        # signal alone. Parallel treatment to W_k_raw/W_k_resid for direct comparison.
+        rho_d_raw.append(    scipy.stats.spearmanr(vd,                mse_loo[ci][mask])[0])
+        # N_k raw, direct (not just inferred via the residual-removal step below) -- same
+        # visible-only population as W_k_raw/d_raw for apples-to-apples comparison.
+        rho_nk_raw.append(   scipy.stats.spearmanr(Nk_m,               mse_loo[ci][mask])[0])
+
+        # v_k's own correlation is undefined within the visible-only mask (v≡1 there by
+        # construction -- zero variance). To measure it, use the FULL tile population
+        # (byte_k>0 only, no visibility filter) so v_k actually varies 0/1.
+        mask_full = byte_k > 0
+        if mask_full.sum() >= 3 and vis[mask_full].std() > 0:
+            rho_vk_raw.append(scipy.stats.spearmanr(vis[mask_full], mse_loo[ci][mask_full])[0])
+
+        # N_k/v_k mutual residuals: only meaningful in the full population (visible+
+        # invisible) since v_k has zero variance in the visible-only mask. Same
+        # oracle_val_per_byte convention as W_k_resid/d_resid (residual vs value/byte).
+        vis_full = vis[mask_full]
+        Nk_full  = n_gs[mask_full].astype(np.float64)
+        oracle_val_per_byte_full = mse_loo[ci][mask_full] / byte_k[mask_full]
+        if mask_full.sum() >= 3 and vis_full.std() > 0 and Nk_full.std() > 0:
+            A = np.column_stack([np.ones_like(vis_full), vis_full])
+            coefs, *_ = np.linalg.lstsq(A, Nk_full, rcond=None)
+            nk_resid_vk = Nk_full - A @ coefs
+            rho_nk_resid_vk.append(scipy.stats.spearmanr(nk_resid_vk, oracle_val_per_byte_full)[0])
+
+            A2 = np.column_stack([np.ones_like(Nk_full), Nk_full])
+            coefs2, *_ = np.linalg.lstsq(A2, vis_full, rcond=None)
+            vk_resid_nk = vis_full - A2 @ coefs2
+            rho_vk_resid_nk.append(scipy.stats.spearmanr(vk_resid_nk, oracle_val_per_byte_full)[0])
 
         if Nk_m.std() > 0 and Wk_m.std() > 0:
             A = np.column_stack([np.ones_like(Nk_m), Nk_m])
             coefs, *_ = np.linalg.lstsq(A, Wk_m, rcond=None)
             wk_resid = Wk_m - A @ coefs
-            rho_wk_resid.append(scipy.stats.spearmanr(wk_resid, truth_per_byte)[0])
+            rho_wk_resid.append(scipy.stats.spearmanr(wk_resid, oracle_val_per_byte)[0])
+
+        if Nk_m.std() > 0 and vd.std() > 0:
+            A = np.column_stack([np.ones_like(Nk_m), Nk_m])
+            coefs, *_ = np.linalg.lstsq(A, vd, rcond=None)
+            d_resid = vd - A @ coefs
+            rho_d_resid.append(scipy.stats.spearmanr(d_resid, oracle_val_per_byte)[0])
 
         print(f"  cam {ci:03d} done  vis={mask.sum()}")
 
     # --- Aggregate ---
     def _agg(rhos):
         arr = np.array(rhos)
-        return {"median": float(np.median(arr)), "iqr": _iqr(arr),
+        return {"median": float(np.nanmedian(arr)), "iqr": _iqr(arr),
                 "n": len(arr), "rhos": arr.tolist()}
 
     signals = {
         "baseline_key":        _agg(rho_baseline),
-        "heuristic_key":       _agg(rho_heuristic),
+        "v_lod_w_key":         _agg(rho_heuristic),
         "W_k_raw":             _agg(rho_wk_raw),
         "W_k_resid_after_N_k": _agg(rho_wk_resid),
+        "d_raw":               _agg(rho_d_raw),
+        "d_resid_after_N_k":   _agg(rho_d_resid),
+        "N_k_raw":             _agg(rho_nk_raw),
+        "v_k_raw_fullpop":     _agg(rho_vk_raw),
+        "N_k_resid_after_v_k": _agg(rho_nk_resid_vk),
+        "v_k_resid_after_N_k": _agg(rho_vk_resid_nk),
     }
 
     header = f"\n{'signal':<24}  {'median_ρ':>9}  {'IQR_ρ':>7}  {'n':>5}"

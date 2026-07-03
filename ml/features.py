@@ -93,8 +93,16 @@ GROUP_F_NAMES: list = [
     "sh_std_r",  "sh_std_g",  "sh_std_b",
 ]  # 6
 
-ALL_FEATURE_NAMES: list = GROUP_A_NAMES + GROUP_B_NAMES + GROUP_C_NAMES + GROUP_D_NAMES + GROUP_F_NAMES
-# 14 + 12 + 118 + 16 + 6 = 166
+GROUP_G_NAMES: list = [
+    "cos_cam_tile",  # cos angle between camera forward dir and cam->tile-center vector
+]  # 1
+
+# G appended at the END so every existing column's position (and every existing
+# ablation's feature_names.json) is unaffected -- do not reorder.
+ALL_FEATURE_NAMES: list = (
+    GROUP_A_NAMES + GROUP_B_NAMES + GROUP_C_NAMES + GROUP_D_NAMES + GROUP_F_NAMES + GROUP_G_NAMES
+)
+# 14 + 12 + 118 + 16 + 6 + 1 = 167
 
 _GROUP_MAP: dict = {
     "A": GROUP_A_NAMES,
@@ -102,10 +110,11 @@ _GROUP_MAP: dict = {
     "C": GROUP_C_NAMES,
     "D": GROUP_D_NAMES,
     "F": GROUP_F_NAMES,
+    "G": GROUP_G_NAMES,
 }
-_GROUP_ORDER = "ABCDF"
+_GROUP_ORDER = "ABCDFG"
 
-# Canonical example ablations (any subset of ABCDF is valid).
+# Canonical example ablations (any subset of ABCDFG is valid).
 ABLATION_NAMES = ("ABCDF", "ABCD", "ACDF", "ACD", "ACF", "AC", "AF", "ABC", "AB", "A")
 _GROUP_B_SET = set(GROUP_B_NAMES)
 
@@ -280,6 +289,25 @@ def build_group_a(cam_pos_np: np.ndarray, cam_fwd_np: np.ndarray,
         distances_np.astype(np.float32)[:, None],
         visibility_np.astype(np.float32)[:, None],
     ])  # (N_tiles, 14)
+
+
+def build_group_g(cam_pos_np: np.ndarray, cam_fwd_np: np.ndarray,
+                  tile_centroid_np: np.ndarray) -> np.ndarray:
+    """Cheap viewpoint-interaction feature: cos angle between the camera's
+    forward direction and the camera->tile-center vector. Reuses build_group_a's
+    inputs (no new rendering/geometry cost) -- structural/geometric, not a
+    GS-content signal (distinct from Group B).
+
+    Returns: float32 array (N_tiles, 1)
+    """
+    to_tile = tile_centroid_np.astype(np.float64) - cam_pos_np[None, :].astype(np.float64)
+    norm = np.linalg.norm(to_tile, axis=1, keepdims=True)
+    norm = np.where(norm > 0, norm, 1.0)
+    to_tile_unit = to_tile / norm
+    fwd = cam_fwd_np.astype(np.float64)
+    fwd_unit = fwd / (np.linalg.norm(fwd) + 1e-12)
+    cos_angle = to_tile_unit @ fwd_unit
+    return cos_angle.astype(np.float32)[:, None]
 
 
 @torch.no_grad()
@@ -545,6 +573,7 @@ def build_feature_matrix(oracle_npz_path: str, need_b: bool = True,
             cam_pos_np, cam_fwd_np, fov_x, fov_y,
             tile_centers_np, n_gs_per_tile, dist_np, vis_np,
         )
+        group_g = build_group_g(cam_pos_np, cam_fwd_np, tile_centers_np)
 
         if need_b:
             group_b = build_group_b(
@@ -567,7 +596,7 @@ def build_feature_matrix(oracle_npz_path: str, need_b: bool = True,
         else:
             group_f = _zero_f
 
-        X_cam = np.hstack([group_a, group_b, static_feats, group_f])  # (N_tiles, 166)
+        X_cam = np.hstack([group_a, group_b, static_feats, group_f, group_g])  # (N_tiles, 167)
 
         row_idx = cam_to_row[cam_idx_int]
         mse_row = mse_loo[row_idx]   # (N_tiles,)

@@ -353,7 +353,7 @@ def _rerender_rep_views(
         bytes_per_gaussian, max_budget_bytes, budget_list, budget_bytes_list,
         oracle_data, base_output_path, device, args,
         ml_model=None, ml_static_feats=None, ml_feature_names=None,
-        ml_include_b=False, ml_include_g=False, ml_blend_models=None) -> None:
+        ml_blend_models=None) -> None:
     """Re-render and save PNGs for worst/median/best (camera, budget, scheme) combos."""
     import collections as _col
     _mb_to_bytes = dict(zip(budget_list, budget_bytes_list))
@@ -390,7 +390,7 @@ def _rerender_rep_views(
         _index_offsets = (tile_index_offsets.cpu().numpy()
                           if hasattr(tile_index_offsets, "cpu") else np.asarray(tile_index_offsets))
         _n_gs_per_tile = (_index_offsets[1:] - _index_offsets[:-1]).astype(np.float32)
-        ml_group_a = ml_group_b = ml_group_g = None
+        ml_group_a = None
         if any(s in ("ml", "ml_blend") for s in needed_schemes):
             import math as _math
             np_visibility_all = (visibility.cpu().numpy()
@@ -406,30 +406,12 @@ def _rerender_rep_views(
                 float(getattr(sel_cam, "FoVy", _math.pi / 2)),
                 tile_centers_np, _n_gs_per_tile, np_distances, np_visibility_all,
             )
-            if ml_include_g:
-                ml_group_g = ml_features.build_group_g(
-                    cam_center_np, cam_w2v[:3, 2], tile_centers_np)
-            if ml_include_b:
-                if any(r is None for r in (rot_0, rot_1, rot_2, rot_3)):
-                    raise RuntimeError("ml scheme with Group B requires rot_0..rot_3 in PLY")
-                ml_group_b = ml_features.build_group_b(
-                    tile_index_offsets, tile_flat_indices,
-                    min_corners_t, max_corners_t,
-                    gs_xyz_t, opacity, scale_0, scale_1, scale_2,
-                    rot_0, rot_1, rot_2, rot_3,
-                    sel_cam.camera_center.to(device),
-                    sel_cam.world_view_transform, sel_cam.projection_matrix,
-                    args.img_w, args.img_h,
-                    _n_gs_per_tile, device,
-                    fov_x=getattr(sel_cam, "FoVx", None),
-                    fov_y=getattr(sel_cam, "FoVy", None),
-                )
 
         ml_predict_kwargs = dict(
             model_dir=args.ml_model_dir, model_type=args.ml_model_type,
             static_features=ml_static_feats, group_a=ml_group_a,
-            group_b=ml_group_b, feature_names=ml_feature_names, model=ml_model,
-            group_g=ml_group_g, models=ml_blend_models,
+            feature_names=ml_feature_names, model=ml_model,
+            models=ml_blend_models,
         )
 
         for scheme in needed_schemes:
@@ -440,8 +422,15 @@ def _rerender_rep_views(
                 num_lod=args.num_lod, W_k=W_k, C_k=C_k,
                 ml_predict_kwargs=ml_predict_kwargs,
             )
+            # LGBMRanker's raw score is a signed, arbitrary-scale lambdarank margin --
+            # not a byte-divisible utility (positive or negative), so "marginal"
+            # (score/bytes) division can invert relative order between two negative-
+            # score tiles of different byte cost. Force direct-order ("utility") sort.
+            _greedy_key = ("utility" if scheme == "ml"
+                           and ml_predict_kwargs.get("model_type") == "lgbm_rank"
+                           else args.greedy_key)
             utilities = _sort_tiles(raw_scores, _n_gs_per_tile, bytes_per_gaussian,
-                                    args.greedy_key, num_of_level=args.num_lod)
+                                    _greedy_key, num_of_level=args.num_lod)
 
             all_ordered, tile_cum_counts = _build_greedy_order(
                 args.packing_mode, scheme, utilities, visibility,
@@ -796,13 +785,9 @@ def main() -> None:
 
     # --- ML: precompute static features (model already loaded at startup) ---
     ml_static_feats = ml_feature_names = None
-    ml_include_b = False
-    ml_include_g = False
     if any(s in ("ml", "ml_blend") for s in scheme_list):
         _ml_model_path = Path(args.ml_model_dir)
         ml_feature_names = json.loads((_ml_model_path / "feature_names.json").read_text())
-        ml_include_b = any(n in set(ml_features.GROUP_B_NAMES) for n in ml_feature_names)
-        ml_include_g = any(n in set(ml_features.GROUP_G_NAMES) for n in ml_feature_names)
         _cache_path = _ml_model_path / "feature_cache.npz"
         with _timed("ml_static_features", timings):
             ml_static_feats = None
@@ -956,7 +941,7 @@ def main() -> None:
 
         # ML camera features
         _n_gs_per_tile = (index_offsets[1:] - index_offsets[:-1]).astype(np.float32)
-        ml_group_a = ml_group_b = ml_group_g = None
+        ml_group_a = None
         if any(s in ("ml", "ml_blend") for s in scheme_list):
             with _timed("ml_camera_features", timings, camera=camera_index):
                 import math as _math
@@ -967,30 +952,12 @@ def main() -> None:
                     float(getattr(sel_cam, "FoVy", _math.pi / 2)),
                     tile_centers_np, _n_gs_per_tile, np_distances, np_visibility_all,
                 )
-                if ml_include_g:
-                    ml_group_g = ml_features.build_group_g(
-                        cam_center_np, _cam_fwd, tile_centers_np)
-                if ml_include_b:
-                    if any(r is None for r in (rot_0, rot_1, rot_2, rot_3)):
-                        raise RuntimeError("ml scheme with Group B requires rot_0..rot_3 in PLY")
-                    ml_group_b = ml_features.build_group_b(
-                        tile_index_offsets, tile_flat_indices,
-                        min_corners_t, max_corners_t,
-                        gs_xyz_t, opacity, scale_0, scale_1, scale_2,
-                        rot_0, rot_1, rot_2, rot_3,
-                        sel_cam.camera_center.to(device),
-                        sel_cam.world_view_transform, sel_cam.projection_matrix,
-                        args.img_w, args.img_h,
-                        _n_gs_per_tile, device,
-                        fov_x=getattr(sel_cam, "FoVx", None),
-                        fov_y=getattr(sel_cam, "FoVy", None),
-                    )
 
         ml_predict_kwargs = dict(
             model_dir=args.ml_model_dir, model_type=args.ml_model_type,
             static_features=ml_static_feats, group_a=ml_group_a,
-            group_b=ml_group_b, feature_names=ml_feature_names, model=_ml_model,
-            group_g=ml_group_g, models=_ml_blend_models,
+            feature_names=ml_feature_names, model=_ml_model,
+            models=_ml_blend_models,
         )
 
         # --- Per-scheme loop ---
@@ -1003,8 +970,15 @@ def main() -> None:
                     num_lod=args.num_lod, W_k=W_k, C_k=C_k,
                     ml_predict_kwargs=ml_predict_kwargs,
                 )
+                # LGBMRanker's raw score is a signed, arbitrary-scale lambdarank margin --
+                # not a byte-divisible utility (positive or negative), so "marginal"
+                # (score/bytes) division can invert relative order between two negative-
+                # score tiles of different byte cost. Force direct-order ("utility") sort.
+                _greedy_key = ("utility" if scheme == "ml"
+                               and ml_predict_kwargs.get("model_type") == "lgbm_rank"
+                               else args.greedy_key)
                 utilities = _sort_tiles(raw_scores, _n_gs_per_tile, bytes_per_gaussian,
-                                        args.greedy_key, num_of_level=args.num_lod)
+                                        _greedy_key, num_of_level=args.num_lod)
 
             with _timed("greedy", timings, camera=camera_index, scheme=scheme,
                         packing_mode=args.packing_mode):
@@ -1173,8 +1147,7 @@ def main() -> None:
             bytes_per_gaussian, max_budget_bytes, budget_list, _budget_bytes_list,
             oracle_data, base_output_path, device, args,
             ml_model=_ml_model, ml_static_feats=ml_static_feats,
-            ml_feature_names=ml_feature_names, ml_include_b=ml_include_b,
-            ml_include_g=ml_include_g, ml_blend_models=_ml_blend_models)
+            ml_feature_names=ml_feature_names, ml_blend_models=_ml_blend_models)
 
     # --- Representative views ---
     if all_metric_rows:

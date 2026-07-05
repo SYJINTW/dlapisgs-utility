@@ -36,13 +36,12 @@ from scipy.stats import spearmanr
 
 HERE = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(HERE))
-from ml.features import (build_feature_matrix, feature_names_for_ablation,  # noqa: E402
-                         GROUP_B_NAMES, GROUP_F_NAMES)
+from ml.features import build_feature_matrix, feature_names_for_ablation  # noqa: E402
 
 REAL3 = ("bicycle", "garden", "stump")
 SYNTH7 = ("chair", "drums", "ficus", "hotdog", "materials", "mic", "ship")
 ALL10 = REAL3 + SYNTH7
-SCENE_SETS = {"real3": REAL3, "all10": ALL10}
+SCENE_SETS = {"real3": REAL3, "synth7": SYNTH7, "all10": ALL10}
 
 LABEL = "log_mse_loo"
 
@@ -52,9 +51,9 @@ def zscore(y):
     return (y - mu) / (sd if sd > 0 else 1.0)
 
 
-def load_split(root, split, scene, feat_cols, need_b, need_f):
+def load_split(root, split, scene, feat_cols):
     npz = Path(root) / split / scene / "oracle_dq.npz"
-    df, _ = build_feature_matrix(str(npz), need_b=need_b, need_f=need_f)
+    df, _ = build_feature_matrix(str(npz))
     df = df[df[LABEL].notna()].copy()
     X = df[feat_cols].values.astype(np.float32)
     y = df[LABEL].values.astype(np.float32)
@@ -91,20 +90,18 @@ def main():
 
     scenes = SCENE_SETS[args.scene_set]
     feat_cols = feature_names_for_ablation(args.ablation)
-    need_b = bool(set(feat_cols) & set(GROUP_B_NAMES))
-    need_f = bool(set(feat_cols) & set(GROUP_F_NAMES))
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 
     print(f"[{time.time()-t0:6.1f}s] scene-set={args.scene_set} ({len(scenes)} scenes) "
-          f"ablation={args.ablation} ({len(feat_cols)} feats) need_b={need_b} need_f={need_f}",
+          f"ablation={args.ablation} ({len(feat_cols)} feats)",
           flush=True)
 
     tr, ev = {}, {}
     for s in scenes:
-        tr[s] = load_split(args.root, "train", s, feat_cols, need_b, need_f)
-        ev[s] = load_split(args.root, "eval", s, feat_cols, need_b, need_f)
+        tr[s] = load_split(args.root, "train", s, feat_cols)
+        ev[s] = load_split(args.root, "eval", s, feat_cols)
         print(f"[{time.time()-t0:6.1f}s]   {s:10s} train={tr[s][0].shape} eval={ev[s][0].shape}",
               flush=True)
 

@@ -72,6 +72,29 @@ def _fold_arrays(df, cams, feat_cols):
     return X, y, group, marginal, cam_ids
 
 
+def fit_single_scene_ranker(X, y, group, seed, n_estimators=500, lgbm_kwargs=None,
+                            eval_set=None, eval_group=None, early_stopping_rounds=None):
+    """Fit one LGBMRanker on already-prepared (X, y, group) arrays.
+
+    Pass eval_set/eval_group/early_stopping_rounds together to enable early stopping
+    (used by ml/cross_scene/train_pooled_rank.py, which has no prior CV loop to estimate
+    n_estimators from). Omit them to fit exactly n_estimators trees with no validation
+    (used by train_rank()'s final refit below, where n_estimators is already chosen from
+    the CV loop's best_iteration_ average).
+    """
+    lgbm_kwargs = lgbm_kwargs or {}
+    m = lgb.LGBMRanker(objective="lambdarank", n_estimators=n_estimators,
+                       random_state=seed, n_jobs=-1, verbosity=-1, **lgbm_kwargs)
+    fit_kwargs = {}
+    if eval_set is not None:
+        fit_kwargs["eval_set"] = eval_set
+        fit_kwargs["eval_group"] = eval_group
+        fit_kwargs["callbacks"] = [lgb.early_stopping(early_stopping_rounds or 50, verbose=False),
+                                   lgb.log_evaluation(-1)]
+    m.fit(X, y, group=group, **fit_kwargs)
+    return m
+
+
 def _per_camera_rho(preds, marginal, cam_ids):
     rhos = []
     for cam in np.unique(cam_ids):
@@ -92,7 +115,7 @@ def train_rank(oracle_npz_path: str, output_dir: str, ablation: str = "AC",
     lgbm_kwargs = lgbm_kwargs or {}
 
     print(f"Building feature matrix from: {oracle_npz_path}", flush=True)
-    df, _ = build_feature_matrix(oracle_npz_path, need_b=False, need_f=False)
+    df, _ = build_feature_matrix(oracle_npz_path)
     df = df[df["log_mse_loo"].notna()].copy()
     print(f"  {len(df):,} rows  {df['tile'].nunique()} tiles  {df['camera'].nunique()} cameras",
           flush=True)
@@ -138,9 +161,8 @@ def train_rank(oracle_npz_path: str, output_dir: str, ablation: str = "AC",
     # Refit on all data for deployment.
     X_all, y_all, g_all, _, _ = _fold_arrays(df, all_cams, feat_cols)
     n_est = int(np.mean(best_iters) * 1.1) if best_iters else 500
-    final = lgb.LGBMRanker(objective="lambdarank", n_estimators=n_est,
-                           random_state=seed, n_jobs=-1, verbosity=-1, **lgbm_kwargs)
-    final.fit(X_all, y_all, group=g_all)
+    final = fit_single_scene_ranker(X_all, y_all, g_all, seed,
+                                    n_estimators=n_est, lgbm_kwargs=lgbm_kwargs)
     joblib.dump(final, out_dir / "lgbm_rank.pkl")
 
     _oracle_meta = json.loads(str(np.load(str(oracle_npz_path), allow_pickle=True)

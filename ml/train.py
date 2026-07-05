@@ -31,8 +31,7 @@ HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
 from ml.features import (build_feature_matrix, feature_names_for_ablation,  # noqa: E402
-                         ABLATION_NAMES, static_cache_from_oracle, save_feature_cache,
-                         GROUP_B_NAMES, GROUP_F_NAMES)
+                         ABLATION_NAMES, static_cache_from_oracle, save_feature_cache)
 
 try:
     import xgboost as xgb
@@ -315,13 +314,6 @@ def train_scene(oracle_npz_path: str, output_dir: str, seed: int = 0,
     models_to_run = set(models) if models is not None else set(_ALL_MODELS)
     names_to_train = ablations if ablations is not None else list(ABLATION_NAMES)
 
-    # Only compute the expensive per-cam groups (B=EWA screen_area, F=SH eval) if
-    # some requested ablation actually uses them. Training AC alone skips both.
-    feats_needed = set().union(
-        *(set(feature_names_for_ablation(a)) for a in names_to_train))
-    need_b = bool(feats_needed & set(GROUP_B_NAMES))
-    need_f = bool(feats_needed & set(GROUP_F_NAMES))
-
     # Scene identity, for the predict-time guard against pointing --ml-model-dir at the
     # wrong scene (ml/predict.py::load_model's expected_n_gs check) -- read directly from
     # the oracle npz's gen_meta (same 2-line read static_cache_from_oracle does internally,
@@ -331,15 +323,14 @@ def train_scene(oracle_npz_path: str, output_dir: str, seed: int = 0,
     source_ply_n_gs = _oracle_meta.get("n_total_gs")
 
     print(f"\n{'='*60}", flush=True)
-    print(f"Building feature matrix from: {oracle_npz_path} "
-          f"(need_b={need_b} need_f={need_f})", flush=True)
-    df, all_names = build_feature_matrix(oracle_npz_path, need_b=need_b, need_f=need_f)
+    print(f"Building feature matrix from: {oracle_npz_path}", flush=True)
+    df, all_names = build_feature_matrix(oracle_npz_path)
     print(f"  rows={len(df):,}  tiles={df['tile'].nunique()}  cameras={df['camera'].nunique()}", flush=True)
 
     df = df[df["log_mse_loo"].notna()].copy()
     print(f"  After nan filter: {len(df):,} rows", flush=True)
 
-    # Static feature cache (Group C+D) — camera-invariant, shipped with the model so
+    # Static feature cache (Group C) — camera-invariant, shipped with the model so
     # selection never rebuilds it from the PLY. Computed once; written into each
     # ablation dir (where selection's --ml-model-dir points).
     static_feats, cache_index_offsets = static_cache_from_oracle(oracle_npz_path)
@@ -425,9 +416,6 @@ def train_scene(oracle_npz_path: str, output_dir: str, seed: int = 0,
             print(f"    {model.upper():5s}  ρ_train_full={rho_full:.4f}  "
                   f"(saved {model}.pkl)", flush=True)
 
-        include_b = any(c in feat_cols for c in ("wbar_k_screen", "W_k_screen"))
-        include_d = any("_skew" in c for c in feat_cols)
-
         metrics = {
             "ablation":       ablation,
             "n_features":     len(feat_cols),
@@ -437,8 +425,6 @@ def train_scene(oracle_npz_path: str, output_dir: str, seed: int = 0,
             "n_split_units":  int(n_units),
             "split_key":      split_key,
             "seed":           seed,
-            "include_group_b": include_b,
-            "include_group_d": include_d,
             "source_ply":       source_ply,
             "source_ply_n_gs":  source_ply_n_gs,
         }

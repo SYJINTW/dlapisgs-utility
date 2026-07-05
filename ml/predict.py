@@ -1,8 +1,9 @@
 """Inference helper: per-tile utility scores from a trained ML model.
 
 Loads a model from model_dir/{model_type}.pkl and feature_names.json,
-assembles features from precomputed static (C+D) + per-camera (A+B),
-returns (tile_idx, lod=0) pairs sorted descending by predicted score.
+assembles features from precomputed static (C) + per-camera (A, includes
+cos_cam_tile), returns (tile_idx, lod=0) pairs sorted descending by predicted
+score.
 
 The model output is used directly as tile priority — no invisible-tile floor.
 v_k is in Group A so the model learns visibility importance end-to-end.
@@ -68,25 +69,19 @@ def predict_utility(
     model_dir: str,
     model_type: str,          # "lgbm" | "xgb" | "rf"
     *,
-    static_features: np.ndarray,   # (N_tiles, 134) — Groups C+D, precomputed at startup
-    group_a: np.ndarray,            # (N_tiles, 14)  — Group A per camera
-    group_b: "np.ndarray | None",   # (N_tiles, 12)  — Group B or None
+    static_features: np.ndarray,   # (N_tiles, 118) — Group C, precomputed at startup
+    group_a: np.ndarray,            # (N_tiles, 15)  — Group A per camera (incl. cos_cam_tile)
     feature_names: list,            # list[str] from feature_names.json
     model=None,                     # pre-loaded model; if None, load from disk
-    group_g: "np.ndarray | None" = None,  # (N_tiles, 1) — Group G (viewpoint-interaction) or None
 ) -> np.ndarray:
     """Predict tile utility and return sorted (tile_idx, lod=0) pairs.
 
     Args:
         model_dir:       Dir with {lgbm|xgb|rf}.pkl and feature_names.json.
         model_type:      Which model to use: "lgbm", "xgb", or "rf".
-        static_features: Groups C+D precomputed at startup. Shape (N_tiles, 134).
-        group_a:         Group A per-camera features. Shape (N_tiles, 14).
-        group_b:         Group B per-camera features. Shape (N_tiles, 12), or None
-                         if model was trained without Group B.
+        static_features: Group C precomputed at startup. Shape (N_tiles, 118).
+        group_a:         Group A per-camera features. Shape (N_tiles, 15).
         feature_names:   Column names matching training order.
-        group_g:         Group G (viewpoint-interaction) per-camera feature. Shape
-                         (N_tiles, 1), or None if model was trained without Group G.
 
     Returns:
         np.ndarray shape (N_tiles,), dtype float64: raw predicted utility scores.
@@ -101,34 +96,18 @@ def predict_utility(
             )
         model = joblib.load(model_pkl)
 
-    # ── Assemble full feature matrix [A | B | C | D | G] ──────────────────
-    parts = [group_a]
-    if group_b is not None:
-        parts.append(group_b)
-    parts.append(static_features)
-    if group_g is not None:
-        parts.append(group_g)
-    X_all = np.hstack(parts)
+    # ── Assemble full feature matrix [A | C] ────────────────────────────────
+    X_all = np.hstack([group_a, static_features])
 
     # ── Select columns matching training feature order ─────────────────────
-    # Build column name → index map from ALL_FEATURE_NAMES order used in X_all.
-    # The order in X_all depends on whether group_b/group_g are present.
-    from ml.features import (GROUP_A_NAMES, GROUP_B_NAMES,
-                              GROUP_C_NAMES, GROUP_D_NAMES, GROUP_G_NAMES)
-    all_col_names = GROUP_A_NAMES[:]
-    if group_b is not None:
-        all_col_names += GROUP_B_NAMES
-    all_col_names += GROUP_C_NAMES + GROUP_D_NAMES
-    if group_g is not None:
-        all_col_names += GROUP_G_NAMES
-
+    from ml.features import GROUP_A_NAMES, GROUP_C_NAMES
+    all_col_names = GROUP_A_NAMES + GROUP_C_NAMES
     col_map = {name: i for i, name in enumerate(all_col_names)}
     try:
         feat_idx = [col_map[n] for n in feature_names]
     except KeyError as e:
         raise KeyError(
-            f"Feature '{e.args[0]}' in feature_names.json not found in assembled matrix. "
-            "Ensure the model was trained with matching Group B setting."
+            f"Feature '{e.args[0]}' in feature_names.json not found in assembled matrix."
         ) from e
 
     X = X_all[:, feat_idx].astype(np.float32)
@@ -163,9 +142,7 @@ def predict_utility_blend(
     *,
     static_features: np.ndarray,
     group_a: np.ndarray,
-    group_b: "np.ndarray | None",
     feature_names: list,
-    group_g: "np.ndarray | None" = None,
     models: "dict | None" = None,
 ) -> np.ndarray:
     """Average per-tile importance across the RF/LGBM/XGB models already trained for
@@ -185,8 +162,8 @@ def predict_utility_blend(
     linear_preds = [
         np.exp(predict_utility(
             model_dir, model_type,
-            static_features=static_features, group_a=group_a, group_b=group_b,
-            feature_names=feature_names, group_g=group_g, model=model,
+            static_features=static_features, group_a=group_a,
+            feature_names=feature_names, model=model,
         ))
         for model_type, model in models.items()
     ]

@@ -287,7 +287,6 @@ def _time_method(
                     model_type=args.ml_model_type,
                     static_features=ml_static_feats,
                     group_a=group_a,
-                    group_b=None,
                     feature_names=ml_feature_names,
                     model=ml_model,
                 ))

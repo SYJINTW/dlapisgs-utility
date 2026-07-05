@@ -333,15 +333,24 @@ def compute_raw_scores(scheme, *, oracle_data, camera_index, n_tiles,
         return oracle_scores(scheme, oracle_data, camera_index, n_tiles)
     elif scheme == "ml":
         from ml import predict as ml_predict
-        # Model predicts log(mse_loo); exp() recovers the positive linear ΔMSE so the
-        # per-byte sort divides a real importance. exp is monotonic -> plain sort unchanged.
-        ml_kwargs = {k: v for k, v in ml_predict_kwargs.items() if k != "models"}
-        return np.exp(ml_predict.predict_utility(**ml_kwargs))
+        ml_kwargs = {k: v for k, v in ml_predict_kwargs.items()
+                     if k in ("model_dir", "model_type", "static_features",
+                              "group_a", "feature_names", "model")}
+        raw = ml_predict.predict_utility(**ml_kwargs)
+        if ml_kwargs.get("model_type") == "lgbm_rank":
+            # LGBMRanker's predict() is an arbitrary-scale lambdarank margin, never
+            # log(mse_loo) -- exp()-ing it distorts marginal (score/bytes) ratios between
+            # tiles of different byte cost, unlike the regression models below where exp()
+            # genuinely recovers a linear ΔMSE. Use the raw margin directly.
+            return raw
+        # Regression models (rf/lgbm/xgb via ml/train.py) predict log(mse_loo); exp()
+        # recovers the positive linear ΔMSE so the per-byte sort divides a real importance.
+        return np.exp(raw)
     elif scheme == "ml_blend":
         from ml import predict as ml_predict
         blend_kwargs = {k: v for k, v in ml_predict_kwargs.items()
-                        if k in ("model_dir", "static_features", "group_a", "group_b",
-                                 "feature_names", "group_g", "models")}
+                        if k in ("model_dir", "static_features", "group_a",
+                                 "feature_names", "models")}
         return ml_predict.predict_utility_blend(**blend_kwargs)
     else:
         include_lod = scheme != "vd"

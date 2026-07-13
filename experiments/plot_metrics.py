@@ -122,6 +122,9 @@ def _load_overlay(overlay_csv: str | None, overlay_filter: list[str] | None,
 
 def _aggregate(rows: list[dict], group_by: str) -> dict[str, dict]:
     # Two-stage: cam→scene mean, then CI over n_scenes (fixes 12× too-tight CI from pooling).
+    # lpips is only present in sweeps run with --lpips (exp4 onward, 2026-07-09); older
+    # sweeps (exp1/exp2) have no "lpips" column at all -- skip it rather than KeyError.
+    has_lpips = bool(rows) and "lpips" in rows[0]
     buckets: dict[str, dict] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for r in rows:
         key = r.get(group_by) or f"missing_{group_by}"
@@ -132,15 +135,18 @@ def _aggregate(rows: list[dict], group_by: str) -> dict[str, dict]:
     for key, budgets in buckets.items():
         result[key] = {}
         for bk, scenes in budgets.items():
-            spsnr, sssim, sngs = [], [], []
+            spsnr, sssim, slpips, sngs = [], [], [], []
             n_cams = 0
             for entries in scenes.values():
                 spsnr.append(np.minimum(
                     np.array([float(e["psnr"]) for e in entries]), PSNR_SATURATION_DB).mean())
                 sssim.append(np.array([float(e["ssim"]) for e in entries]).mean())
+                if has_lpips:
+                    slpips.append(np.array([float(e["lpips"]) for e in entries]).mean())
                 sngs.append(np.array([float(e.get("selected_gaussians", 0)) for e in entries]).mean())
                 n_cams += len(entries)
-            spsnr = np.array(spsnr); sssim = np.array(sssim); sngs = np.array(sngs)
+            spsnr = np.array(spsnr); sssim = np.array(sssim)
+            slpips = np.array(slpips); sngs = np.array(sngs)
             n = len(spsnr)
             ci = 1.96 / max(np.sqrt(n), 1.0)
             result[key][bk] = {
@@ -148,6 +154,10 @@ def _aggregate(rows: list[dict], group_by: str) -> dict[str, dict]:
                 "psnr_ci95": float(spsnr.std(ddof=1) * ci) if n > 1 else 0.0,
                 "ssim_mean": float(sssim.mean()),
                 "ssim_ci95": float(sssim.std(ddof=1) * ci) if n > 1 else 0.0,
+                **({
+                    "lpips_mean": float(slpips.mean()),
+                    "lpips_ci95": float(slpips.std(ddof=1) * ci) if n > 1 else 0.0,
+                } if has_lpips else {}),
                 "ngs_mean":  float(sngs.mean()),
                 "ngs_ci95":  float(sngs.std(ddof=1) * ci) if n > 1 else 0.0,
                 "n": n,

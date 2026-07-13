@@ -188,10 +188,11 @@ def _time_method(
                 dists = uc.calculate_distances(tile_centers, cam.camera_center.to(device))
 
             with _timed("gaussian_weights", stages):
-                w_gi = sc.compute_camera_weights(
-                    cam, opacity, scale_0, scale_1, scale_2,
+                w_gi = sc.camera_weights_for_scope(
+                    args.gs_weight_scope, cam, vis, opacity, scale_0, scale_1, scale_2,
                     rot_0, rot_1, rot_2, rot_3, gs_xyz_t, device,
-                    wm, args.img_w, args.img_h)
+                    wm, args.img_w, args.img_h,
+                    tile_index_offsets, tile_flat_indices)
 
             with _timed("greedy", stages):
                 all_ordered = sc.greedy_order_progressive(
@@ -416,6 +417,14 @@ def main() -> None:
                              "measuring the cost of that option. vd_lod always uses 'ply' "
                              "(canonical convention, not user-selectable -- see run_exp2.sh). "
                              "heuristic/progressive_* always use real weights, unaffected.")
+    parser.add_argument("--gs-weight-scope", default="full", choices=["full", "visible"],
+                        help="Exp1 (2026-07-13): progressive_* methods only. 'full' (default) "
+                             "computes compute_camera_weights over every Gaussian in the scene, "
+                             "regardless of tile visibility -- current/original behavior. "
+                             "'visible' uses compute_camera_weights_culled: only visible-tile "
+                             "Gaussians get real weight, everything else gets epsilon=0.0. Not "
+                             "wired into heuristic/vd_lod/ml/oracle_online -- out of scope for "
+                             "this round.")
     parser.add_argument("--budget-pct", nargs="+", type=int,
                         default=[10, 25, 40, 55, 70, 85, 99, 100])
     parser.add_argument("--camera-index",   type=int, default=-1)
@@ -551,6 +560,7 @@ def main() -> None:
         "ml_model_dir":   args.ml_model_dir,
         "ml_model_type":  args.ml_model_type,
         "gs_order":       args.gs_order,
+        "gs_weight_scope": args.gs_weight_scope,
         "budget_pct":     args.budget_pct,
         "n_cameras_run":  len(camera_indices),
         "img_w":          args.img_w,
@@ -602,6 +612,8 @@ def main() -> None:
         dir_name = f"ml_{args.ml_model_type}" if method == "ml" else method
         if method in ("ml", "oracle_online") and args.gs_order == "weight":
             dir_name = f"{dir_name}_wtord"
+        if method in _PROG_WEIGHT_MODE and args.gs_weight_scope == "visible":
+            dir_name = f"{dir_name}_visible"
         out_dir = Path(args.output_root) / args.scene / dir_name
         out_dir.mkdir(parents=True, exist_ok=True)
 

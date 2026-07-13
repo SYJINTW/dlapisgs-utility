@@ -66,7 +66,6 @@ from oracle_dq import ply_fingerprint  # noqa: E402
 # unchanged -- only the definitions moved. See selection_core.py::greedy_order's own docstring
 # for its current implementation and perf history -- don't restate it here, it'll go stale.
 _bytes_per_gaussian       = sc.bytes_per_gaussian
-_compute_camera_weights   = sc.compute_camera_weights
 _greedy_order_progressive = sc.greedy_order_progressive
 _greedy_order_tile_strict = sc.greedy_order_tile_strict
 _greedy_order             = sc.greedy_order
@@ -79,6 +78,7 @@ _load_trace               = sc.load_trace
 _compute_metrics          = sc.compute_metrics
 _subset_gaussians         = sc.subset_gaussians
 _render_gs                = sc.render_gs
+_camera_weights_for_scope = sc.camera_weights_for_scope
 
 # Renderer deps (gaussian_splatting env)
 RENDERER_ROOT = WORKSPACE / "LapisGS-object-based-renderer"
@@ -93,7 +93,7 @@ from streaming_utils.camera_loader import load_camera_from_streaming_config  # n
 from utils.image_utils import psnr as gs_psnr  # noqa: E402  # type: ignore
 from utils.loss_utils import ssim as gs_ssim  # noqa: E402  # type: ignore
 
-VALID_SCHEMES = ["vd", "vd_lod", "vd_lod_w", "v_lod_w", "vd_lod_c", "vd_lod_w_c",
+VALID_SCHEMES = ["vd", "vd_lod", "vd_lod_w", "v_lod_w", "w_lod", "vd_lod_c", "vd_lod_w_c",
                  "ml", "ml_blend",
                  "oracle_loo", "oracle_loo_ssim", "oracle_aoi", "oracle_combined"]
 PLY_WORKERS = 4
@@ -368,10 +368,11 @@ def _rerender_rep_views(
         distances = uc.calculate_distances(tile_centers, sel_cam.camera_center.to(device))
         visibility = visibility_AABB_pytorch.batched_check_tiles_visible(
             min_corners_t, max_corners_t, sel_cam, device=device)
-        w_gi = _compute_camera_weights(
-            sel_cam, opacity, scale_0, scale_1, scale_2,
+        w_gi = _camera_weights_for_scope(
+            args.gs_weight_scope, sel_cam, visibility, opacity, scale_0, scale_1, scale_2,
             rot_0, rot_1, rot_2, rot_3, gs_xyz_t, device,
-            args.weight_mode, args.img_w, args.img_h)
+            args.weight_mode, args.img_w, args.img_h,
+            tile_index_offsets, tile_flat_indices)
         W_k, N_k = uc.compute_tile_weights_and_counts(
             tile_index_offsets, tile_flat_indices, w_gi,
             w_norm=args.w_norm, c_norm=args.c_norm)
@@ -499,6 +500,18 @@ def main() -> None:
                              "'utility' = raw score (legacy).")
     parser.add_argument("--weight-mode", type=str, default="screen_area",
                         choices=list(uc.WEIGHT_MODES))
+    parser.add_argument("--gs-weight-scope", type=str, default="full",
+                        choices=["full", "visible"],
+                        help="Exp1/Exp2 (2026-07-13). 'full' (default) computes "
+                             "gaussian_weights over every Gaussian in the scene, regardless "
+                             "of tile visibility -- current/original behavior, unaffected "
+                             "unless explicitly overridden. 'visible' only evaluates "
+                             "visible-tile Gaussians; everything else gets epsilon=0.0 "
+                             "(screen_area's FOV clamp doesn't naturally decay off-frustum "
+                             "weight -- see selection_core.py::compute_camera_weights_culled). "
+                             "Used by: --packing-mode progressive (Exp1) and --scheme w_lod "
+                             "(Exp2, tile_partial -- w_lod's W_k is only sound when built "
+                             "from culled weights).")
     parser.add_argument("--tiling-cache", type=str, default=None)
 
     parser.add_argument("--ml-model-dir", type=str, default=None)
@@ -892,10 +905,11 @@ def main() -> None:
         cam_pbar.set_postfix(idx=camera_index, stage="gaussian_weights")
         with _timed("gaussian_weights", timings, camera=camera_index,
                     weight_mode=args.weight_mode):
-            w_gi = _compute_camera_weights(
-                sel_cam, opacity, scale_0, scale_1, scale_2,
+            w_gi = _camera_weights_for_scope(
+                args.gs_weight_scope, sel_cam, visibility, opacity, scale_0, scale_1, scale_2,
                 rot_0, rot_1, rot_2, rot_3, gs_xyz_t, device,
-                args.weight_mode, args.img_w, args.img_h)
+                args.weight_mode, args.img_w, args.img_h,
+                tile_index_offsets, tile_flat_indices)
 
         cam_pbar.set_postfix(idx=camera_index, stage="tile_weights")
         with _timed("tile_weights", timings, camera=camera_index):

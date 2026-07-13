@@ -92,6 +92,70 @@ def compute_camera_weights(sel_cam, opacity, scale_0, scale_1, scale_2,
     return uc.compute_gaussian_weights_v2(weight_mode, **kw).to(device)
 
 
+def compute_camera_weights_culled(sel_cam, opacity, scale_0, scale_1, scale_2,
+                                   rot_0, rot_1, rot_2, rot_3, gs_xyz_t, device,
+                                   weight_mode, img_w, img_h,
+                                   visible_gs_indices, n_total_gs, epsilon=0.0):
+    """Like compute_camera_weights, but only evaluates weight_mode's math for the
+    visible-tile Gaussian subset (visible_gs_indices, global GS ids); every other index
+    gets `epsilon`. Saves both the per-GS projection compute and the H2D transfer size,
+    proportional to the culled fraction. Same dense length-n_total_gs output contract as
+    compute_camera_weights, so every existing w_gi[...] consumer is unaffected.
+
+    Exp1 (2026-07-13): screen_area's FOV clamp (project_covariance_2d, mirrors the real
+    3DGS rasterizer's own clamp) bounds the off-axis *angle*, not the magnitude -- a
+    Gaussian close to the near plane still gets an unbounded 1/tz^2-driven weight even if
+    clamped off-axis. Measured: invisible-tile Gaussians can carry MORE weight than
+    visible-tile ones (bicycle cam0: 59% of total weight mass sat in invisible tiles).
+    This is why invisible-tile Gaussians get `epsilon`, not "left alone" -- the projection
+    math does not naturally decay them.
+    """
+    w_gi = torch.full((n_total_gs,), float(epsilon), dtype=torch.float32, device=device)
+    if visible_gs_indices.numel() == 0:
+        return w_gi
+
+    idx_np = visible_gs_indices.detach().cpu().numpy()
+    kw = dict(opacity=opacity[idx_np], scale_0=scale_0[idx_np], scale_1=scale_1[idx_np],
+              scale_2=scale_2[idx_np], xyz=gs_xyz_t[visible_gs_indices],
+              cam_center=sel_cam.camera_center.to(device))
+    if weight_mode == "screen_area":
+        if any(r is None for r in (rot_0, rot_1, rot_2, rot_3)):
+            raise RuntimeError("weight_mode=screen_area requires rot_0..rot_3 in PLY")
+        kw.update(rot_0=rot_0[idx_np], rot_1=rot_1[idx_np], rot_2=rot_2[idx_np], rot_3=rot_3[idx_np],
+                  world_view=sel_cam.world_view_transform,
+                  proj=sel_cam.projection_matrix,
+                  img_w=img_w, img_h=img_h,
+                  fov_x=getattr(sel_cam, "FoVx", None),
+                  fov_y=getattr(sel_cam, "FoVy", None))
+    sub_w = uc.compute_gaussian_weights_v2(weight_mode, **kw).to(device)
+    w_gi[visible_gs_indices] = sub_w
+    return w_gi
+
+
+def camera_weights_for_scope(gs_weight_scope, sel_cam, visibility, opacity, scale_0, scale_1,
+                              scale_2, rot_0, rot_1, rot_2, rot_3, gs_xyz_t, device,
+                              weight_mode, img_w, img_h,
+                              tile_index_offsets, tile_flat_indices):
+    """Shared full/visible GS-weight dispatch (Exp1/Exp2, 2026-07-13) -- single
+    implementation for both callers (test_utility_inmem.py: progressive packing + w_lod
+    scheme; time_selection.py: progressive_* methods), not duplicated per caller.
+    'visible' derives visible_gs_indices from tile-level visibility and calls
+    compute_camera_weights_culled; 'full' calls compute_camera_weights unchanged."""
+    if gs_weight_scope == "visible":
+        sizes = tile_index_offsets[1:] - tile_index_offsets[:-1]
+        per_gs_vis = torch.repeat_interleave(visibility.to(device=device, dtype=torch.bool), sizes)
+        visible_gs_indices = tile_flat_indices[per_gs_vis]
+        return compute_camera_weights_culled(
+            sel_cam, opacity, scale_0, scale_1, scale_2,
+            rot_0, rot_1, rot_2, rot_3, gs_xyz_t, device,
+            weight_mode, img_w, img_h,
+            visible_gs_indices, len(opacity))
+    return compute_camera_weights(
+        sel_cam, opacity, scale_0, scale_1, scale_2,
+        rot_0, rot_1, rot_2, rot_3, gs_xyz_t, device,
+        weight_mode, img_w, img_h)
+
+
 # ---------------------------------------------------------------------------
 # Greedy packing
 # ---------------------------------------------------------------------------
@@ -116,8 +180,13 @@ def greedy_order_progressive(visibility_tile, tile_index_offsets, tile_flat_indi
         gen.manual_seed(shuffle_seed + 1)
         invisible_sorted = invisible_gs[torch.randperm(len(invisible_gs), generator=gen, device=device)]
     else:
-        visible_sorted = visible_gs[torch.argsort(w_gi[visible_gs], descending=True)]
-        invisible_sorted = invisible_gs[torch.argsort(w_gi[invisible_gs], descending=True)]
+        # stable=True: under --gs-weight-scope visible (compute_camera_weights_culled),
+        # every invisible-tile GS ties at exactly `epsilon` -- an unstable sort would make
+        # this pool's fallback order nondeterministic run-to-run. Cheap either way.
+        # torch.argsort(..., stable=) isn't accepted in this env's torch==1.12.1 -- use
+        # torch.sort(..., stable=True).indices instead, which has supported it since 1.9.
+        visible_sorted = visible_gs[torch.sort(w_gi[visible_gs], descending=True, stable=True).indices]
+        invisible_sorted = invisible_gs[torch.sort(w_gi[invisible_gs], descending=True, stable=True).indices]
 
     if visible_sorted.numel() >= max_count:
         return visible_sorted[:max_count].detach().cpu().numpy().astype(np.int64, copy=False)
@@ -356,9 +425,14 @@ def compute_raw_scores(scheme, *, oracle_data, camera_index, n_tiles,
         return ml_predict.predict_utility_blend(**blend_kwargs)
     else:
         include_lod = scheme != "vd"
-        include_v = True  # flag ready for future v-ablation; all current schemes keep visibility
-        include_d = scheme.startswith("vd")  # False only for v_lod_w (W_k already encodes ∝1/d²)
-        include_w = scheme in ("vd_lod_w", "vd_lod_w_c", "v_lod_w")
+        # w_lod (Exp2, 2026-07-13): W_k alone, no explicit v or d -- only sound when W_k
+        # itself was built from --gs-weight-scope visible (culled) weights, otherwise an
+        # invisible tile's own W_k isn't naturally near-zero (screen_area's FOV clamp
+        # doesn't decay off-frustum weight -- see compute_camera_weights_culled). Caller
+        # is responsible for that; this dispatcher just wires the flags.
+        include_v = scheme != "w_lod"
+        include_d = scheme.startswith("vd")  # False for v_lod_w/w_lod (W_k already encodes ∝1/d²)
+        include_w = scheme in ("vd_lod_w", "vd_lod_w_c", "v_lod_w", "w_lod")
         include_c = scheme in ("vd_lod_c", "vd_lod_w_c")
         return uc.calculate_utility_param(
             visibility, distances, num_of_level=num_lod,

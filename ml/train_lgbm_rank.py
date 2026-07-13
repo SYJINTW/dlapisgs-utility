@@ -42,6 +42,7 @@ HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 
 from ml.features import build_feature_matrix, feature_names_for_ablation  # noqa: E402
+from ml.predict import exp_clipped  # noqa: E402
 
 
 def _rank_label(marginal_key: "np.ndarray", n_bins: int) -> np.ndarray:
@@ -55,7 +56,7 @@ def _rank_label(marginal_key: "np.ndarray", n_bins: int) -> np.ndarray:
 
 def _add_rank_label(df, n_bins: int):
     df = df.copy()
-    df["marginal_key"] = np.exp(df["log_mse_loo"]) / df["N_k"].clip(lower=1.0)
+    df["marginal_key"] = exp_clipped(df["log_mse_loo"].to_numpy()) / df["N_k"].clip(lower=1.0)
     df["rank_label"] = df.groupby("camera")["marginal_key"].transform(
         lambda s: _rank_label(s.to_numpy(), n_bins))
     return df

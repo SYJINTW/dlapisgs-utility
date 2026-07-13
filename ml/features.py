@@ -324,10 +324,21 @@ def build_feature_matrix(oracle_npz_path: str) -> "tuple[pd.DataFrame, list]":
 
         row_idx = cam_to_row[cam_idx_int]
         mse_row = mse_loo[row_idx]   # (N_tiles,)
-        # Avoid log(0) warning: replace non-positive values with 1.0 before log,
-        # then mask them out to nan in the final array.
-        _safe = np.where(mse_row > 0, mse_row, 1.0)
-        log_mse = np.where(mse_row > 0, np.log(_safe), np.nan)
+        # mse_loo <= 0 (bit-identical LOO render, or floating-point noise making it
+        # marginally closer to GT than the baseline) means "negligible importance", not
+        # "unmeasurable" -- floor at MSE_EPS instead of dropping to NaN, so the model
+        # still trains on these as strongly-negative-log examples. Real missing/NaN
+        # entries in mse_row stay NaN (np.maximum propagates NaN) and are filtered
+        # downstream by log_mse_loo.notna(). Was silently NaN-dropping ~90%+ of tiny-tile
+        # (cam,tile) rows on real scenes at fine grids, starving the model of the exact
+        # "this genuinely doesn't matter" signal it needs (2026-07-09 grid16 investigation).
+        # MSE_EPS must sit below every genuinely-measured positive mse_loo in the dataset,
+        # or floored (<=0) rows would rank as MORE important than real tiny-but-nonzero
+        # survivors -- checked across all grids/scenes/train splits, global min positive
+        # mse_loo is ~7.2e-24 (log~-53.3); 1e-30 (log~-69.1) stays ~16 orders below that,
+        # comfortably clear of float32 underflow (~1.2e-38 normal, ~1e-45 subnormal).
+        MSE_EPS = 1e-30
+        log_mse = np.log(np.maximum(mse_row, MSE_EPS))
 
         cam_df = pd.DataFrame(
             X_cam, columns=ALL_FEATURE_NAMES, dtype=np.float32

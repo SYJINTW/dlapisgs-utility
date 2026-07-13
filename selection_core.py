@@ -345,7 +345,9 @@ def compute_raw_scores(scheme, *, oracle_data, camera_index, n_tiles,
             return raw
         # Regression models (rf/lgbm/xgb via ml/train.py) predict log(mse_loo); exp()
         # recovers the positive linear ΔMSE so the per-byte sort divides a real importance.
-        return np.exp(raw)
+        # exp_clipped guards against a single OOD prediction dominating the marginal sort
+        # (see ml/predict.py::LOG_MSE_CLIP).
+        return ml_predict.exp_clipped(raw)
     elif scheme == "ml_blend":
         from ml import predict as ml_predict
         blend_kwargs = {k: v for k, v in ml_predict_kwargs.items()

@@ -23,14 +23,14 @@
 # Env overrides:
 #   SCENES="chair bicycle"
 #   GRIDS="8 1 2 4 16"
-#   CUDA_VISIBLE_DEVICES=0
+#   CUDA_VISIBLE_DEVICES=2
 #   OUTPUT_ROOT=.../output/MMDD/quality_sweep
 set -euo pipefail
 
 ROOT="/mnt/data1/samk/gs-quic/cs5262_tile_quic"
 UTIL_DIR="$ROOT/dlapisgs-utility"
 DSET="$ROOT/exp-dataset"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"   # GPU0 banned
 
 MIN_FREE_MIB="${MIN_FREE_MIB:-8192}"
 check_gpu_free() {
@@ -53,7 +53,8 @@ NUM_LOD="${NUM_LOD:-1}"
 OUT_BASE="${OUTPUT_ROOT:-$UTIL_DIR/output/0704/quality_sweep}"
 ORACLE_ROOT="${ORACLE_ROOT:-$UTIL_DIR/output/oracle}"     # {ORACLE_ROOT}/{grid}/eval/{scene}/oracle_dq.npz
 
-ML_DIR="${ML_DIR:-$UTIL_DIR/output/ml_models_experimental/pooled_all10_ACG}"
+# ML_DIR: leave unset to get the per-grid model picked inside the grid loop
+# (pooled_all10_ACG_grid{1,2,4,8,16}); set explicitly to pin one dir for every grid.
 ML_TYPE="${ML_TYPE:-lgbm}"
 
 TILING_CACHE_BASE="${TILING_CACHE_BASE:-$UTIL_DIR/output/oracle_tiling_cache}"
@@ -63,7 +64,7 @@ echo "Quality sweep @1600² (exp1+2+3+4 tables, LPIPS enabled)"
 echo "OUTPUT_ROOT : $OUT_BASE"
 echo "SCENES      : $SCENES"
 echo "GRIDS       : $GRIDS"
-echo "ML_DIR      : $ML_DIR ($ML_TYPE)"
+echo "ML_DIR      : ${ML_DIR:-<per-grid: pooled_all10_ACG_grid<N>>} ($ML_TYPE)"
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "=========================================="
 
@@ -72,6 +73,11 @@ mkdir -p "$OUT_BASE"
 for g in $GRIDS; do
     echo ""
     echo "====== grid=${g}x${g}x${g} ======"
+    # ml scheme needs a model trained on THIS grid's tile geometry -- a grid8-trained
+    # model scores nonsense on grid1/2/4/16 tile features. ML_DIR env override (if set)
+    # still wins for a single fixed dir; otherwise pick the per-grid trained model.
+    ML_DIR_G="${ML_DIR:-$UTIL_DIR/output/ml_models_experimental/pooled_all10_ACG_grid${g}}"
+    echo "ML_DIR (grid${g}): $ML_DIR_G"
 
     for scene in $SCENES; do
         PLY="$DSET/$scene/point_cloud.ply"
@@ -138,7 +144,7 @@ for g in $GRIDS; do
                 --scene "$scene" --group-by scheme \
                 --tiling-cache "$TILING_CACHE" \
                 --oracle-npz "$ORACLE_NPZ" \
-                --ml-model-dir "$ML_DIR" --ml-model-type "$ML_TYPE" \
+                --ml-model-dir "$ML_DIR_G" --ml-model-type "$ML_TYPE" \
                 --lpips --save-rep-only
         done
     done

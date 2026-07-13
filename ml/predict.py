@@ -116,6 +116,20 @@ def predict_utility(
     return model.predict(X).astype(np.float64)   # (N_tiles,) raw scores
 
 
+# Legitimate log(mse_loo) values live in ~[-70, 5] (features.py's MSE_EPS=1e-30 floor
+# sets the low end; observed real ΔMSE values set the high end). exp_clipped bounds both
+# ends independently of that upstream floor -- a single OOD feature row, or a future
+# regression in features.py's floor, can't produce a linear score that overflows or
+# dominates the marginal (per-byte) greedy sort. 2026-07-09: every exp(log_mse_loo) call
+# site was unclamped before this.
+LOG_MSE_CLIP = (-80.0, 20.0)
+
+
+def exp_clipped(log_val: np.ndarray) -> np.ndarray:
+    """exp() with a defensive clip on the log-space input -- see LOG_MSE_CLIP."""
+    return np.exp(np.clip(log_val, *LOG_MSE_CLIP))
+
+
 _BLEND_MODEL_TYPES = ("rf", "lgbm", "xgb")
 
 
@@ -160,7 +174,7 @@ def predict_utility_blend(
         models = load_blend_models(model_dir)
 
     linear_preds = [
-        np.exp(predict_utility(
+        exp_clipped(predict_utility(
             model_dir, model_type,
             static_features=static_features, group_a=group_a,
             feature_names=feature_names, model=model,

@@ -42,6 +42,7 @@ from ml.features import build_feature_matrix, feature_names_for_ablation  # noqa
 from ml.train_lgbm_rank import (_rank_label, _per_camera_rho,  # noqa: E402
                                 fit_single_scene_ranker)
 from ml.cross_scene.train_pooled import SCENE_SETS  # noqa: E402
+from ml.predict import exp_clipped  # noqa: E402
 
 LABEL = "log_mse_loo"
 
@@ -65,7 +66,7 @@ def _add_rank_label_pooled(df, n_bins):
     by (scene, camera) -- camera indices repeat across scenes, "camera" alone would collide.
     """
     df = df.copy()
-    df["marginal_key"] = np.exp(df[LABEL]) / df["N_k"].clip(lower=1.0)
+    df["marginal_key"] = exp_clipped(df[LABEL].to_numpy()) / df["N_k"].clip(lower=1.0)
     df["rank_label"] = (
         df.groupby(["scene", "camera"])["marginal_key"]
           .transform(lambda s: _rank_label(s.to_numpy(), n_bins))

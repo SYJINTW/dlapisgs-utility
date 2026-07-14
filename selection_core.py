@@ -80,9 +80,9 @@ def compute_camera_weights(sel_cam, opacity, scale_0, scale_1, scale_2,
     cam_center = sel_cam.camera_center.to(device)
     kw = dict(opacity=opacity, scale_0=scale_0, scale_1=scale_1, scale_2=scale_2,
               xyz=gs_xyz_t, cam_center=cam_center)
-    if weight_mode == "screen_area":
+    if weight_mode in ("screen_area", "screen_area_over_d2"):
         if any(r is None for r in (rot_0, rot_1, rot_2, rot_3)):
-            raise RuntimeError("weight_mode=screen_area requires rot_0..rot_3 in PLY")
+            raise RuntimeError(f"weight_mode={weight_mode} requires rot_0..rot_3 in PLY")
         kw.update(rot_0=rot_0, rot_1=rot_1, rot_2=rot_2, rot_3=rot_3,
                   world_view=sel_cam.world_view_transform,
                   proj=sel_cam.projection_matrix,
@@ -118,9 +118,9 @@ def compute_camera_weights_culled(sel_cam, opacity, scale_0, scale_1, scale_2,
     kw = dict(opacity=opacity[idx_np], scale_0=scale_0[idx_np], scale_1=scale_1[idx_np],
               scale_2=scale_2[idx_np], xyz=gs_xyz_t[visible_gs_indices],
               cam_center=sel_cam.camera_center.to(device))
-    if weight_mode == "screen_area":
+    if weight_mode in ("screen_area", "screen_area_over_d2"):
         if any(r is None for r in (rot_0, rot_1, rot_2, rot_3)):
-            raise RuntimeError("weight_mode=screen_area requires rot_0..rot_3 in PLY")
+            raise RuntimeError(f"weight_mode={weight_mode} requires rot_0..rot_3 in PLY")
         kw.update(rot_0=rot_0[idx_np], rot_1=rot_1[idx_np], rot_2=rot_2[idx_np], rot_3=rot_3[idx_np],
                   world_view=sel_cam.world_view_transform,
                   proj=sel_cam.projection_matrix,

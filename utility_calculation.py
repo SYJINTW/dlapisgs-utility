@@ -33,7 +33,7 @@ DISTANCE_EPS = 1e-3
 
 W_MODES = ("sum",)
                           # and is not a good idea for utility scoring
-WEIGHT_MODES = ("volume", "volume_over_d2", "screen_area", "random")
+WEIGHT_MODES = ("volume", "volume_over_d2", "screen_area", "screen_area_over_d2", "random")
 NORM_MODES = ("none", "max", "minmax", "log1p", "sum")
 
 COMPLEXITY_KINDS = ("eigenentropy", "omnivariance", "voxel_entropy", "spectral_energy")
@@ -158,7 +158,11 @@ def compute_gaussian_weights_v2(weight_mode, *, opacity, scale_0, scale_1, scale
     """Per-Gaussian weight under one of the named WEIGHT_MODES.
 
     volume: sigmoid(o)·det(Σ)^0.5  |  volume_over_d2: volume/d²
-    screen_area: sigmoid(o)·π·√det(Σ_2D)  |  random: U(0,1) seeded baseline
+    screen_area: sigmoid(o)·π·√det(Σ_2D)  |  screen_area_over_d2: screen_area/d²
+    (Open item 4, 2026-07-14: explicit extra distance-decay stacked on screen_area, testing
+    whether it's redundant -- screen_area's perspective projection already implicitly shrinks
+    apparent area ∝1/d² via project_covariance_2d, this stacks a second, explicit /d² on top)
+    random: U(0,1) seeded baseline
     """
     # perf 2026-07-02: opacity/scale arrive as plain numpy from PLY load and were cast via
     # torch.as_tensor() with no device, landing on CPU. Since project_covariance_2d (below)
@@ -195,10 +199,10 @@ def compute_gaussian_weights_v2(weight_mode, *, opacity, scale_0, scale_1, scale
         d2 = ((_t(xyz, o_i.device) - _t(cam_center, o_i.device).unsqueeze(0)) ** 2).sum(dim=1).clamp(min=1e-6)
         return o_i * vol / d2
 
-    if weight_mode == "screen_area": # this is bottleneck, [TODO] check if we can accelerate this
+    if weight_mode in ("screen_area", "screen_area_over_d2"):
         required = [rot_0, rot_1, rot_2, rot_3, xyz, world_view, proj, img_w, img_h]
         if any(r is None for r in required):
-            raise ValueError("screen_area requires rot_0..rot_3, xyz, world_view, proj, img_w, img_h")
+            raise ValueError(f"{weight_mode} requires rot_0..rot_3, xyz, world_view, proj, img_w, img_h")
         dev = o_i.device
         det2d, in_front = project_covariance_2d(
             _t(xyz, dev), scale_0, scale_1, scale_2,
@@ -207,7 +211,13 @@ def compute_gaussian_weights_v2(weight_mode, *, opacity, scale_0, scale_1, scale
         )
         area = math.pi * torch.sqrt(det2d.clamp(min=0.0))
         area = torch.where(in_front, area, torch.zeros_like(area))
-        return o_i * area.clamp(max=float(img_w * img_h))
+        w = o_i * area.clamp(max=float(img_w * img_h))
+        if weight_mode == "screen_area_over_d2":
+            if cam_center is None:
+                raise ValueError("screen_area_over_d2 requires cam_center")
+            d2 = ((_t(xyz, dev) - _t(cam_center, dev).unsqueeze(0)) ** 2).sum(dim=1).clamp(min=1e-6)
+            w = w / d2
+        return w
 
     raise ValueError(f"unknown weight_mode '{weight_mode}'; valid: {WEIGHT_MODES}")
 

@@ -23,8 +23,10 @@ import numpy as np
 
 _SCHEME_LABELS = {
     "vd_lod":          "VD+LOD (baseline)",
-    "vd_lod_w":        "VD+LOD+W (ours)",
-    "v_lod_w":         "V+LOD+W (no distance)",
+    "vd_lod_w":        "VD+LOD+W (retired 2026-07-03)",
+    "v_lod_w":         "V+LOD+W (ours)",
+    "w_lod":           "W (2026-07-14, gated on full-scope re-test)",
+    "d_lod_w":         "D+LOD+W (2026-07-14)",
     "ml":              "ML (ours)",
     "ml_rf":           "ML-RF",
     "ml_lgbm":         "ML-LGBM",
@@ -44,7 +46,7 @@ _SCHEME_LABELS = {
 }
 _SCHEME_ORDER = [
     "prog_no_cull", "prog_culled", "oracle_tp", "ml_tp",
-    "vd_lod", "vd_lod_w", "v_lod_w", "ml", "ml_rf", "ml_lgbm", "ml_xgb",
+    "vd_lod", "vd_lod_w", "v_lod_w", "w_lod", "d_lod_w", "ml", "ml_rf", "ml_lgbm", "ml_xgb",
     "vd_lod_w_sa", "vd_lod_w_vd2", "vd_lod_c", "vd_lod_w_c",
     "oracle_aoi", "oracle_combined", "oracle_loo", "oracle_loo_ssim",
 ]

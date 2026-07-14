@@ -425,14 +425,16 @@ def compute_raw_scores(scheme, *, oracle_data, camera_index, n_tiles,
         return ml_predict.predict_utility_blend(**blend_kwargs)
     else:
         include_lod = scheme != "vd"
-        # w_lod (Exp2, 2026-07-13): W_k alone, no explicit v or d -- only sound when W_k
-        # itself was built from --gs-weight-scope visible (culled) weights, otherwise an
+        # w_lod / d_lod_w (Exp2, 2026-07-13/14): drop the explicit v term -- only sound when
+        # W_k itself was built from --gs-weight-scope visible (culled) weights, otherwise an
         # invisible tile's own W_k isn't naturally near-zero (screen_area's FOV clamp
         # doesn't decay off-frustum weight -- see compute_camera_weights_culled). Caller
-        # is responsible for that; this dispatcher just wires the flags.
-        include_v = scheme != "w_lod"
-        include_d = scheme.startswith("vd")  # False for v_lod_w/w_lod (W_k already encodes ∝1/d²)
-        include_w = scheme in ("vd_lod_w", "vd_lod_w_c", "v_lod_w", "w_lod")
+        # is responsible for that; this dispatcher just wires the flags. d_lod_w keeps the
+        # explicit /d term (w_lod doesn't) -- the 4th of 4 W_k-inclusive formula variants
+        # (vd_lod_w, v_lod_w, w_lod, d_lod_w = all 4 {v,d} subsets paired with w).
+        include_v = scheme not in ("w_lod", "d_lod_w")
+        include_d = scheme.startswith("vd") or scheme == "d_lod_w"
+        include_w = scheme in ("vd_lod_w", "vd_lod_w_c", "v_lod_w", "w_lod", "d_lod_w")
         include_c = scheme in ("vd_lod_c", "vd_lod_w_c")
         return uc.calculate_utility_param(
             visibility, distances, num_of_level=num_lod,

@@ -417,14 +417,13 @@ def main() -> None:
                              "measuring the cost of that option. vd_lod always uses 'ply' "
                              "(canonical convention, not user-selectable -- see run_exp2.sh). "
                              "heuristic/progressive_* always use real weights, unaffected.")
-    parser.add_argument("--gs-weight-scope", default="full", choices=["full", "visible"],
-                        help="Exp1 (2026-07-13): progressive_* methods only. 'full' (default) "
-                             "computes compute_camera_weights over every Gaussian in the scene, "
-                             "regardless of tile visibility -- current/original behavior. "
-                             "'visible' uses compute_camera_weights_culled: only visible-tile "
-                             "Gaussians get real weight, everything else gets epsilon=0.0. Not "
-                             "wired into heuristic/vd_lod/ml/oracle_online -- out of scope for "
-                             "this round.")
+    parser.add_argument("--gs-weight-scope", default="full", choices=["full"],
+                        help="Exp1 (2026-07-13) tested 'visible' (compute_camera_weights_culled: "
+                             "only visible-tile Gaussians get real weight, rest epsilon=0.0) "
+                             "against 'full'. DECISION (2026-07-14, closed): 'visible' loses on "
+                             "both quality and speed (uniformly slower, 1.1-6x) -- always "
+                             "'full', no exception. Disabled here (choices restricted); "
+                             "implementation kept for reference: compute_camera_weights_culled.")
     parser.add_argument("--budget-pct", nargs="+", type=int,
                         default=[10, 25, 40, 55, 70, 85, 99, 100])
     parser.add_argument("--camera-index",   type=int, default=-1)

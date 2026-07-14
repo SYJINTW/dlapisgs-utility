@@ -93,7 +93,7 @@ from streaming_utils.camera_loader import load_camera_from_streaming_config  # n
 from utils.image_utils import psnr as gs_psnr  # noqa: E402  # type: ignore
 from utils.loss_utils import ssim as gs_ssim  # noqa: E402  # type: ignore
 
-VALID_SCHEMES = ["vd", "vd_lod", "vd_lod_w", "v_lod_w", "w_lod", "vd_lod_c", "vd_lod_w_c",
+VALID_SCHEMES = ["vd", "vd_lod", "vd_lod_w", "v_lod_w", "w_lod", "d_lod_w", "vd_lod_c", "vd_lod_w_c",
                  "ml", "ml_blend",
                  "oracle_loo", "oracle_loo_ssim", "oracle_aoi", "oracle_combined"]
 PLY_WORKERS = 4
@@ -501,17 +501,16 @@ def main() -> None:
     parser.add_argument("--weight-mode", type=str, default="screen_area",
                         choices=list(uc.WEIGHT_MODES))
     parser.add_argument("--gs-weight-scope", type=str, default="full",
-                        choices=["full", "visible"],
-                        help="Exp1/Exp2 (2026-07-13). 'full' (default) computes "
-                             "gaussian_weights over every Gaussian in the scene, regardless "
-                             "of tile visibility -- current/original behavior, unaffected "
-                             "unless explicitly overridden. 'visible' only evaluates "
-                             "visible-tile Gaussians; everything else gets epsilon=0.0 "
-                             "(screen_area's FOV clamp doesn't naturally decay off-frustum "
-                             "weight -- see selection_core.py::compute_camera_weights_culled). "
-                             "Used by: --packing-mode progressive (Exp1) and --scheme w_lod "
-                             "(Exp2, tile_partial -- w_lod's W_k is only sound when built "
-                             "from culled weights).")
+                        choices=["full"],
+                        help="Exp1 (2026-07-13) tested 'visible' (only evaluate visible-tile "
+                             "Gaussians, epsilon=0.0 elsewhere) against 'full' (compute over "
+                             "every Gaussian regardless of tile visibility). DECISION "
+                             "(2026-07-14, closed): 'visible' loses on both quality (real "
+                             "scenes, up to 8dB PSNR gap) and speed (uniformly slower, "
+                             "1.1-6x) -- always 'full', no exception. 'visible' is disabled "
+                             "here (choices restricted) but its implementation is kept for "
+                             "reference: selection_core.py::compute_camera_weights_culled / "
+                             "camera_weights_for_scope.")
     parser.add_argument("--tiling-cache", type=str, default=None)
 
     parser.add_argument("--ml-model-dir", type=str, default=None)

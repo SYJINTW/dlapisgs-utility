@@ -160,6 +160,27 @@ def camera_weights_for_scope(gs_weight_scope, sel_cam, visibility, opacity, scal
 # Greedy packing
 # ---------------------------------------------------------------------------
 
+# Schemes with no per-Gaussian weight signal in their own TILED (tile_partial) scoring
+# formula -- these MUST use PLY/storage order for intra-tile Gaussian ordering there.
+# Sorting them by a weight they never computed (e.g. screen_area W_k) silently gifts an
+# unearned quality bump that grows with tile coarseness (grid 1^3, chair, budget 25%:
+# weight-order 35.5dB vs ply-order 19.9dB, same GS count -- measured 2026-07-15). This is
+# a property of the tiled scoring formula, so it's enforced once here, inside
+# greedy_order() -- NOT left to each caller to remember. A caller's `gs_order` argument is
+# only a preference for schemes that DO have a real weight signal; it is silently
+# overridden for anything in this set. (Real incident: test_utility_inmem.py forwarded
+# --gs-order uniformly to every scheme including vd_lod, corrupting Exp4's grid-size
+# sweep; time_selection.py separately hardcoded gs_order="ply" at its own vd_lod call site
+# and got it right -- two callers, two different answers, because the rule lived in
+# neither of them. It belongs here.)
+#
+# Does NOT apply to greedy_order_progressive: progressive packing is a fundamentally
+# per-Gaussian, visible-first-by-weight method (not a tile-scoring formula at all) --
+# vd_lod run under progressive packing is a different algorithm from vd_lod run under
+# tile_partial, and always uses real weight order there, same as every other scheme.
+NO_WEIGHT_SCHEMES = frozenset({"vd_lod"})
+
+
 def greedy_order_progressive(visibility_tile, tile_index_offsets, tile_flat_indices,
                               w_gi, bytes_per_gaussian, max_budget_bytes,
                               shuffle_seed=None):
@@ -218,7 +239,7 @@ def greedy_order_tile_strict(order_pairs, tile_index_offsets, tile_flat_indices,
 
 
 def greedy_order(order_pairs, tile_index_offsets, tile_flat_indices, w_gi,
-                  bytes_per_gaussian, max_budget_bytes, gs_order="weight"):
+                  bytes_per_gaussian, max_budget_bytes, gs_order="weight", scheme=None):
     """Return flat Gaussian index array in scheduling order, truncated to budget.
 
     Two independent axes: tile-level rank (order_pairs, from whichever scoring scheme
@@ -227,8 +248,13 @@ def greedy_order(order_pairs, tile_index_offsets, tile_flat_indices, w_gi,
     within a partially-packed tile; this is the paper's two-level design (Thesis #1), not
     an incidental tie-break. gs_order="ply" is storage order, used when no per-GS weight
     was computed for this run (vd_lod always; ml/oracle_online when the caller chooses not
-    to pay for gaussian_weights -- see time_selection.py --gs-order). Caller must NOT pass
-    gs_order="weight" with a dummy/uniform w_gi -- if weights weren't computed, use "ply".
+    to pay for gaussian_weights -- see time_selection.py --gs-order).
+
+    `scheme` (optional): if it's in NO_WEIGHT_SCHEMES, gs_order is force-overridden to
+    "ply" regardless of what the caller passed -- enforced here, once, so no caller can
+    accidentally apply weight-order to a scheme that never computed a real w_gi (this is
+    what corrupted Exp4's grid sweep -- see NO_WEIGHT_SCHEMES docstring above). Callers
+    that don't pass `scheme` keep the old caller-trusts-gs_order behavior.
 
     perf: this used to be a per-tile Python loop, then a CPU np.lexsort over the full scene
     (both regressed back into this codebase repeatedly with no recorded verdict -- if
@@ -246,6 +272,8 @@ def greedy_order(order_pairs, tile_index_offsets, tile_flat_indices, w_gi,
     priority order, so even a fully-included tile's internal order matters for progressive
     delivery. Every Gaussian needs a defined position, not just budget-adjacent ones.
     """
+    if scheme in NO_WEIGHT_SCHEMES:
+        gs_order = "ply"
     max_count = max_budget_bytes // bytes_per_gaussian
     n_tiles = int(tile_index_offsets.numel()) - 1
     device = w_gi.device
@@ -292,7 +320,7 @@ def build_greedy_order(packing_mode, scheme, utilities, visibility,
     elif packing_mode == "tile_partial":
         all_ordered = greedy_order(
             utilities, tile_index_offsets, tile_flat_indices,
-            w_gi, bytes_per_gaussian, max_budget_bytes, gs_order=gs_order)
+            w_gi, bytes_per_gaussian, max_budget_bytes, gs_order=gs_order, scheme=scheme)
     else:
         raise ValueError(f"Unknown packing_mode '{packing_mode}'.")
     return all_ordered, tile_cum_counts

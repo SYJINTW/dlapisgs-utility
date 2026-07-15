@@ -64,11 +64,12 @@ from gaussian_renderer_lapisgs import GaussianModel  # noqa: E402
 METHODS = ["vd_lod", "v_lod_w", "ml"]
 BANDWIDTHS_MBPS = [40, 80, 120]
 
-# Deliberate per-method divergence for the multi-track experiment (2026-07-15): ml/v_lod_w
-# carry an explicit per-GS weight (screen_area) and order each tile's Gaussians by it;
-# vd_lod never computes a per-GS weight, so it sends a tile's Gaussians in raw PLY order.
-# Falls back to --gs-order for any method not listed here.
-GS_ORDER_BY_METHOD = {"vd_lod": "ply", "v_lod_w": "weight", "ml": "weight"}
+# Per-method intra-tile Gaussian order divergence (2026-07-15): vd_lod never computes a
+# per-GS weight, so it must send a tile's Gaussians in raw PLY order while v_lod_w/ml sort
+# by real weight. This is enforced centrally in selection_core.py's greedy_order() via
+# NO_WEIGHT_SCHEMES + the scheme=method passed to build_greedy_order() below -- no
+# per-caller dict needed here (a duplicate of that dict lived here until this session's
+# own antipattern was caught and collapsed into the one, shared enforcement point).
 
 # bicycle's scene_setting.csv correction quaternion (x,y,z,w), scale=1 (moot, not
 # applied to the camera -- CAM.py applies scale to the loaded scene object instead).
@@ -364,10 +365,9 @@ def run_sweep(args, device, rend_gs_full=None):
                 ml_predict_kwargs=ml_predict_kwargs)
             utilities = sc.sort_tiles(raw_scores, n_gs_per_tile, bpg, greedy_key="marginal",
                                        num_of_level=1)
-            gs_order = GS_ORDER_BY_METHOD.get(method, args.gs_order)
             all_ordered, _tile_cum_counts = sc.build_greedy_order(
                 "tile_partial", method, utilities, visibility, tile_index_offsets,
-                tile_flat_indices, w_gi, bpg, max_budget_bytes, gs_order=gs_order)
+                tile_flat_indices, w_gi, bpg, max_budget_bytes, gs_order=args.gs_order)
             orders[(cadence_idx, method)] = partition_into_tracks(
                 all_ordered, utilities, n_gs_per_tile, args.n_tracks)
     logger.info("orders: {} cadence ticks x {} methods computed ({:.1f}s elapsed)",
@@ -473,7 +473,7 @@ def run_sweep(args, device, rend_gs_full=None):
         "ml_model_dir": args.ml_model_dir, "ml_model_type": args.ml_model_type,
         "weight_mode": args.weight_mode, "w_norm": args.w_norm, "c_norm": args.c_norm,
         "white_bg": args.white_bg, "swap_top_bottom": args.swap_top_bottom,
-        "n_tracks": args.n_tracks, "gs_order_by_method": GS_ORDER_BY_METHOD,
+        "n_tracks": args.n_tracks, "gs_order": args.gs_order,
         "elapsed_sec": time.time() - t0,
     }
     (out_root / "params.yaml").write_text(json.dumps(params, indent=2))

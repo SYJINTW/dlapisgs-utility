@@ -223,10 +223,14 @@ def _time_method(
                 # n_total_gs torch.ones() as a "weight" with implicit gs_order="weight" --
                 # same selection (all keys tied -> lexsort falls back to storage order
                 # anyway) but paid the full-scene GPU->CPU transfer for nothing.
+                # gs_order="ply" is now also enforced centrally by greedy_order() via
+                # scheme="vd_lod" (selection_core.py NO_WEIGHT_SCHEMES) -- passed
+                # explicitly here too since this call skips gaussian_weights entirely
+                # (w_dummy is empty, not just unused).
                 w_dummy = torch.empty(0, device=device)
                 all_ordered = sc.greedy_order(order_pairs, tile_index_offsets, tile_flat_indices,
                                               w_dummy, bytes_per_gaussian, max_budget_bytes,
-                                              gs_order="ply")
+                                              gs_order="ply", scheme="vd_lod")
 
         # ── HEURISTIC (tile_partial, vd_lod_w, screen_area W_k) ─────────────
         elif method == "heuristic":

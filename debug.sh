@@ -20,6 +20,7 @@ SCENE="${1:?usage: ./debug.sh <scene> [cam] [budget_pct] [grid] [packing] [schem
 CAM="${2:-0}"; BUD="${3:-40}"; GRID="${4:-8}"; PACK="${5:-tile_strict}"; SCHEME="${6:-vd_lod}"; GS_ORDER="${7:-weight}"
 ROOT="/mnt/data1/samk/gs-quic/cs5262_tile_quic"
 OUT="output/debug/${SCENE}_cam${CAM}_b${BUD}_g${GRID}_${PACK}_${SCHEME}"
+[ "$GS_ORDER" != "weight" ] && OUT="${OUT}_${GS_ORDER}"
 
 case "$SCENE" in
   bicycle) PLY="${ROOT}/exp-dataset/bicycle/point_cloud.ply"

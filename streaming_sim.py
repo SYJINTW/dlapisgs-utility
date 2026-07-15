@@ -30,6 +30,7 @@ import json
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -161,6 +162,31 @@ def run_sanity_check(args, device) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Frame writer -- raw RGB24 piped straight into a persistent ffmpeg process that does
+# the RGB->YUV420p conversion, instead of a per-frame PNG encode (measured ~343ms/frame
+# vs ~15ms/frame piped -- PNG disk write was the actual per-mark bottleneck, not
+# rendering or selection; see .claude/PLAN.md fast-cadence entry).
+# ---------------------------------------------------------------------------
+
+class FrameWriter:
+    def __init__(self, out_path: Path, width: int, height: int):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        self.proc = subprocess.Popen(
+            ["ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
+             "-framerate", "1", "-i", "pipe:0", "-pix_fmt", "yuv420p", "-f", "rawvideo",
+             str(out_path)],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def write(self, rendered: torch.Tensor):
+        frame = (rendered.clamp(0, 1) * 255).byte().permute(1, 2, 0).cpu().numpy().tobytes()
+        self.proc.stdin.write(frame)
+
+    def close(self):
+        self.proc.stdin.close()
+        self.proc.wait()
+
+
+# ---------------------------------------------------------------------------
 # Main sweep
 # ---------------------------------------------------------------------------
 
@@ -184,6 +210,8 @@ def run_sweep(args, device):
         Path(args.bicycle_trace_dir))
     rows = load_trace_rows(trace_path)
     duration_ms = int(rows[-1]["timestep"])
+    if args.duration_sec is not None:
+        duration_ms = min(duration_ms, int(args.duration_sec * 1000))
 
     cadence_marks = marks_up_to(duration_ms, args.interval_sec)
     cadence_rows = sample_at_marks(rows, cadence_marks)
@@ -227,6 +255,9 @@ def run_sweep(args, device):
 
     bpg = sc.bytes_per_gaussian(sel_gs)
     max_budget_bytes = budget_bytes(max(args.bandwidths_mbps), args.interval_sec)
+    for bw in args.bandwidths_mbps:
+        gs_per_sec = bw * 1e6 / 8 / bpg
+        logger.info("Bandwidth {} Mbps = {:.0f} GS/s ({:.1f} GS/ms)", bw, gs_per_sec, gs_per_sec / 1000)
 
     ml_model = ml_static_feats = ml_feature_names = None
     if "ml" in args.methods:
@@ -242,6 +273,16 @@ def run_sweep(args, device):
         for method in args.methods:
             (out_root / f"renders/bw_{bw}mbps/{method}").mkdir(parents=True, exist_ok=True)
     (out_root / "metrics").mkdir(parents=True, exist_ok=True)
+    vmaf_dir = out_root / "vmaf"
+
+    frame_writers = {"gt": FrameWriter(vmaf_dir / "gt.yuv", img_w, img_h)}
+    for bw in args.bandwidths_mbps:
+        for method in args.methods:
+            key = (bw, method)
+            frame_writers[key] = FrameWriter(
+                vmaf_dir / f"bw_{bw}mbps" / method / "distorted.yuv", img_w, img_h)
+    png_executor = ThreadPoolExecutor(max_workers=args.png_workers) if args.png_workers > 0 else None
+    png_futures: list = []
 
     n_tiles = len(index_offsets) - 1
     t0 = time.time()
@@ -293,6 +334,27 @@ def run_sweep(args, device):
 
     # --- Pass 2: dense render/metric samples -- frozen order, continuously growing
     #     budget within the current cadence window, actual continuous camera pose ---
+    # PNGs are only saved for the LAST mark of the first and last cadence windows (visual
+    # grounding) -- every mark's frame still goes into the vmaf/*.yuv sequences via
+    # FrameWriter regardless (see class docstring). Deliberately NOT the trace's first/last
+    # render mark: elapsed_sec resets to 0 (budget_bytes=0, guaranteed-empty frame) at every
+    # cadence tick, and whenever duration is an exact multiple of interval_sec (the common
+    # case) the trace's literal first AND last marks both land on that reset instant -- the
+    # two blackest possible frames. The last mark of a window has the window's maximum
+    # elapsed_sec (most bytes delivered), which is what's actually worth looking at.
+    marks_cadence_idx = [int(t // args.interval_sec) for t in render_marks]
+    windows: list[list[int]] = []
+    for i, ci in enumerate(marks_cadence_idx):
+        if windows and marks_cadence_idx[windows[-1][-1]] == ci:
+            windows[-1].append(i)
+        else:
+            windows.append([i])
+    # When duration is an exact multiple of interval_sec (the common case), the trailing
+    # window is a singleton (elapsed_sec=0, empty by construction) -- skip it when picking
+    # the "last window" representative so both saved marks aren't guaranteed-empty.
+    real_windows = [w for w in windows if len(w) > 1] or windows
+    repr_marks = {windows[0][-1], real_windows[-1][-1]}
+    is_repr_mark = lambda fi: fi in repr_marks  # noqa: E731
     metric_rows = []
     for fine_idx, trace_row in enumerate(render_rows):
         t_sec = render_marks[fine_idx]
@@ -305,8 +367,11 @@ def run_sweep(args, device):
             swap_top_bottom=args.swap_top_bottom)
 
         gt_rendered = sc.render_gs(rend_gs_full, cam, args.white_bg)
-        torchvision.utils.save_image(
-            gt_rendered, str(out_root / "gt_renders" / f"frame_{fine_idx:04d}.png"))
+        frame_writers["gt"].write(gt_rendered)
+        if is_repr_mark(fine_idx) and png_executor:
+            png_futures.append(png_executor.submit(
+                torchvision.utils.save_image, gt_rendered.cpu().clone(),
+                str(out_root / "gt_renders" / f"frame_{fine_idx:04d}.png")))
 
         for method in args.methods:
             all_ordered, tile_cum_counts = orders[(cadence_idx, method)]
@@ -318,8 +383,11 @@ def run_sweep(args, device):
                 del sub_gs
                 metrics = sc.compute_metrics(rendered, gt_rendered, skip_lpips=True)
 
-                png_path = out_root / f"renders/bw_{bw}mbps/{method}/frame_{fine_idx:04d}.png"
-                torchvision.utils.save_image(rendered, str(png_path))
+                frame_writers[(bw, method)].write(rendered)
+                if is_repr_mark(fine_idx) and png_executor:
+                    png_path = out_root / f"renders/bw_{bw}mbps/{method}/frame_{fine_idx:04d}.png"
+                    png_futures.append(png_executor.submit(
+                        torchvision.utils.save_image, rendered.cpu().clone(), str(png_path)))
 
                 metric_rows.append({
                     "frame_idx": fine_idx, "t_sec": t_sec, "cadence_idx": cadence_idx,
@@ -331,6 +399,13 @@ def run_sweep(args, device):
         if fine_idx % 10 == 0 or fine_idx == len(render_rows) - 1:
             logger.info("frame {}/{} t={:.1f}s done ({:.1f}s elapsed)",
                         fine_idx + 1, len(render_rows), t_sec, time.time() - t0)
+
+    for fw in frame_writers.values():
+        fw.close()
+    if png_executor:
+        for fut in png_futures:
+            fut.result()
+        png_executor.shutdown(wait=True)
 
     rows = metric_rows
     summary_csv = out_root / "metrics" / "summary.csv"
@@ -360,26 +435,21 @@ def run_sweep(args, device):
 # ---------------------------------------------------------------------------
 
 def run_vmaf(args):
+    """Reads the yuv sequences FrameWriter already wrote during run_sweep -- no PNG-sequence
+    conversion step here (see FrameWriter class docstring for why)."""
     out_root = Path(args.output_root)
     summary_rows = json.loads((out_root / "metrics" / "summary.json").read_text())
     params = json.loads((out_root / "params.yaml").read_text())
     img_w, img_h = params["img_w"], params["img_h"]
-    n_frames = params["n_frames"]
 
     vmaf_dir = out_root / "vmaf"
-    vmaf_dir.mkdir(parents=True, exist_ok=True)
     gt_yuv = vmaf_dir / "gt.yuv"
-    if not gt_yuv.exists():
-        _pngs_to_yuv(out_root / "gt_renders", "frame_%04d.png", n_frames, gt_yuv)
 
     vmaf_by_key = {}
     for bw in params["bandwidths_mbps"]:
         for method in params["methods"]:
             key_dir = vmaf_dir / f"bw_{bw}mbps" / method
-            key_dir.mkdir(parents=True, exist_ok=True)
             dist_yuv = key_dir / "distorted.yuv"
-            src_dir = out_root / f"renders/bw_{bw}mbps/{method}"
-            _pngs_to_yuv(src_dir, "frame_%04d.png", n_frames, dist_yuv)
 
             out_json = key_dir / "vmaf.json"
             # This vmaf binary's .y4m path doesn't parse the container header (confirmed
@@ -408,13 +478,6 @@ def run_vmaf(args):
     logger.success("VMAF merged into {}", summary_csv)
 
 
-def _pngs_to_yuv(src_dir: Path, pattern: str, n_frames: int, out_yuv: Path):
-    subprocess.run(
-        ["ffmpeg", "-y", "-framerate", "1", "-i", str(src_dir / pattern),
-         "-frames:v", str(n_frames), "-pix_fmt", "yuv420p", "-f", "rawvideo", str(out_yuv)],
-        check=True, capture_output=True)
-
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -439,6 +502,14 @@ def parse_args():
                          "(dense, continuous camera pose + continuously growing byte budget "
                          "against the frozen order) -- this is what makes the metric-vs-time "
                          "curve smooth rather than a handful of disconnected snapshots.")
+    p.add_argument("--duration-sec", type=float, default=None,
+                    help="Cap the trace session length (default: use the full recorded trace "
+                         "duration). E.g. 30 to only simulate the first 30s.")
+    p.add_argument("--png-workers", type=int, default=4,
+                    help="Thread pool size for the small number of representative PNG saves "
+                         "(first + last render mark only, for visual grounding -- 0 disables "
+                         "PNG saving entirely). Every mark still feeds the vmaf/*.yuv "
+                         "sequences via FrameWriter regardless of this flag.")
     p.add_argument("--methods", nargs="+", default=METHODS)
     p.add_argument("--ml-model-dir",
                     default=str(HERE / "output/ml_models_experimental/per_scene/bicycle/AC"))

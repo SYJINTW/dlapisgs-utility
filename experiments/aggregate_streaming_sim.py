@@ -113,7 +113,7 @@ def main():
             if not r.get(metric):
                 continue
             key = (r["bandwidth_mbps"], r["method"])
-            pooled[key][float(r["elapsed_sec"])].append(float(r[metric]))
+            pooled[key][round(float(r["elapsed_sec"]), 6)].append(float(r[metric]))
         out_path = out_dir / f"{metric}_vs_elapsed_pooled.png"
         plot_metric(pooled, metric, bandwidths, methods, out_path)
         print(f"wrote {out_path}")

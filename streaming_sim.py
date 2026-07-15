@@ -64,6 +64,12 @@ from gaussian_renderer_lapisgs import GaussianModel  # noqa: E402
 METHODS = ["vd_lod", "v_lod_w", "ml"]
 BANDWIDTHS_MBPS = [40, 80, 120]
 
+# Deliberate per-method divergence for the multi-track experiment (2026-07-15): ml/v_lod_w
+# carry an explicit per-GS weight (screen_area) and order each tile's Gaussians by it;
+# vd_lod never computes a per-GS weight, so it sends a tile's Gaussians in raw PLY order.
+# Falls back to --gs-order for any method not listed here.
+GS_ORDER_BY_METHOD = {"vd_lod": "ply", "v_lod_w": "weight", "ml": "weight"}
+
 # bicycle's scene_setting.csv correction quaternion (x,y,z,w), scale=1 (moot, not
 # applied to the camera -- CAM.py applies scale to the loaded scene object instead).
 BICYCLE_SCENE_QUAT_XYZW = (-0.1305, 0.0, 0.0, 0.9914)
@@ -71,6 +77,32 @@ BICYCLE_SCENE_QUAT_XYZW = (-0.1305, 0.0, 0.0, 0.9914)
 
 def budget_bytes(bw_mbps: float, interval_sec: float) -> int:
     return int(bw_mbps * 1e6 * interval_sec / 8.0)
+
+
+def partition_into_tracks(all_ordered, order_pairs, n_gs_per_tile, n_tracks: int):
+    """Split a tile-contiguous priority-ordered GS sequence (from build_greedy_order) into
+    n_tracks round-robin sub-sequences: track k owns tile-priority ranks k, k+N, k+2N, ...
+    -- so tracks 0..N-1 hold exactly the top-N tiles at the very start of a window. Chunk
+    boundaries are recomputed from order_pairs/n_gs_per_tile rather than re-deriving
+    build_greedy_order's sort, and are consistent with all_ordered by construction (same
+    priority order, same per-tile GS counts). all_ordered may be shorter than the full tile
+    set (truncated at max_budget_bytes) -- any tile beyond that point is simply unreachable
+    by every track, matching single-track behavior at the same budget cap."""
+    if n_tracks <= 1:
+        return [all_ordered]
+    tile_ranked = order_pairs[:, 0]
+    chunk_lens = n_gs_per_tile[tile_ranked].astype(np.int64)
+    offsets = np.concatenate([[0], np.cumsum(chunk_lens)])
+    n_avail = len(all_ordered)
+    track_chunks = [[] for _ in range(n_tracks)]
+    for rank in range(len(tile_ranked)):
+        start = offsets[rank]
+        if start >= n_avail:
+            break
+        end = min(offsets[rank + 1], n_avail)
+        track_chunks[rank % n_tracks].append(all_ordered[start:end])
+    return [np.concatenate(chunks) if chunks else np.array([], dtype=all_ordered.dtype)
+            for chunks in track_chunks]
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +160,9 @@ def marks_up_to(duration_ms: int, step_sec: float) -> list:
 # Sanity gate
 # ---------------------------------------------------------------------------
 
-def run_sanity_check(args, device) -> bool:
+def run_sanity_check(args, device, gs=None) -> bool:
+    """gs: optional pre-loaded GaussianModel (avoids a second ~8.5s PLY load when called
+    right before run_sweep, which needs the same model -- load once in main(), pass it in)."""
     trace_path = Path(args.trace_file) if args.trace_file else pick_longest_trace(
         Path(args.bicycle_trace_dir))
     with open(trace_path, newline="") as f:
@@ -144,8 +178,9 @@ def run_sanity_check(args, device) -> bool:
         znear=args.znear, zfar=args.zfar, device=device,
         swap_top_bottom=args.swap_top_bottom)
 
-    gs = GaussianModel(args.sh_degree)
-    gs.load_ply(str(args.ply))
+    if gs is None:
+        gs = GaussianModel(args.sh_degree)
+        gs.load_ply(str(args.ply))
     rendered = sc.render_gs(gs, cam, args.white_bg)
 
     out_dir = Path(args.output_root) / "sanity_check"
@@ -190,8 +225,11 @@ class FrameWriter:
 # Main sweep
 # ---------------------------------------------------------------------------
 
-def run_sweep(args, device):
-    """Continuous-viewport streaming model (2026-07-14 redesign, replaces the earlier
+def run_sweep(args, device, rend_gs_full=None):
+    """rend_gs_full: optional pre-loaded GaussianModel (avoids a second ~8.5s PLY load when
+    run_sanity_check already loaded one right before this -- load once in main(), pass it in).
+
+    Continuous-viewport streaming model (2026-07-14 redesign, replaces the earlier
     one-shot-per-cadence-tick version):
 
     - Tile ORDER is recomputed only at cadence ticks (every --interval-sec), from the
@@ -227,8 +265,9 @@ def run_sweep(args, device):
 
     # --- one-time setup (mirrors test_utility_inmem.py:612-797) ---
     sel_gs = io_3dgs.GaussianModelV2(str(args.ply))
-    rend_gs_full = GaussianModel(args.sh_degree)
-    rend_gs_full.load_ply(str(args.ply))
+    if rend_gs_full is None:
+        rend_gs_full = GaussianModel(args.sh_degree)
+        rend_gs_full.load_ply(str(args.ply))
 
     tc = np.load(str(args.tiling_cache), allow_pickle=True)
     min_corners, max_corners = tc["min_corners"], tc["max_corners"]
@@ -325,10 +364,12 @@ def run_sweep(args, device):
                 ml_predict_kwargs=ml_predict_kwargs)
             utilities = sc.sort_tiles(raw_scores, n_gs_per_tile, bpg, greedy_key="marginal",
                                        num_of_level=1)
-            all_ordered, tile_cum_counts = sc.build_greedy_order(
+            gs_order = GS_ORDER_BY_METHOD.get(method, args.gs_order)
+            all_ordered, _tile_cum_counts = sc.build_greedy_order(
                 "tile_partial", method, utilities, visibility, tile_index_offsets,
-                tile_flat_indices, w_gi, bpg, max_budget_bytes, gs_order=args.gs_order)
-            orders[(cadence_idx, method)] = (all_ordered, tile_cum_counts)
+                tile_flat_indices, w_gi, bpg, max_budget_bytes, gs_order=gs_order)
+            orders[(cadence_idx, method)] = partition_into_tracks(
+                all_ordered, utilities, n_gs_per_tile, args.n_tracks)
     logger.info("orders: {} cadence ticks x {} methods computed ({:.1f}s elapsed)",
                 len(cadence_rows), len(args.methods), time.time() - t0)
 
@@ -374,10 +415,16 @@ def run_sweep(args, device):
                 str(out_root / "gt_renders" / f"frame_{fine_idx:04d}.png")))
 
         for method in args.methods:
-            all_ordered, tile_cum_counts = orders[(cadence_idx, method)]
+            track_orders = orders[(cadence_idx, method)]
             for bw in args.bandwidths_mbps:
                 bb = budget_bytes(bw, elapsed_sec)
-                selected, used_bytes = sc.select_at_budget(all_ordered, bb, bpg, tile_cum_counts)
+                track_bb = budget_bytes(bw / args.n_tracks, elapsed_sec)
+                sel_parts, used_bytes = [], 0
+                for track_ordered in track_orders:
+                    sel_k, used_k = sc.select_at_budget(track_ordered, track_bb, bpg, None)
+                    sel_parts.append(sel_k)
+                    used_bytes += used_k
+                selected = np.concatenate(sel_parts) if sel_parts else np.array([], dtype=np.int64)
                 sub_gs = sc.subset_gaussians(rend_gs_full, selected)
                 rendered = sc.render_gs(sub_gs, cam, args.white_bg)
                 del sub_gs
@@ -393,6 +440,7 @@ def run_sweep(args, device):
                     "frame_idx": fine_idx, "t_sec": t_sec, "cadence_idx": cadence_idx,
                     "elapsed_sec": elapsed_sec, "method": method,
                     "bandwidth_mbps": bw, "budget_bytes": bb, "used_bytes": used_bytes,
+                    "n_tracks": args.n_tracks,
                     "n_selected": len(selected), "n_gs_total": len(opacity),
                     "psnr": metrics["psnr"], "ssim": metrics["ssim"],
                 })
@@ -425,6 +473,7 @@ def run_sweep(args, device):
         "ml_model_dir": args.ml_model_dir, "ml_model_type": args.ml_model_type,
         "weight_mode": args.weight_mode, "w_norm": args.w_norm, "c_norm": args.c_norm,
         "white_bg": args.white_bg, "swap_top_bottom": args.swap_top_bottom,
+        "n_tracks": args.n_tracks, "gs_order_by_method": GS_ORDER_BY_METHOD,
         "elapsed_sec": time.time() - t0,
     }
     (out_root / "params.yaml").write_text(json.dumps(params, indent=2))
@@ -456,10 +505,12 @@ def run_vmaf(args):
             # empirically this session -- claims .y4m support in --help but silently fails
             # to read frame data from a well-formed y4m file); raw .yuv with explicit
             # -w/-h/-p/-b works.
+            # --threads 8: real measured 8.3s->1.35s per call (6.2x) on this 64-core box,
+            # load average ~4.5 at measurement time -- plenty of headroom for 8 threads.
             subprocess.run(
                 ["vmaf", "-r", str(gt_yuv), "-d", str(dist_yuv),
                  "-w", str(img_w), "-h", str(img_h), "-p", "420", "-b", "8",
-                 "--json", "-o", str(out_json)],
+                 "--threads", "8", "--json", "-o", str(out_json)],
                 check=True)
             scores = [f["metrics"]["vmaf"] for f in json.loads(out_json.read_text())["frames"]]
             for frame_idx, score in enumerate(scores):
@@ -518,6 +569,11 @@ def parse_args():
     p.add_argument("--w-norm", default="sum")
     p.add_argument("--c-norm", default="sum")
     p.add_argument("--gs-order", default="weight")
+    p.add_argument("--n-tracks", type=int, default=1,
+                    help="Number of simultaneous QUIC/MOQ-style transmission tracks. Tile "
+                         "priority ranks are round-robin assigned to tracks (track k owns "
+                         "ranks k, k+N, k+2N, ...), each track gets an equal bandwidth share. "
+                         "1 = current strictly-serial single-track behavior (default).")
     p.add_argument("--white-bg", action="store_true")
     p.add_argument("--znear", type=float, default=0.01)
     p.add_argument("--zfar", type=float, default=100.0)
@@ -544,14 +600,17 @@ def main():
         run_vmaf(args)
         return
 
-    ok = run_sanity_check(args, device)
+    gs = GaussianModel(args.sh_degree)
+    gs.load_ply(str(args.ply))
+
+    ok = run_sanity_check(args, device, gs=gs)
     if not ok and not args.force:
         logger.error("Sanity check FAILED -- refusing to run full sweep (pass --force to override)")
         sys.exit(1)
     if args.sanity_check_only:
         return
 
-    run_sweep(args, device)
+    run_sweep(args, device, rend_gs_full=gs)
 
 
 if __name__ == "__main__":

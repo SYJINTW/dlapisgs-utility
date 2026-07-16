@@ -80,30 +80,77 @@ def budget_bytes(bw_mbps: float, interval_sec: float) -> int:
     return int(bw_mbps * 1e6 * interval_sec / 8.0)
 
 
-def partition_into_tracks(all_ordered, order_pairs, n_gs_per_tile, n_tracks: int):
+def tile_chunk_offsets(tile_ranked, offsets, n_avail: int):
+    """Cumulative chunk-length boundaries for all_ordered's per-tile-rank chunks, in
+    tile_ranked (priority) order, sourced from tile-index-keyed `offsets` (e.g.
+    pruned_offsets from sc.prune_tile_gs -- reflects any online per-tile pruning; passing
+    the raw unpruned tile_index_offsets instead silently mismatches a pruned all_ordered,
+    the exact bug this shared helper exists to avoid now that both partition_into_tracks
+    and schedule_tracks_greedy need the same chunk boundaries). Returns (starts, ends)
+    arrays clipped to n_avail -- all_ordered may be shorter than the full tile set
+    (truncated at max_budget_bytes, always at a whole-tile boundary since tile_partial
+    packing never splits a tile mid-chunk at this stage); a tile whose start >= n_avail is
+    simply unreachable. `offsets` may be a GPU torch.Tensor (tile_index_offsets/pruned_offsets
+    are constructed as such) or a numpy array -- normalized to numpy here since this is cheap
+    per-tile (~150) bookkeeping, not worth keeping on-device."""
+    if hasattr(offsets, "cpu"):
+        offsets = offsets.cpu().numpy()
+    tile_ranked = np.asarray(tile_ranked)
+    chunk_lens = (offsets[tile_ranked + 1] - offsets[tile_ranked]).astype(np.int64)
+    cum = np.concatenate([[0], np.cumsum(chunk_lens)])
+    starts = np.minimum(cum[:-1], n_avail)
+    ends = np.minimum(cum[1:], n_avail)
+    return starts, ends
+
+
+def partition_into_tracks(all_ordered, order_pairs, offsets, n_tracks: int):
     """Split a tile-contiguous priority-ordered GS sequence (from build_greedy_order) into
     n_tracks round-robin sub-sequences: track k owns tile-priority ranks k, k+N, k+2N, ...
-    -- so tracks 0..N-1 hold exactly the top-N tiles at the very start of a window. Chunk
-    boundaries are recomputed from order_pairs/n_gs_per_tile rather than re-deriving
-    build_greedy_order's sort, and are consistent with all_ordered by construction (same
-    priority order, same per-tile GS counts). all_ordered may be shorter than the full tile
-    set (truncated at max_budget_bytes) -- any tile beyond that point is simply unreachable
-    by every track, matching single-track behavior at the same budget cap."""
+    -- so tracks 0..N-1 hold exactly the top-N tiles at the very start of a window."""
     if n_tracks <= 1:
         return [all_ordered]
     tile_ranked = order_pairs[:, 0]
-    chunk_lens = n_gs_per_tile[tile_ranked].astype(np.int64)
-    offsets = np.concatenate([[0], np.cumsum(chunk_lens)])
     n_avail = len(all_ordered)
+    starts, ends = tile_chunk_offsets(tile_ranked, offsets, n_avail)
     track_chunks = [[] for _ in range(n_tracks)]
     for rank in range(len(tile_ranked)):
-        start = offsets[rank]
-        if start >= n_avail:
+        if starts[rank] >= n_avail:
             break
-        end = min(offsets[rank + 1], n_avail)
-        track_chunks[rank % n_tracks].append(all_ordered[start:end])
+        track_chunks[rank % n_tracks].append(all_ordered[starts[rank]:ends[rank]])
     return [np.concatenate(chunks) if chunks else np.array([], dtype=all_ordered.dtype)
             for chunks in track_chunks]
+
+
+def schedule_tracks_greedy(tile_ranked, tile_bytes, track_rates):
+    """Event-driven greedy list scheduling (2026-07-16, replaces static round-robin when
+    --track-schedule greedy): each track is a server with its own byte rate; tiles are
+    fixed-priority-order jobs. Whenever a track goes idle, it claims the next unclaimed tile
+    -- a finished fast track doesn't sit idle while a slow track is still stuck on a large
+    tile, unlike round-robin's permanent per-rank track ownership. tile_ranked/tile_bytes:
+    parallel arrays, ALREADY reachable-truncated (start < n_avail from tile_chunk_offsets).
+    track_rates: bytes/sec per track (possibly unequal -- weighted split). Returns a list of
+    (start_sec, end_sec, track_idx), same order/length as tile_ranked.
+
+    Assigns each tile, in priority order, to whichever track gives that tile the EARLIEST
+    COMPLETION time (free_at[k] + tile_bytes/rate[k]) -- not whichever track is free soonest.
+    These coincide when all rates are equal (duration is then identical across tracks, so
+    ranking by completion == ranking by free_at), which is why a simpler free_at-only min-heap
+    looked correct in initial testing (all n_tracks=1 unit tests used equal rates) -- but for
+    weighted tracks a slower track can free up sooner and still finish a given tile later than
+    a busier, faster one, so free_at-only assignment would send it to the wrong track. No heap
+    needed: linear scan per tile, O(n_tiles x n_tracks), trivially cheap at this scale (~150
+    tiles x <=8 tracks)."""
+    n_tracks = len(track_rates)
+    free_at = [0.0] * n_tracks
+    schedule = []
+    for tb in tile_bytes:
+        completions = [free_at[k] + float(tb) / track_rates[k] for k in range(n_tracks)]
+        track_idx = min(range(n_tracks), key=lambda k: completions[k])
+        start_at = free_at[track_idx]
+        end_at = completions[track_idx]
+        schedule.append((start_at, end_at, track_idx))
+        free_at[track_idx] = end_at
+    return schedule
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +202,18 @@ def marks_up_to(duration_ms: int, step_sec: float) -> list:
     step_ms = step_sec * 1000.0
     n = int(duration_ms // step_ms) + 1
     return [k * step_sec for k in range(n)]
+
+
+def nearest_oracle_camera(cam_center: torch.Tensor, eval_centers: torch.Tensor) -> int:
+    """Index into `eval_centers` (N,3) of the nearest world-space camera position to
+    `cam_center` (3,). Used to approximate oracle_loo (generated at a fixed discrete
+    150-camera eval trace) for a continuous streaming pose that never lands exactly on
+    one of those 150 poses -- an approximation on top of oracle_loo's own leave-one-tile-
+    out approximation of a true RD-optimal oracle. Both must be flagged wherever a result
+    using this mapping is reported, not presented as a clean oracle (see --oracle-npz
+    help text)."""
+    d2 = ((eval_centers - cam_center.unsqueeze(0)) ** 2).sum(dim=1)
+    return int(torch.argmin(d2).item())
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +366,36 @@ def run_sweep(args, device, rend_gs_full=None):
         ml_feature_names = json.loads((Path(args.ml_model_dir) / "feature_names.json").read_text())
         ml_static_feats = ml_features.build_static_features(sel_gs.data, index_offsets, flat_indices)
 
+    # --- Oracle data (mirrors test_utility_inmem.py:840-859) + eval-camera positions for
+    #     nearest-pose matching (see nearest_oracle_camera() docstring for the caveat) ---
+    oracle_data = oracle_eval_centers = None
+    if "oracle_loo" in args.methods:
+        if args.oracle_npz is None:
+            raise ValueError("--oracle-npz required when 'oracle_loo' is in --methods")
+        _od = np.load(args.oracle_npz, allow_pickle=False)
+        _cam_ids = _od["camera_indices"].astype(np.int32)
+        oracle_data = {
+            "mse_loo": _od["mse"].astype(np.float64),
+            "ssim_loo": _od["ssim"].astype(np.float64),
+            "mse_aoi": _od["mse_aoi"].astype(np.float64) if "mse_aoi" in _od else None,
+            "mse_blank": _od["mse_blank"].astype(np.float64) if "mse_blank" in _od else None,
+            "cam_idx_to_row": {int(c): i for i, c in enumerate(_cam_ids)},
+        }
+        n_oracle_tiles = oracle_data["mse_loo"].shape[1]
+        n_scene_tiles = len(index_offsets) - 1
+        if n_oracle_tiles != n_scene_tiles:
+            raise ValueError(
+                f"--oracle-npz {args.oracle_npz} has {n_oracle_tiles} tiles but the scene "
+                f"tiling has {n_scene_tiles} -- use the matching --tiling-cache."
+            )
+        _eval_cam_infos = visibility_AABB_pytorch.readCamerasFromTransforms(
+            str(args.oracle_eval_trace), img_w, img_h)
+        _eval_cams = visibility_AABB_pytorch.camera_infos_to_MiniCam_list(_eval_cam_infos)
+        oracle_eval_centers = torch.stack(
+            [c.camera_center.to(device) for c in _eval_cams])
+        logger.info("Oracle: {} tiles, {} eval cameras (nearest-pose-matched to "
+                    "{} cadence ticks)", n_oracle_tiles, len(_eval_cams), len(cadence_rows))
+
     out_root = Path(args.output_root)
     (out_root / "gt_renders").mkdir(parents=True, exist_ok=True)
     for bw in args.bandwidths_mbps:
@@ -329,6 +418,8 @@ def run_sweep(args, device, rend_gs_full=None):
 
     # --- Pass 1: tile order per (cadence tick, method) -- viewport-based, frozen ---
     orders = {}
+    greedy_chunks = {}
+    schedules = {}
     for cadence_idx, trace_row in enumerate(cadence_rows):
         cam = scam.build_streaming_camera(
             trace_row, BICYCLE_SCENE_QUAT_XYZW, img_w, img_h,
@@ -345,6 +436,11 @@ def run_sweep(args, device, rend_gs_full=None):
             tile_index_offsets, tile_flat_indices, w_gi,
             w_norm=args.w_norm, c_norm=args.c_norm)
 
+        oracle_camera_index = None
+        if oracle_data is not None:
+            oracle_camera_index = nearest_oracle_camera(
+                cam.camera_center.to(device), oracle_eval_centers)
+
         ml_group_a = None
         if "ml" in args.methods:
             cam_w2v = cam.world_view_transform.cpu().numpy()
@@ -359,17 +455,50 @@ def run_sweep(args, device, rend_gs_full=None):
             feature_names=ml_feature_names, model=ml_model)
 
         for method in args.methods:
+            is_oracle = method.startswith("oracle_")
             raw_scores = sc.compute_raw_scores(
-                method, oracle_data=None, camera_index=cadence_idx, n_tiles=n_tiles,
+                method, oracle_data=oracle_data if is_oracle else None,
+                camera_index=oracle_camera_index if is_oracle else cadence_idx,
+                n_tiles=n_tiles,
                 visibility=visibility, distances=distances, num_lod=1, W_k=W_k, C_k=N_k,
                 ml_predict_kwargs=ml_predict_kwargs)
             utilities = sc.sort_tiles(raw_scores, n_gs_per_tile, bpg, greedy_key="marginal",
                                        num_of_level=1)
+            # Online per-tile prune (Workstream C, 2026-07-15): no-op for vd_lod
+            # (NO_WEIGHT_SCHEMES) and at default keep_frac=1.0/no max_gs_per_tile -- see
+            # prune_tile_gs() docstring. Only affects the PACKING step below; tile-level
+            # ranking (utilities/visibility above) always sees the full, unpruned tiling.
+            # Combining with --n-tracks>1 is now safe (2026-07-16): both partition_into_tracks
+            # and the greedy scheduler derive chunk boundaries from tile_chunk_offsets() over
+            # pruned_offsets, not the raw unpruned tile_index_offsets/n_gs_per_tile -- fixes
+            # the mismatch noted here previously.
+            pruned_offsets, pruned_flat = sc.prune_tile_gs(
+                tile_index_offsets, tile_flat_indices, w_gi,
+                args.online_prune_keep_frac, method,
+                max_gs_per_tile=args.online_prune_max_gs_per_tile)
             all_ordered, _tile_cum_counts = sc.build_greedy_order(
-                "tile_partial", method, utilities, visibility, tile_index_offsets,
-                tile_flat_indices, w_gi, bpg, max_budget_bytes, gs_order=args.gs_order)
-            orders[(cadence_idx, method)] = partition_into_tracks(
-                all_ordered, utilities, n_gs_per_tile, args.n_tracks)
+                "tile_partial", method, utilities, visibility, pruned_offsets,
+                pruned_flat, w_gi, bpg, max_budget_bytes, gs_order=args.gs_order)
+            if args.track_schedule == "round_robin":
+                orders[(cadence_idx, method)] = partition_into_tracks(
+                    all_ordered, utilities, pruned_offsets, args.n_tracks)
+            else:  # greedy -- schedule depends on bandwidth too (via track_rates), so
+                   # pass 1 here only precomputes the bw-independent tile-chunk layout;
+                   # per-bw schedules are filled in right below.
+                tile_ranked = utilities[:, 0]
+                n_avail = len(all_ordered)
+                starts, ends = tile_chunk_offsets(tile_ranked, pruned_offsets, n_avail)
+                reachable = starts < n_avail
+                tile_ranked_r = tile_ranked[reachable]
+                starts_r = starts[reachable]
+                ends_r = ends[reachable]
+                tile_bytes_r = (ends_r - starts_r) * bpg
+                greedy_chunks[(cadence_idx, method)] = (all_ordered, starts_r, ends_r)
+                for bw in args.bandwidths_mbps:
+                    rates = [w / sum(args.track_weights) * budget_bytes(bw, 1.0)
+                             for w in args.track_weights]
+                    schedules[(cadence_idx, method, bw)] = schedule_tracks_greedy(
+                        tile_ranked_r, tile_bytes_r, rates)
     logger.info("orders: {} cadence ticks x {} methods computed ({:.1f}s elapsed)",
                 len(cadence_rows), len(args.methods), time.time() - t0)
 
@@ -415,15 +544,33 @@ def run_sweep(args, device, rend_gs_full=None):
                 str(out_root / "gt_renders" / f"frame_{fine_idx:04d}.png")))
 
         for method in args.methods:
-            track_orders = orders[(cadence_idx, method)]
             for bw in args.bandwidths_mbps:
                 bb = budget_bytes(bw, elapsed_sec)
-                track_bb = budget_bytes(bw / args.n_tracks, elapsed_sec)
                 sel_parts, used_bytes = [], 0
-                for track_ordered in track_orders:
-                    sel_k, used_k = sc.select_at_budget(track_ordered, track_bb, bpg, None)
-                    sel_parts.append(sel_k)
-                    used_bytes += used_k
+                if args.track_schedule == "round_robin":
+                    track_bb = budget_bytes(bw / args.n_tracks, elapsed_sec)
+                    for track_ordered in orders[(cadence_idx, method)]:
+                        sel_k, used_k = sc.select_at_budget(track_ordered, track_bb, bpg, None)
+                        sel_parts.append(sel_k)
+                        used_bytes += used_k
+                else:  # greedy -- per-tile partial cutoff from the precomputed schedule,
+                       # not a flat per-track byte-budget truncation.
+                    all_ordered, starts_r, ends_r = greedy_chunks[(cadence_idx, method)]
+                    schedule = schedules[(cadence_idx, method, bw)]
+                    rates = [w / sum(args.track_weights) * budget_bytes(bw, 1.0)
+                             for w in args.track_weights]
+                    for j, (start_sec, end_sec, track_idx) in enumerate(schedule):
+                        if elapsed_sec <= start_sec:
+                            continue
+                        chunk_start, chunk_end = int(starts_r[j]), int(ends_r[j])
+                        if elapsed_sec >= end_sec:
+                            n_gs = chunk_end - chunk_start
+                        else:
+                            bytes_sent = rates[track_idx] * (elapsed_sec - start_sec)
+                            n_gs = min(int(bytes_sent // bpg), chunk_end - chunk_start)
+                        if n_gs > 0:
+                            sel_parts.append(all_ordered[chunk_start:chunk_start + n_gs])
+                            used_bytes += n_gs * bpg
                 selected = np.concatenate(sel_parts) if sel_parts else np.array([], dtype=np.int64)
                 sub_gs = sc.subset_gaussians(rend_gs_full, selected)
                 rendered = sc.render_gs(sub_gs, cam, args.white_bg)
@@ -440,7 +587,8 @@ def run_sweep(args, device, rend_gs_full=None):
                     "frame_idx": fine_idx, "t_sec": t_sec, "cadence_idx": cadence_idx,
                     "elapsed_sec": elapsed_sec, "method": method,
                     "bandwidth_mbps": bw, "budget_bytes": bb, "used_bytes": used_bytes,
-                    "n_tracks": args.n_tracks,
+                    "n_tracks": args.n_tracks, "track_schedule": args.track_schedule,
+                    "track_weights": ",".join(str(w) for w in args.track_weights),
                     "n_selected": len(selected), "n_gs_total": len(opacity),
                     "psnr": metrics["psnr"], "ssim": metrics["ssim"],
                 })
@@ -474,6 +622,7 @@ def run_sweep(args, device, rend_gs_full=None):
         "weight_mode": args.weight_mode, "w_norm": args.w_norm, "c_norm": args.c_norm,
         "white_bg": args.white_bg, "swap_top_bottom": args.swap_top_bottom,
         "n_tracks": args.n_tracks, "gs_order": args.gs_order,
+        "track_schedule": args.track_schedule, "track_weights": args.track_weights,
         "elapsed_sec": time.time() - t0,
     }
     (out_root / "params.yaml").write_text(json.dumps(params, indent=2))
@@ -510,7 +659,8 @@ def run_vmaf(args):
             subprocess.run(
                 ["vmaf", "-r", str(gt_yuv), "-d", str(dist_yuv),
                  "-w", str(img_w), "-h", str(img_h), "-p", "420", "-b", "8",
-                 "--threads", "8", "--json", "-o", str(out_json)],
+                 "--threads", "8", "--json", "-o", str(out_json),
+                 "-m", args.vmaf_model],
                 check=True)
             scores = [f["metrics"]["vmaf"] for f in json.loads(out_json.read_text())["frames"]]
             for frame_idx, score in enumerate(scores):
@@ -562,6 +712,20 @@ def parse_args():
                          "PNG saving entirely). Every mark still feeds the vmaf/*.yuv "
                          "sequences via FrameWriter regardless of this flag.")
     p.add_argument("--methods", nargs="+", default=METHODS)
+    p.add_argument("--oracle-npz", default=None,
+                    help="oracle_dq.npz (tile-level LOO delta-MSE, e.g. "
+                         "output/oracle/8/eval/bicycle/oracle_dq.npz). Required if 'oracle_loo' "
+                         "is in --methods. The npz is indexed by discrete eval-trace camera "
+                         "index (--oracle-eval-trace); streaming poses are continuous, so each "
+                         "cadence tick's real pose is nearest-matched to the closest of those "
+                         "discrete cameras (see nearest_oracle_camera()) -- this is a second "
+                         "approximation layered on top of oracle_loo's own leave-one-tile-out "
+                         "approximation, not an exact oracle. Flag any oracle_loo result with "
+                         "both caveats, don't present as a clean upper bound.")
+    p.add_argument("--oracle-eval-trace",
+                    default=str(WORKSPACE / "exp-dataset/bicycle/sparse_views_eval.json"),
+                    help="Eval-trace JSON the --oracle-npz's camera_indices are keyed against "
+                         "(must be the same trace exp4_oracle_dq.py was run with).")
     p.add_argument("--ml-model-dir",
                     default=str(HERE / "output/ml_models_experimental/per_scene/bicycle/AC"))
     p.add_argument("--ml-model-type", default="lgbm")
@@ -569,11 +733,37 @@ def parse_args():
     p.add_argument("--w-norm", default="sum")
     p.add_argument("--c-norm", default="sum")
     p.add_argument("--gs-order", default="weight")
+    p.add_argument("--online-prune-keep-frac", type=float, default=1.0,
+                    help="Within each tile, keep only the top keep-frac of that tile's own "
+                         "Gaussians by w(g_i) before packing -- the tile 'finishes' after "
+                         "fewer bytes, so the schedule reaches more tiles per cadence window "
+                         "at coarser per-tile fidelity. 1.0 (default) = no-op. Never applied "
+                         "to vd_lod (no real per-GS weight -- see NO_WEIGHT_SCHEMES). "
+                         "Orthogonal to --n-tracks and to any offline scene-size reduction; "
+                         "test separately, don't combine with either in one run.")
+    p.add_argument("--online-prune-max-gs-per-tile", type=int, default=None,
+                    help="Starvation backstop: absolute per-tile Gaussian cap applied AFTER "
+                         "--online-prune-keep-frac, so one oversized tile (bicycle has a "
+                         "1.37M-GS outlier vs. a 850-GS scene median) can't alone consume an "
+                         "entire cadence window's budget. Applies even if keep-frac=1.0. "
+                         "None (default) = no cap.")
     p.add_argument("--n-tracks", type=int, default=1,
-                    help="Number of simultaneous QUIC/MOQ-style transmission tracks. Tile "
-                         "priority ranks are round-robin assigned to tracks (track k owns "
-                         "ranks k, k+N, k+2N, ...), each track gets an equal bandwidth share. "
-                         "1 = current strictly-serial single-track behavior (default).")
+                    help="Number of simultaneous QUIC/MOQ-style transmission tracks. "
+                         "1 = current strictly-serial single-track behavior (default). "
+                         "See --track-schedule for how tiles are assigned to tracks.")
+    p.add_argument("--track-schedule", choices=["round_robin", "greedy"], default="round_robin",
+                    help="round_robin (default): track k permanently owns tile-priority ranks "
+                         "k, k+N, k+2N, ..., equal bandwidth share -- preserves the already-"
+                         "reported n_tracks=1/4/8 numbers exactly. greedy (2026-07-16): "
+                         "event-driven work-conserving list scheduling -- a track that "
+                         "finishes its current tile claims the next unclaimed tile instead of "
+                         "sitting idle; rates set via --track-weights.")
+    p.add_argument("--track-weights", type=float, nargs="+", default=None,
+                    help="Only consulted when --track-schedule greedy. Per-track relative "
+                         "bandwidth share, e.g. '4 3 2 1' for n_tracks=4. Must have exactly "
+                         "--n-tracks entries and be non-increasing (track 0 = highest-"
+                         "bandwidth slot by convention -- w_i >= w_j for i < j). Default: "
+                         "equal weights ([1.0]*n_tracks).")
     p.add_argument("--white-bg", action="store_true")
     p.add_argument("--znear", type=float, default=0.01)
     p.add_argument("--zfar", type=float, default=100.0)
@@ -587,12 +777,27 @@ def parse_args():
     p.add_argument("--min-edge-var", type=float, default=0.0)
     p.add_argument("--sanity-check-only", action="store_true")
     p.add_argument("--vmaf-only", action="store_true")
+    p.add_argument("--vmaf-model", default="version=vmaf_4k_v0.6.1",
+                    help="libvmaf -m value. Switched from vmaf_v0.6.1 (1080p-calibrated) to "
+                         "vmaf_4k_v0.6.1 (2026-07-16, PLAN.md 'VMAF profile decision') -- "
+                         "renders are 1600x1644, resolution-matched to 4K not 1080p.")
     p.add_argument("--force", action="store_true")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.track_weights is None:
+        args.track_weights = [1.0] * args.n_tracks
+    if len(args.track_weights) != args.n_tracks:
+        raise ValueError(f"--track-weights has {len(args.track_weights)} entries, "
+                          f"expected --n-tracks={args.n_tracks}")
+    for i in range(len(args.track_weights) - 1):
+        if args.track_weights[i] < args.track_weights[i + 1]:
+            raise ValueError(
+                f"--track-weights must be non-increasing (track index = priority slot, "
+                f"w_i >= w_j for i < j) -- got {args.track_weights}, "
+                f"w[{i}]={args.track_weights[i]} < w[{i + 1}]={args.track_weights[i + 1]}")
     Path(args.output_root).mkdir(parents=True, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 

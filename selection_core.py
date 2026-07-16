@@ -303,6 +303,68 @@ def greedy_order(order_pairs, tile_index_offsets, tile_flat_indices, w_gi,
     return tile_flat_indices[final_order][:max_count].detach().cpu().numpy().astype(np.int64)
 
 
+def prune_tile_gs(tile_index_offsets, tile_flat_indices, w_gi, keep_frac, scheme,
+                   max_gs_per_tile=None):
+    """Online per-tile Gaussian pruning (2026-07-15, Workstream C of the scene-size-
+    reduction plan): cap each tile's OWN Gaussian set to its top-`keep_frac` (by
+    descending w_gi) before the flat priority interleave in greedy_order() ever runs --
+    a deliberate cap, not the accidental byte-budget truncation select_at_budget() already
+    does. A tile "finishes" after fewer bytes, so the schedule reaches more tiles per
+    cadence window at coarser per-tile fidelity.
+
+    Schemes in NO_WEIGHT_SCHEMES (no real per-GS weight -- currently just vd_lod) pass
+    through UNMODIFIED: pruning by a weight that was never computed is meaningless for
+    them, same rule this codebase already enforces for gs_order inside greedy_order()
+    (see its docstring / NO_WEIGHT_SCHEMES above). keep_frac >= 1.0 is also a no-op.
+
+    `max_gs_per_tile` (optional) is the starvation backstop: an absolute cap applied
+    AFTER the proportional keep_frac cut, so one oversized tile (bicycle has a 1.37M-GS
+    outlier against a scene median of 850) can't alone consume an entire cadence window's
+    budget regardless of its keep_frac share -- same fix shape as the size-aware/
+    load-balanced track-assignment candidate already flagged for the n_tracks SSIM-
+    regression root cause (PLAN.md).
+
+    Returns (new_tile_index_offsets, new_tile_flat_indices), same dtype/device as the
+    inputs, still tile-contiguous (offsets mark per-tile block boundaries) -- ready to
+    feed into build_greedy_order()/greedy_order() unchanged. Order within a surviving
+    tile's block does NOT need to be weight-sorted: greedy_order() re-derives its own
+    gs_order from scratch on whatever it's given, it doesn't trust caller order.
+    """
+    if scheme in NO_WEIGHT_SCHEMES:
+        return tile_index_offsets, tile_flat_indices
+    if keep_frac >= 1.0 and max_gs_per_tile is None:
+        return tile_index_offsets, tile_flat_indices
+
+    device = tile_flat_indices.device
+    offsets_np = tile_index_offsets.cpu().numpy()
+    flat_np = tile_flat_indices.cpu().numpy()
+    n_tiles = len(offsets_np) - 1
+
+    kept_chunks = []
+    new_offsets = [0]
+    for t in range(n_tiles):
+        tile_idx = flat_np[offsets_np[t]:offsets_np[t + 1]]
+        if len(tile_idx) == 0:
+            new_offsets.append(new_offsets[-1])
+            continue
+        n_keep = max(1, int(round(len(tile_idx) * keep_frac)))
+        if max_gs_per_tile is not None:
+            n_keep = min(n_keep, max_gs_per_tile)
+        n_keep = min(n_keep, len(tile_idx))
+        tile_idx_t = torch.as_tensor(tile_idx, dtype=torch.long, device=device)
+        tile_w = w_gi[tile_idx_t]
+        _, order = torch.sort(tile_w, descending=True, stable=True)
+        survivors = tile_idx_t[order[:n_keep]].cpu().numpy()
+        kept_chunks.append(survivors)
+        new_offsets.append(new_offsets[-1] + n_keep)
+
+    new_flat_np = (np.concatenate(kept_chunks) if kept_chunks
+                   else np.empty((0,), dtype=np.int64))
+    new_tile_index_offsets = torch.tensor(new_offsets, dtype=tile_index_offsets.dtype, device=device)
+    new_tile_flat_indices = torch.tensor(new_flat_np, dtype=tile_flat_indices.dtype, device=device)
+    return new_tile_index_offsets, new_tile_flat_indices
+
+
 def build_greedy_order(packing_mode, scheme, utilities, visibility,
                         tile_index_offsets, tile_flat_indices, w_gi,
                         bytes_per_gaussian, max_budget_bytes, shuffle_visible_seed=None,

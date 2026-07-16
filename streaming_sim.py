@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Stateless streaming-simulation harness -- metric-vs-time, not metric-vs-budget.
+"""Stateful streaming-simulation harness -- metric-vs-time, not metric-vs-budget.
 
-Reruns the existing single-shot selection pipeline (selection_core.py) once per
-10-second time-mark along a REAL recorded EyeNavGS head trajectory (NTHU bicycle
-dataset), at 3 bandwidth-derived byte budgets, for 3 methods. Every time-mark
-reselects from the FULL scene -- no "already sent" buffer, no accumulation.
-Stateless by design (see .claude/PLAN.md streaming-sim entry): this is meant to
-generalize to future 4D/dynamic-scene work where each frame's content genuinely
-differs, so an incremental client-buffer model wouldn't even apply there.
+Simulates a PERSISTENT per-client tile buffer along a REAL recorded EyeNavGS head
+trajectory (NTHU bicycle dataset), full ~60s session, at 3 bandwidth tiers, for 3
+methods. Tile ORDER is recomputed every cadence tick (300ms default) from the current
+viewport, but the delivered buffer is NEVER flushed -- a track works one tile at a
+time to completion (never abandoned mid-tile), and once free, claims the highest-
+priority not-yet-delivered tile from whichever cadence tick is latest as of that
+moment (see .claude/PLAN.md streaming-sim stateful-rewrite entry, 2026-07-16).
+Single LOD only -- once a tile is fully delivered it is permanently done, no
+re-upgrade. Online per-tile pruning (Workstream C) is deliberately out of scope for
+this rewrite (circle back later); every tile's full Gaussian set is used.
 
 Run in the gaussian_splatting conda env (same as test_utility_inmem.py).
 
@@ -24,8 +27,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import glob
+import heapq
 import json
 import subprocess
 import sys
@@ -61,7 +66,7 @@ os.environ.setdefault("LAPISGS_DUMMY_IMAGE", str(_DUMMY))
 from gaussian_renderer_lapisgs import GaussianModel  # noqa: E402
 
 METHODS = ["vd_lod", "v_lod_w", "ml"]
-BANDWIDTHS_MBPS = [40, 80, 120]
+BANDWIDTHS_MBPS = [60, 120, 300]
 
 # Per-method intra-tile Gaussian order divergence (2026-07-15): vd_lod never computes a
 # per-GS weight, so it must send a tile's Gaussians in raw PLY order while v_lod_w/ml sort
@@ -79,77 +84,89 @@ def budget_bytes(bw_mbps: float, interval_sec: float) -> int:
     return int(bw_mbps * 1e6 * interval_sec / 8.0)
 
 
-def tile_chunk_offsets(tile_ranked, offsets, n_avail: int):
-    """Cumulative chunk-length boundaries for all_ordered's per-tile-rank chunks, in
-    tile_ranked (priority) order, sourced from tile-index-keyed `offsets` (e.g.
-    pruned_offsets from sc.prune_tile_gs -- reflects any online per-tile pruning; passing
-    the raw unpruned tile_index_offsets instead silently mismatches a pruned all_ordered,
-    the exact bug this shared helper exists to avoid now that both partition_into_tracks
-    and schedule_tracks_greedy need the same chunk boundaries). Returns (starts, ends)
-    arrays clipped to n_avail -- all_ordered may be shorter than the full tile set
-    (truncated at max_budget_bytes, always at a whole-tile boundary since tile_partial
-    packing never splits a tile mid-chunk at this stage); a tile whose start >= n_avail is
-    simply unreachable. `offsets` may be a GPU torch.Tensor (tile_index_offsets/pruned_offsets
-    are constructed as such) or a numpy array -- normalized to numpy here since this is cheap
-    per-tile (~150) bookkeeping, not worth keeping on-device."""
-    if hasattr(offsets, "cpu"):
-        offsets = offsets.cpu().numpy()
-    tile_ranked = np.asarray(tile_ranked)
-    chunk_lens = (offsets[tile_ranked + 1] - offsets[tile_ranked]).astype(np.int64)
-    cum = np.concatenate([[0], np.cumsum(chunk_lens)])
-    starts = np.minimum(cum[:-1], n_avail)
-    ends = np.minimum(cum[1:], n_avail)
-    return starts, ends
+def latest_tick_leq(t: float, cadence_marks: list) -> int:
+    """Index of the latest cadence tick with tick_time <= t. cadence_marks is sorted
+    ascending (marks_up_to's output)."""
+    i = bisect.bisect_right(cadence_marks, t) - 1
+    return max(i, 0)
 
 
-def partition_into_tracks(all_ordered, order_pairs, offsets, n_tracks: int):
-    """Split a tile-contiguous priority-ordered GS sequence (from build_greedy_order) into
-    n_tracks round-robin sub-sequences: track k owns tile-priority ranks k, k+N, k+2N, ...
-    -- so tracks 0..N-1 hold exactly the top-N tiles at the very start of a window."""
-    if n_tracks <= 1:
-        return [all_ordered]
-    tile_ranked = order_pairs[:, 0]
-    n_avail = len(all_ordered)
-    starts, ends = tile_chunk_offsets(tile_ranked, offsets, n_avail)
-    track_chunks = [[] for _ in range(n_tracks)]
-    for rank in range(len(tile_ranked)):
-        if starts[rank] >= n_avail:
-            break
-        track_chunks[rank % n_tracks].append(all_ordered[starts[rank]:ends[rank]])
-    return [np.concatenate(chunks) if chunks else np.array([], dtype=all_ordered.dtype)
-            for chunks in track_chunks]
+def tile_gs_order_at_tick(tile_idx: int, method: str, cam, tile_index_offsets, tile_flat_indices,
+                           opacity, scale_0, scale_1, scale_2, rot_0, rot_1, rot_2, rot_3,
+                           gs_xyz_t, device, weight_mode, img_w, img_h, gs_order: str = "weight"):
+    """Lazily compute ONE tile's own Gaussian send-order at a given cadence tick's camera --
+    not a full-scene sort. Deliberately mirrors selection_core.greedy_order()'s per-tile
+    ordering exactly (weight-descending for weight-bearing schemes via compute_camera_weights
+    restricted to this tile's own GS slice -- same pattern as compute_camera_weights_culled;
+    pure PLY/storage order, camera-independent, for NO_WEIGHT_SCHEMES or gs_order="ply"),
+    because selection_core.greedy_order proved a tile's internal order is a pure function of
+    (gs_order mode, that tile's own w_gi) -- independent of budget/other tiles/its own rank
+    (see .claude/PLAN.md streaming-sim stateful-rewrite entry, 2026-07-16, design step 1).
+    Safe to compute once, at claim time, and never revisit: the scheduler below never
+    abandons a tile mid-send. `method in NO_WEIGHT_SCHEMES` force-overrides gs_order to "ply"
+    regardless of the caller's preference, same rule greedy_order() itself enforces."""
+    start = int(tile_index_offsets[tile_idx])
+    end = int(tile_index_offsets[tile_idx + 1])
+    idx = tile_flat_indices[start:end]
+    if idx.numel() == 0:
+        return np.empty(0, dtype=np.int64)
+    if method in sc.NO_WEIGHT_SCHEMES or gs_order == "ply":
+        return idx.cpu().numpy().astype(np.int64, copy=False)
+    idx_np = idx.cpu().numpy()
+    w_tile = sc.compute_camera_weights(
+        cam, opacity[idx_np], scale_0[idx_np], scale_1[idx_np], scale_2[idx_np],
+        rot_0[idx_np], rot_1[idx_np], rot_2[idx_np], rot_3[idx_np],
+        gs_xyz_t[idx], device, weight_mode, img_w, img_h)
+    order = torch.sort(w_tile, descending=True, stable=True).indices
+    return idx[order].cpu().numpy().astype(np.int64, copy=False)
 
 
-def schedule_tracks_greedy(tile_ranked, tile_bytes, track_rates):
-    """Event-driven greedy list scheduling (2026-07-16, replaces static round-robin when
-    --track-schedule greedy): each track is a server with its own byte rate; tiles are
-    fixed-priority-order jobs. Whenever a track goes idle, it claims the next unclaimed tile
-    -- a finished fast track doesn't sit idle while a slow track is still stuck on a large
-    tile, unlike round-robin's permanent per-rank track ownership. tile_ranked/tile_bytes:
-    parallel arrays, ALREADY reachable-truncated (start < n_avail from tile_chunk_offsets).
-    track_rates: bytes/sec per track (possibly unequal -- weighted split). Returns a list of
-    (start_sec, end_sec, track_idx), same order/length as tile_ranked.
+def build_session_schedule(cadence_marks, cadence_order_pairs, cameras, method,
+                            tile_index_offsets, tile_flat_indices,
+                            opacity, scale_0, scale_1, scale_2, rot_0, rot_1, rot_2, rot_3,
+                            gs_xyz_t, device, weight_mode, img_w, img_h, bpg,
+                            n_tiles: int, track_rates: list, gs_order: str = "weight") -> dict:
+    """Whole-session event-driven scheduler (2026-07-16 stateful redesign) -- replaces the
+    old per-window schedule_tracks_greedy/partition_into_tracks. Each of len(track_rates)
+    tracks works ONE tile at a time to completion (never abandoned mid-tile, see
+    tile_gs_order_at_tick docstring); whenever a track frees up, it claims the highest-
+    priority tile not yet claimed by ANY track, using whichever cadence tick's ranking is
+    latest as of that moment. A tile is claimed at most once, ever, across the whole
+    session -- single LOD, no re-upgrade (pruning/downsampling deferred, see module
+    docstring). Returns {tile_idx: (start_sec, end_sec, track_idx, gs_order np.int64
+    array)}. Ties at the same free_at time resolve by ascending track index (heap tuple
+    order), so simultaneous starts pick in a stable, deterministic order.
 
-    Assigns each tile, in priority order, to whichever track gives that tile the EARLIEST
-    COMPLETION time (free_at[k] + tile_bytes/rate[k]) -- not whichever track is free soonest.
-    These coincide when all rates are equal (duration is then identical across tracks, so
-    ranking by completion == ranking by free_at), which is why a simpler free_at-only min-heap
-    looked correct in initial testing (all n_tracks=1 unit tests used equal rates) -- but for
-    weighted tracks a slower track can free up sooner and still finish a given tile later than
-    a busier, faster one, so free_at-only assignment would send it to the wrong track. No heap
-    needed: linear scan per tile, O(n_tiles x n_tracks), trivially cheap at this scale (~150
-    tiles x <=8 tracks)."""
+    O(n_tiles^2) worst case (each claim linear-scans the current tick's ranking for the
+    first not-yet-taken tile) -- trivially cheap at this scale (~150 tiles), not worth a
+    fancier structure."""
     n_tracks = len(track_rates)
     free_at = [0.0] * n_tracks
-    schedule = []
-    for tb in tile_bytes:
-        completions = [free_at[k] + float(tb) / track_rates[k] for k in range(n_tracks)]
-        track_idx = min(range(n_tracks), key=lambda k: completions[k])
-        start_at = free_at[track_idx]
-        end_at = completions[track_idx]
-        schedule.append((start_at, end_at, track_idx))
-        free_at[track_idx] = end_at
-    return schedule
+    heap = [(0.0, k) for k in range(n_tracks)]
+    heapq.heapify(heap)
+    taken: dict = {}
+    while heap and len(taken) < n_tiles:
+        t, k = heapq.heappop(heap)
+        i = latest_tick_leq(t, cadence_marks)
+        ranking = cadence_order_pairs[i][:, 0]
+        pick = None
+        for tile_idx in ranking:
+            ti = int(tile_idx)
+            if ti not in taken:
+                pick = ti
+                break
+        if pick is None:
+            continue  # every tile already claimed -- track idle for rest of session
+        tile_order = tile_gs_order_at_tick(
+            pick, method, cameras[i], tile_index_offsets, tile_flat_indices,
+            opacity, scale_0, scale_1, scale_2, rot_0, rot_1, rot_2, rot_3,
+            gs_xyz_t, device, weight_mode, img_w, img_h, gs_order=gs_order)
+        n_gs_tile = len(tile_order)
+        dur = (n_gs_tile * bpg) / track_rates[k] if n_gs_tile > 0 else 0.0
+        end = t + dur
+        taken[pick] = (t, end, k, tile_order)
+        heapq.heappush(heap, (end, k))
+    return taken
 
 
 # ---------------------------------------------------------------------------
@@ -288,20 +305,21 @@ def run_sweep(args, device, rend_gs_full=None):
     """rend_gs_full: optional pre-loaded GaussianModel (avoids a second ~8.5s PLY load when
     run_sanity_check already loaded one right before this -- load once in main(), pass it in).
 
-    Continuous-viewport streaming model (2026-07-14 redesign, replaces the earlier
-    one-shot-per-cadence-tick version):
+    Stateful persistent-buffer streaming model (2026-07-16 redesign, replaces the earlier
+    stateless per-window-reset version):
 
-    - Tile ORDER is recomputed only at cadence ticks (every --interval-sec), from the
-      viewport AT that tick -- frozen until the next tick. Models a real scheduler that
-      only periodically re-scores/reorders tiles.
-    - Byte BUDGET grows continuously within a cadence window: budget(t) = bandwidth *
-      (t - last_cadence_tick), reset to 0 at each new tick (no banking, matches spec).
-    - The RENDER pose is the actual continuous trace pose at the fine render time, not
-      the (stale) cadence-tick pose -- the client keeps moving while still working
-      through the frozen order.
-    This produces the smooth-ramp-with-stepwise-reorder curve shape (see
-    plotting/paper/plot_format_ref/streaming/*.png), not a handful of disconnected
-    snapshot points.
+    - Tile ORDER is recomputed at every cadence tick (--interval-sec), from the viewport AT
+      that tick. This ranking is only ever CONSULTED, never enforced wholesale: the client's
+      delivered buffer is never flushed.
+    - Delivery is modeled by build_session_schedule(): each of --n-tracks tracks works one
+      tile at a time to completion (never abandoned mid-tile), and once free, claims the
+      highest-priority not-yet-delivered tile using whichever cadence tick is latest as of
+      that moment. A tile is claimed at most once, ever -- single LOD, no re-upgrade.
+    - The RENDER pose is the actual continuous trace pose at the fine render time
+      (--render-interval-sec, independent of --interval-sec).
+    This produces a genuine monotonic coverage ramp (used_bytes/selected GS count never
+    decreases) with viewport-driven reprioritization of what's picked NEXT, instead of the
+    old sawtooth reset-every-window artifact.
     """
     trace_path = Path(args.trace_file) if args.trace_file else pick_longest_trace(
         Path(args.bicycle_trace_dir))
@@ -352,7 +370,7 @@ def run_sweep(args, device, rend_gs_full=None):
     gs_xyz_t = torch.tensor(gs_xyz, dtype=torch.float32, device=device)
 
     bpg = sc.bytes_per_gaussian(sel_gs)
-    max_budget_bytes = budget_bytes(max(args.bandwidths_mbps), args.interval_sec)
+    full_scene_bytes = len(opacity) * bpg
     for bw in args.bandwidths_mbps:
         gs_per_sec = bw * 1e6 / 8 / bpg
         logger.info("Bandwidth {} Mbps = {:.0f} GS/s ({:.1f} GS/ms)", bw, gs_per_sec, gs_per_sec / 1000)
@@ -414,15 +432,20 @@ def run_sweep(args, device, rend_gs_full=None):
     n_tiles = len(index_offsets) - 1
     t0 = time.time()
 
-    # --- Pass 1: tile order per (cadence tick, method) -- viewport-based, frozen ---
+    # --- Pass 1: tile RANKING per (cadence tick, method) -- viewport-based. Stores only
+    #     order_pairs (tiny, (n_tiles,2)) + the tick's camera object, NOT a full-scene
+    #     ordered GS array -- avoids holding ~29GB (200 ticks x 3 methods x 48MB) of
+    #     redundant full_ordered arrays in memory. Per-tile GS send-order is computed
+    #     lazily, once, only for tiles actually claimed (see build_session_schedule /
+    #     tile_gs_order_at_tick below). See .claude/PLAN.md stateful-rewrite design step 3.
     orders = {}
-    greedy_chunks = {}
-    schedules = {}
+    cameras = []
     for cadence_idx, trace_row in enumerate(cadence_rows):
         cam = scam.build_streaming_camera(
             trace_row, BICYCLE_SCENE_QUAT_XYZW, img_w, img_h,
             uid=cadence_idx, znear=args.znear, zfar=args.zfar, device=device,
             swap_top_bottom=args.swap_top_bottom)
+        cameras.append(cam)
 
         distances = uc.calculate_distances(tile_centers, cam.camera_center.to(device))
         visibility = visibility_AABB_pytorch.batched_check_tiles_visible(
@@ -460,74 +483,58 @@ def run_sweep(args, device, rend_gs_full=None):
                 n_tiles=n_tiles,
                 visibility=visibility, distances=distances, num_lod=1, W_k=W_k, C_k=N_k,
                 ml_predict_kwargs=ml_predict_kwargs)
-            utilities = sc.sort_tiles(raw_scores, n_gs_per_tile, bpg, greedy_key="marginal",
-                                       num_of_level=1)
-            # Online per-tile prune (Workstream C, 2026-07-15): no-op for vd_lod
-            # (NO_WEIGHT_SCHEMES) and at default keep_frac=1.0/no max_gs_per_tile -- see
-            # prune_tile_gs() docstring. Only affects the PACKING step below; tile-level
-            # ranking (utilities/visibility above) always sees the full, unpruned tiling.
-            # Combining with --n-tracks>1 is now safe (2026-07-16): both partition_into_tracks
-            # and the greedy scheduler derive chunk boundaries from tile_chunk_offsets() over
-            # pruned_offsets, not the raw unpruned tile_index_offsets/n_gs_per_tile -- fixes
-            # the mismatch noted here previously.
-            pruned_offsets, pruned_flat = sc.prune_tile_gs(
-                tile_index_offsets, tile_flat_indices, w_gi,
-                args.online_prune_keep_frac, method,
-                max_gs_per_tile=args.online_prune_max_gs_per_tile)
-            all_ordered, _tile_cum_counts = sc.build_greedy_order(
-                "tile_partial", method, utilities, visibility, pruned_offsets,
-                pruned_flat, w_gi, bpg, max_budget_bytes, gs_order=args.gs_order)
-            if args.track_schedule == "round_robin":
-                orders[(cadence_idx, method)] = partition_into_tracks(
-                    all_ordered, utilities, pruned_offsets, args.n_tracks)
-            else:  # greedy -- schedule depends on bandwidth too (via track_rates), so
-                   # pass 1 here only precomputes the bw-independent tile-chunk layout;
-                   # per-bw schedules are filled in right below.
-                tile_ranked = utilities[:, 0]
-                n_avail = len(all_ordered)
-                starts, ends = tile_chunk_offsets(tile_ranked, pruned_offsets, n_avail)
-                reachable = starts < n_avail
-                tile_ranked_r = tile_ranked[reachable]
-                starts_r = starts[reachable]
-                ends_r = ends[reachable]
-                tile_bytes_r = (ends_r - starts_r) * bpg
-                greedy_chunks[(cadence_idx, method)] = (all_ordered, starts_r, ends_r)
-                for bw in args.bandwidths_mbps:
-                    rates = [w / sum(args.track_weights) * budget_bytes(bw, 1.0)
-                             for w in args.track_weights]
-                    schedules[(cadence_idx, method, bw)] = schedule_tracks_greedy(
-                        tile_ranked_r, tile_bytes_r, rates)
+            orders[(cadence_idx, method)] = sc.sort_tiles(
+                raw_scores, n_gs_per_tile, bpg, greedy_key="marginal", num_of_level=1)
     logger.info("orders: {} cadence ticks x {} methods computed ({:.1f}s elapsed)",
                 len(cadence_rows), len(args.methods), time.time() - t0)
 
-    # --- Pass 2: dense render/metric samples -- frozen order, continuously growing
-    #     budget within the current cadence window, actual continuous camera pose ---
-    # PNGs are only saved for the LAST mark of the first and last cadence windows (visual
-    # grounding) -- every mark's frame still goes into the vmaf/*.yuv sequences via
-    # FrameWriter regardless (see class docstring). Deliberately NOT the trace's first/last
-    # render mark: elapsed_sec resets to 0 (budget_bytes=0, guaranteed-empty frame) at every
-    # cadence tick, and whenever duration is an exact multiple of interval_sec (the common
-    # case) the trace's literal first AND last marks both land on that reset instant -- the
-    # two blackest possible frames. The last mark of a window has the window's maximum
-    # elapsed_sec (most bytes delivered), which is what's actually worth looking at.
-    marks_cadence_idx = [int(t // args.interval_sec) for t in render_marks]
-    windows: list[list[int]] = []
-    for i, ci in enumerate(marks_cadence_idx):
-        if windows and marks_cadence_idx[windows[-1][-1]] == ci:
-            windows[-1].append(i)
-        else:
-            windows.append([i])
-    # When duration is an exact multiple of interval_sec (the common case), the trailing
-    # window is a singleton (elapsed_sec=0, empty by construction) -- skip it when picking
-    # the "last window" representative so both saved marks aren't guaranteed-empty.
-    real_windows = [w for w in windows if len(w) > 1] or windows
-    repr_marks = {windows[0][-1], real_windows[-1][-1]}
-    is_repr_mark = lambda fi: fi in repr_marks  # noqa: E731
+    # --- Pass 1.5: whole-session event-driven delivery schedule, per (method, bandwidth) --
+    #     see build_session_schedule() docstring. Also dumps the exact per-tile schedule
+    #     (Gantt-chart data, not sampled from the render loop) for a bandwidth-utilization
+    #     sanity check -- confirms the scheduler isn't pathologically stalling a track while
+    #     unclaimed tiles remain (2026-07-16 user request; see plot_track_utilization.py). ---
+    track_rate_total = {bw: budget_bytes(bw, 1.0) for bw in args.bandwidths_mbps}  # bytes/sec
+    schedules = {}
+    schedule_dir = out_root / "schedule"
+    schedule_dir.mkdir(parents=True, exist_ok=True)
+    for method in args.methods:
+        cadence_order_pairs = [orders[(ci, method)] for ci in range(len(cadence_rows))]
+        for bw in args.bandwidths_mbps:
+            track_rates = [track_rate_total[bw] / args.n_tracks] * args.n_tracks
+            schedule = build_session_schedule(
+                cadence_marks, cadence_order_pairs, cameras, method,
+                tile_index_offsets, tile_flat_indices,
+                opacity, scale_0, scale_1, scale_2, rot_0, rot_1, rot_2, rot_3,
+                gs_xyz_t, device, args.weight_mode, img_w, img_h, bpg,
+                n_tiles, track_rates, gs_order=args.gs_order)
+            schedules[(method, bw)] = schedule
+            entries = [
+                {"tile_idx": ti, "track": tr, "start_sec": st, "end_sec": en,
+                 "n_gs": len(tile_order), "bytes": len(tile_order) * bpg}
+                for ti, (st, en, tr, tile_order) in schedule.items()
+            ]
+            (schedule_dir / f"{method}_bw{bw}mbps.json").write_text(json.dumps({
+                "n_tracks": args.n_tracks, "bandwidth_mbps": bw,
+                "track_rates_bps": track_rates, "bpg": bpg, "n_tiles": n_tiles,
+                "session_duration_sec": duration_ms / 1000.0, "entries": entries,
+            }, indent=2))
+    logger.info("schedules: {} methods x {} bandwidths, whole-session event-driven "
+                "({:.1f}s elapsed)", len(args.methods), len(args.bandwidths_mbps),
+                time.time() - t0)
+
+    # --- Pass 2: dense render/metric samples off the persistent schedule -- delivered GS
+    #     count per tile only ever grows (no per-window reset), actual continuous camera
+    #     pose at each render mark (independent of cadence). PNGs saved at 5 evenly-spaced
+    #     representative session-time marks (no more guaranteed-empty reset instants to
+    #     dodge, unlike the old per-window picker -- t=0 is legitimately near-empty now,
+    #     which is expected and fine to show). ---
+    n_frames = len(render_rows)
+    save_indices = ({round(f * (n_frames - 1)) for f in (0.0, 0.25, 0.5, 0.75, 1.0)}
+                     if n_frames > 1 else {0})
+    is_repr_mark = lambda fi: fi in save_indices  # noqa: E731
     metric_rows = []
     for fine_idx, trace_row in enumerate(render_rows):
         t_sec = render_marks[fine_idx]
-        cadence_idx = int(t_sec // args.interval_sec)
-        elapsed_sec = t_sec - cadence_idx * args.interval_sec
 
         cam = scam.build_streaming_camera(
             trace_row, BICYCLE_SCENE_QUAT_XYZW, img_w, img_h,
@@ -543,32 +550,20 @@ def run_sweep(args, device, rend_gs_full=None):
 
         for method in args.methods:
             for bw in args.bandwidths_mbps:
-                bb = budget_bytes(bw, elapsed_sec)
+                schedule = schedules[(method, bw)]
+                rate_k = track_rate_total[bw] / args.n_tracks
                 sel_parts, used_bytes = [], 0
-                if args.track_schedule == "round_robin":
-                    track_bb = budget_bytes(bw / args.n_tracks, elapsed_sec)
-                    for track_ordered in orders[(cadence_idx, method)]:
-                        sel_k, used_k = sc.select_at_budget(track_ordered, track_bb, bpg, None)
-                        sel_parts.append(sel_k)
-                        used_bytes += used_k
-                else:  # greedy -- per-tile partial cutoff from the precomputed schedule,
-                       # not a flat per-track byte-budget truncation.
-                    all_ordered, starts_r, ends_r = greedy_chunks[(cadence_idx, method)]
-                    schedule = schedules[(cadence_idx, method, bw)]
-                    rates = [w / sum(args.track_weights) * budget_bytes(bw, 1.0)
-                             for w in args.track_weights]
-                    for j, (start_sec, end_sec, track_idx) in enumerate(schedule):
-                        if elapsed_sec <= start_sec:
-                            continue
-                        chunk_start, chunk_end = int(starts_r[j]), int(ends_r[j])
-                        if elapsed_sec >= end_sec:
-                            n_gs = chunk_end - chunk_start
-                        else:
-                            bytes_sent = rates[track_idx] * (elapsed_sec - start_sec)
-                            n_gs = min(int(bytes_sent // bpg), chunk_end - chunk_start)
-                        if n_gs > 0:
-                            sel_parts.append(all_ordered[chunk_start:chunk_start + n_gs])
-                            used_bytes += n_gs * bpg
+                for tile_idx, (start, end, track_idx, tile_order) in schedule.items():
+                    n_tile = len(tile_order)
+                    if n_tile == 0 or t_sec <= start:
+                        continue
+                    if t_sec >= end:
+                        n_gs = n_tile
+                    else:
+                        n_gs = min(int(rate_k * (t_sec - start) // bpg), n_tile)
+                    if n_gs > 0:
+                        sel_parts.append(tile_order[:n_gs])
+                        used_bytes += n_gs * bpg
                 selected = np.concatenate(sel_parts) if sel_parts else np.array([], dtype=np.int64)
                 sub_gs = sc.subset_gaussians(rend_gs_full, selected)
                 rendered = sc.render_gs(sub_gs, cam, args.white_bg)
@@ -582,11 +577,12 @@ def run_sweep(args, device, rend_gs_full=None):
                         torchvision.utils.save_image, rendered.cpu().clone(), str(png_path))
 
                 metric_rows.append({
-                    "frame_idx": fine_idx, "t_sec": t_sec, "cadence_idx": cadence_idx,
-                    "elapsed_sec": elapsed_sec, "method": method,
-                    "bandwidth_mbps": bw, "budget_bytes": bb, "used_bytes": used_bytes,
-                    "n_tracks": args.n_tracks, "track_schedule": args.track_schedule,
-                    "track_weights": ",".join(str(w) for w in args.track_weights),
+                    "frame_idx": fine_idx, "t_sec": t_sec, "method": method,
+                    "bandwidth_mbps": bw,
+                    "theoretical_max_bytes": int(track_rate_total[bw] * t_sec),
+                    "used_bytes": used_bytes,
+                    "coverage_frac": used_bytes / full_scene_bytes,
+                    "n_tracks": args.n_tracks,
                     "n_selected": len(selected), "n_gs_total": len(opacity),
                     "psnr": metrics["psnr"], "ssim": metrics["ssim"],
                 })
@@ -618,7 +614,7 @@ def run_sweep(args, device, rend_gs_full=None):
         "weight_mode": args.weight_mode, "w_norm": args.w_norm, "c_norm": args.c_norm,
         "white_bg": args.white_bg, "swap_top_bottom": args.swap_top_bottom,
         "n_tracks": args.n_tracks, "gs_order": args.gs_order,
-        "track_schedule": args.track_schedule, "track_weights": args.track_weights,
+        "full_scene_bytes": full_scene_bytes,
         "elapsed_sec": time.time() - t0,
     }
     (out_root / "params.yaml").write_text(json.dumps(params, indent=2))
@@ -691,22 +687,25 @@ def parse_args():
     p.add_argument("--sh-degree", type=int, default=3)
     p.add_argument("--img-w", type=int, default=1600)
     p.add_argument("--bandwidths-mbps", type=float, nargs="+", default=BANDWIDTHS_MBPS)
-    p.add_argument("--interval-sec", type=float, default=10.0,
-                    help="Cadence: how often the tile ORDER is recomputed from the current "
-                         "viewport (frozen in between).")
+    p.add_argument("--interval-sec", type=float, default=0.3,
+                    help="Cadence: how often the tile RANKING is recomputed from the current "
+                         "viewport. Only ever consulted by whichever track next goes idle -- "
+                         "the delivered buffer itself is never flushed on a tick (stateful "
+                         "model, 2026-07-16).")
     p.add_argument("--render-interval-sec", type=float, default=0.5,
-                    help="How often a frame is rendered+measured within a cadence window "
-                         "(dense, continuous camera pose + continuously growing byte budget "
-                         "against the frozen order) -- this is what makes the metric-vs-time "
-                         "curve smooth rather than a handful of disconnected snapshots.")
+                    help="How often a frame is rendered+measured -- independent of "
+                         "--interval-sec (not required to be in phase with it). Dense, "
+                         "continuous camera pose against the persistent delivery schedule -- "
+                         "this is what makes the metric-vs-time curve smooth.")
     p.add_argument("--duration-sec", type=float, default=None,
                     help="Cap the trace session length (default: use the full recorded trace "
-                         "duration). E.g. 30 to only simulate the first 30s.")
+                         "duration, ~60s for the EyeNavGS bicycle traces). E.g. 30 to only "
+                         "simulate the first 30s.")
     p.add_argument("--png-workers", type=int, default=4,
                     help="Thread pool size for the small number of representative PNG saves "
-                         "(first + last render mark only, for visual grounding -- 0 disables "
-                         "PNG saving entirely). Every mark still feeds the vmaf/*.yuv "
-                         "sequences via FrameWriter regardless of this flag.")
+                         "(5 evenly-spaced session-time marks, for visual grounding -- 0 "
+                         "disables PNG saving entirely). Every mark still feeds the "
+                         "vmaf/*.yuv sequences via FrameWriter regardless of this flag.")
     p.add_argument("--methods", nargs="+", default=METHODS)
     p.add_argument("--oracle-npz", default=None,
                     help="oracle_dq.npz (tile-level LOO delta-MSE, e.g. "
@@ -728,38 +727,21 @@ def parse_args():
     p.add_argument("--weight-mode", default="screen_area")
     p.add_argument("--w-norm", default="sum")
     p.add_argument("--c-norm", default="sum")
-    p.add_argument("--gs-order", default="weight")
-    p.add_argument("--online-prune-keep-frac", type=float, default=1.0,
-                    help="Within each tile, keep only the top keep-frac of that tile's own "
-                         "Gaussians by w(g_i) before packing -- the tile 'finishes' after "
-                         "fewer bytes, so the schedule reaches more tiles per cadence window "
-                         "at coarser per-tile fidelity. 1.0 (default) = no-op. Never applied "
-                         "to vd_lod (no real per-GS weight -- see NO_WEIGHT_SCHEMES). "
-                         "Orthogonal to --n-tracks and to any offline scene-size reduction; "
-                         "test separately, don't combine with either in one run.")
-    p.add_argument("--online-prune-max-gs-per-tile", type=int, default=None,
-                    help="Starvation backstop: absolute per-tile Gaussian cap applied AFTER "
-                         "--online-prune-keep-frac, so one oversized tile (bicycle has a "
-                         "1.37M-GS outlier vs. a 850-GS scene median) can't alone consume an "
-                         "entire cadence window's budget. Applies even if keep-frac=1.0. "
-                         "None (default) = no cap.")
+    p.add_argument("--gs-order", default="weight",
+                    help="Intra-tile Gaussian send-order preference for weight-bearing "
+                         "schemes: 'weight' (descending per-GS screen_area, default) or "
+                         "'ply' (storage order). Force-overridden to 'ply' regardless for "
+                         "schemes in selection_core.NO_WEIGHT_SCHEMES (currently vd_lod).")
+    # Online per-tile pruning (Workstream C) is deliberately out of scope for the stateful
+    # rewrite (2026-07-16, explicit user decision -- circle back later). Every tile's full
+    # Gaussian set is delivered. selection_core.prune_tile_gs itself is untouched and stays
+    # available for reuse when this is revisited.
     p.add_argument("--n-tracks", type=int, default=1,
-                    help="Number of simultaneous QUIC/MOQ-style transmission tracks. "
-                         "1 = current strictly-serial single-track behavior (default). "
-                         "See --track-schedule for how tiles are assigned to tracks.")
-    p.add_argument("--track-schedule", choices=["round_robin", "greedy"], default="round_robin",
-                    help="round_robin (default): track k permanently owns tile-priority ranks "
-                         "k, k+N, k+2N, ..., equal bandwidth share -- preserves the already-"
-                         "reported n_tracks=1/4/8 numbers exactly. greedy (2026-07-16): "
-                         "event-driven work-conserving list scheduling -- a track that "
-                         "finishes its current tile claims the next unclaimed tile instead of "
-                         "sitting idle; rates set via --track-weights.")
-    p.add_argument("--track-weights", type=float, nargs="+", default=None,
-                    help="Only consulted when --track-schedule greedy. Per-track relative "
-                         "bandwidth share, e.g. '4 3 2 1' for n_tracks=4. Must have exactly "
-                         "--n-tracks entries and be non-increasing (track 0 = highest-"
-                         "bandwidth slot by convention -- w_i >= w_j for i < j). Default: "
-                         "equal weights ([1.0]*n_tracks).")
+                    help="Number of simultaneous QUIC/MOQ-style transmission tracks, equal "
+                         "bandwidth share. Each track works one tile at a time to completion "
+                         "and, once free, claims the highest-priority not-yet-delivered tile "
+                         "(event-driven, work-conserving -- see build_session_schedule()). "
+                         "1 = strictly-serial single-track (default).")
     p.add_argument("--white-bg", action="store_true")
     p.add_argument("--znear", type=float, default=0.01)
     p.add_argument("--zfar", type=float, default=100.0)
@@ -783,17 +765,6 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.track_weights is None:
-        args.track_weights = [1.0] * args.n_tracks
-    if len(args.track_weights) != args.n_tracks:
-        raise ValueError(f"--track-weights has {len(args.track_weights)} entries, "
-                          f"expected --n-tracks={args.n_tracks}")
-    for i in range(len(args.track_weights) - 1):
-        if args.track_weights[i] < args.track_weights[i + 1]:
-            raise ValueError(
-                f"--track-weights must be non-increasing (track index = priority slot, "
-                f"w_i >= w_j for i < j) -- got {args.track_weights}, "
-                f"w[{i}]={args.track_weights[i]} < w[{i + 1}]={args.track_weights[i + 1]}")
     Path(args.output_root).mkdir(parents=True, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 

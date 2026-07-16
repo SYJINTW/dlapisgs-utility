@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Aggregate streaming_sim.py summary.csv across multiple traces, pooled by
-elapsed_sec (time since last cadence reorder) -- NOT raw t_sec, since traces
-are independent sessions with no shared clock. One point per (bandwidth,
-method, elapsed_sec) = mean +/- 95% CI over all traces x cadence windows
-landing on that elapsed_sec tick.
+"""Aggregate streaming_sim.py summary.csv across multiple traces, pooled by raw
+session t_sec (2026-07-16, stateful rewrite -- supersedes the old elapsed_sec/
+"time since last cadence reorder" pooling key, which only made sense under the
+retired per-window-reset model). All EyeNavGS bicycle traces are genuinely ~60s
+recordings sharing a comparable absolute session clock, so pooling directly by
+t_sec across traces is valid, not an approximation. One point per (bandwidth,
+method, t_sec) = mean +/- 95% CI over all traces landing on that render mark.
 
 Usage:
   python experiments/aggregate_streaming_sim.py \
-      --glob "output/0714/streaming_sim/all24_bw600/*/metrics/summary.csv" \
-      --out-dir output/0714/streaming_sim/all24_bw600/agg
+      --glob "output/0717/streaming_sim/all24_bw300_600/*/metrics/summary.csv" \
+      --out-dir output/0717/streaming_sim/all24_bw300_600/agg
 """
 from __future__ import annotations
 
@@ -56,11 +58,11 @@ def plot_metric(pooled: dict, metric: str, bandwidths: list[str], methods: list[
             key = (bw, method)
             if key not in pooled:
                 continue
-            elapsed_to_vals = pooled[key]
-            xs = sorted(elapsed_to_vals)
+            t_to_vals = pooled[key]
+            xs = sorted(t_to_vals)
             means, los, his = [], [], []
             for x in xs:
-                vals = np.asarray(elapsed_to_vals[x])
+                vals = np.asarray(t_to_vals[x])
                 if metric == "psnr":
                     vals = np.clip(vals, None, PSNR_SATURATION_DB)
                 m = vals.mean()
@@ -72,7 +74,7 @@ def plot_metric(pooled: dict, metric: str, bandwidths: list[str], methods: list[
                     label=cfg.get("label", method), zorder=2)
             ax.fill_between(xs, los, his, color=cfg.get("color"), alpha=0.2, linewidth=0, zorder=1)
         ax.set_title(f"{bw} Mbps", fontsize=17)
-        ax.set_xlabel("Time since cadence tick (sec)", fontsize=15)
+        ax.set_xlabel("Time (sec)", fontsize=15)
         ax.tick_params(labelsize=13, direction="out", which="both", top=False, right=False)
         for spine in ax.spines.values():
             spine.set_visible(True)
@@ -107,14 +109,18 @@ def main():
     for metric in ("psnr", "ssim", "vmaf"):
         if not any(r.get(metric) for r in all_rows):
             continue
-        # pooled[(bandwidth, method)][elapsed_sec] = [values across traces/windows]
+        # pooled[(bandwidth, method)][t_sec] = [values across traces]. round(): matches
+        # the render marks' fixed step exactly, but floats accumulate drift across many
+        # summary.csv files -- rounding avoids fragmenting one nominal tick into several
+        # near-duplicate x-positions (same class of bug this file already fixed once
+        # under the old elapsed_sec key, see .claude/PLAN.md "Cross-trace aggregator bug").
         pooled: dict = defaultdict(lambda: defaultdict(list))
         for r in all_rows:
             if not r.get(metric):
                 continue
             key = (r["bandwidth_mbps"], r["method"])
-            pooled[key][round(float(r["elapsed_sec"]), 6)].append(float(r[metric]))
-        out_path = out_dir / f"{metric}_vs_elapsed_pooled.png"
+            pooled[key][round(float(r["t_sec"]), 6)].append(float(r[metric]))
+        out_path = out_dir / f"{metric}_vs_time_pooled.png"
         plot_metric(pooled, metric, bandwidths, methods, out_path)
         print(f"wrote {out_path}")
 

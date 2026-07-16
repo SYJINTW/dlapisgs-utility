@@ -30,7 +30,6 @@ import json
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -410,8 +409,7 @@ def run_sweep(args, device, rend_gs_full=None):
             key = (bw, method)
             frame_writers[key] = FrameWriter(
                 vmaf_dir / f"bw_{bw}mbps" / method / "distorted.yuv", img_w, img_h)
-    png_executor = ThreadPoolExecutor(max_workers=args.png_workers) if args.png_workers > 0 else None
-    png_futures: list = []
+    png_pool = sc.AsyncWritePool(args.png_workers)
 
     n_tiles = len(index_offsets) - 1
     t0 = time.time()
@@ -538,10 +536,10 @@ def run_sweep(args, device, rend_gs_full=None):
 
         gt_rendered = sc.render_gs(rend_gs_full, cam, args.white_bg)
         frame_writers["gt"].write(gt_rendered)
-        if is_repr_mark(fine_idx) and png_executor:
-            png_futures.append(png_executor.submit(
+        if is_repr_mark(fine_idx) and args.png_workers > 0:
+            png_pool.submit(
                 torchvision.utils.save_image, gt_rendered.cpu().clone(),
-                str(out_root / "gt_renders" / f"frame_{fine_idx:04d}.png")))
+                str(out_root / "gt_renders" / f"frame_{fine_idx:04d}.png"))
 
         for method in args.methods:
             for bw in args.bandwidths_mbps:
@@ -578,10 +576,10 @@ def run_sweep(args, device, rend_gs_full=None):
                 metrics = sc.compute_metrics(rendered, gt_rendered, skip_lpips=True)
 
                 frame_writers[(bw, method)].write(rendered)
-                if is_repr_mark(fine_idx) and png_executor:
+                if is_repr_mark(fine_idx) and args.png_workers > 0:
                     png_path = out_root / f"renders/bw_{bw}mbps/{method}/frame_{fine_idx:04d}.png"
-                    png_futures.append(png_executor.submit(
-                        torchvision.utils.save_image, rendered.cpu().clone(), str(png_path)))
+                    png_pool.submit(
+                        torchvision.utils.save_image, rendered.cpu().clone(), str(png_path))
 
                 metric_rows.append({
                     "frame_idx": fine_idx, "t_sec": t_sec, "cadence_idx": cadence_idx,
@@ -598,10 +596,8 @@ def run_sweep(args, device, rend_gs_full=None):
 
     for fw in frame_writers.values():
         fw.close()
-    if png_executor:
-        for fut in png_futures:
-            fut.result()
-        png_executor.shutdown(wait=True)
+    png_pool.drain()
+    png_pool.shutdown()
 
     rows = metric_rows
     summary_csv = out_root / "metrics" / "summary.csv"

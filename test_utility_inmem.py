@@ -33,7 +33,6 @@ import socket
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -876,9 +875,8 @@ def main() -> None:
     metrics_dir.mkdir(parents=True, exist_ok=True)
     timings_path = output_root_for_meta / "timings.json"
 
-    executor = ThreadPoolExecutor(max_workers=args.ply_workers) if args.save_ply else None
-    png_executor = ThreadPoolExecutor(max_workers=args.png_workers) if args.png_workers > 0 else None
-    png_futures: list = []
+    ply_pool = sc.AsyncWritePool(args.ply_workers) if args.save_ply else None
+    png_pool = sc.AsyncWritePool(args.png_workers)
 
     # --- Per-camera loop ---
     cam_pbar = tqdm(camera_indices, desc="cameras", unit="cam")
@@ -887,7 +885,6 @@ def main() -> None:
             torch.cuda.empty_cache()
         sel_cam = sel_cameras[camera_index]
         rend_cam = rend_cameras[camera_index]
-        cam_futures = []
         _sel_peak_mib = 0
         _rend_peak_mib = 0
         if torch.cuda.is_available():
@@ -1039,10 +1036,9 @@ def main() -> None:
                     m = _compute_metrics(rendered, gt_render_gpu, skip_lpips=not args.lpips)
 
                 if not args.save_rep_only:
-                    if png_executor:
-                        png_futures.append(png_executor.submit(
-                            torchvision.utils.save_image,
-                            rendered.cpu().clone(), str(render_png)))
+                    if args.png_workers > 0:
+                        png_pool.submit(torchvision.utils.save_image,
+                                        rendered.cpu().clone(), str(render_png))
                     else:
                         with _timed("png_write", timings, camera=camera_index,
                                     scheme=scheme, budget_mb=budget_mb):
@@ -1086,9 +1082,8 @@ def main() -> None:
                 if args.save_ply:
                     ply_dir = base_output_path / "ply" / budget_tag / scheme
                     output_ply = ply_dir / f"camera_{camera_index:03d}.ply"
-                    fut = executor.submit(_write_ply, sel_gs, selected_indices,
-                                         output_ply, args.ascii_ply)
-                    cam_futures.append(fut)
+                    ply_pool.submit(_write_ply, sel_gs, selected_indices,
+                                    output_ply, args.ascii_ply)
                     # Write manifest alongside PLY
                     manifest = {
                         "scheme": scheme, "camera_index": camera_index,
@@ -1113,11 +1108,10 @@ def main() -> None:
                         json.dumps(manifest, indent=2), encoding="utf-8"
                     )
 
-        if executor and cam_futures:
+        if args.save_ply:
             cam_pbar.set_postfix(idx=camera_index, stage="draining_ply")
-            with _timed("ply_writes_drained", timings, camera=camera_index, n=len(cam_futures)):
-                for fut in cam_futures:
-                    fut.result()
+            with _timed("ply_writes_drained", timings, camera=camera_index):
+                ply_pool.drain()
 
         if torch.cuda.is_available():
             timings.append({"stage": "gpu_peak_selection", "camera": camera_index,
@@ -1125,13 +1119,12 @@ def main() -> None:
             timings.append({"stage": "gpu_peak_render", "camera": camera_index,
                             "peak_alloc_mib": _rend_peak_mib})
 
-    if executor:
-        executor.shutdown(wait=True)
+    if ply_pool is not None:
+        ply_pool.drain()
+        ply_pool.shutdown()
 
-    if png_executor:
-        for fut in png_futures:
-            fut.result(timeout=300)
-        png_executor.shutdown(wait=True)
+    png_pool.drain(timeout=300)
+    png_pool.shutdown()
 
     # --- Write summary ---
     if all_metric_rows:

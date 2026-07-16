@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -63,6 +64,39 @@ class _FakePipe:
 
 
 PIPELINE = _FakePipe()
+
+
+class AsyncWritePool:
+    """Optional background ThreadPoolExecutor for fire-and-forget file writes (PNG/PLY).
+
+    Extracted 2026-07-16 from test_utility_inmem.py (which had two near-identical copies,
+    one for PNG renders and one for PLY exports) and streaming_sim.py (one more, for PNG
+    renders). max_workers<=0 disables pooling -- submit() then runs synchronously, so
+    callers don't need their own if-pool-else-sync branch at every call site.
+    """
+    def __init__(self, max_workers: int):
+        self._executor = ThreadPoolExecutor(max_workers=max_workers) if max_workers > 0 else None
+        self._futures: list = []
+
+    def submit(self, fn, *args, **kwargs) -> None:
+        if self._executor is None:
+            fn(*args, **kwargs)
+            return
+        self._futures.append(self._executor.submit(fn, *args, **kwargs))
+
+    def drain(self, timeout=None) -> None:
+        """Wait for all currently-queued futures. Safe to call repeatedly (e.g. once per
+        camera, to barrier before moving on) -- does NOT shut the pool down; call
+        shutdown() once, after the last drain(), when the pool is no longer needed."""
+        try:
+            for fut in self._futures:
+                fut.result(timeout=timeout)
+        finally:
+            self._futures.clear()
+
+    def shutdown(self) -> None:
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
 
 
 def bytes_per_gaussian(gs) -> int:

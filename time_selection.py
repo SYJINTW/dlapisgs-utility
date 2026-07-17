@@ -215,8 +215,16 @@ def _time_method(
     ml_feature_names=None,
 ) -> list[dict]:
     n_total_gs = int(len(sel_gs.data["x"]["data"]))
-    max_budget_bytes = n_total_gs * bytes_per_gaussian  # identity budget
-    total_scene_bytes = max_budget_bytes
+    total_scene_bytes = n_total_gs * bytes_per_gaussian
+    # perf 2026-07-17: was unconditionally using the full-scene "identity" budget here,
+    # so greedy_order()'s final CPU transfer always moved all n_gs indices regardless of
+    # --budget-pct -- correct for sweep mode (compute once, slice for every requested
+    # budget_pct cheaply) but wasteful when only smaller budgets are requested (measured:
+    # transfer scales superlinearly with size, bicycle 40%->~12ms vs identity 100%->~66ms
+    # under sustained GPU load -- ~55ms/camera of dead weight for a single-budget call).
+    # max(budget_pcts) preserves sweep semantics exactly (still one order supporting every
+    # requested budget_pct via cheap slicing) while dropping the artificial 100% floor.
+    max_budget_bytes = int(max(budget_pcts) / 100.0 * total_scene_bytes)
 
     cam_results = []
     for ci in camera_indices:

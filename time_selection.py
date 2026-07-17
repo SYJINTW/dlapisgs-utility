@@ -109,11 +109,62 @@ BUDGET_COLS = ["scene", "method", "camera_index", "budget_pct",
 
 @contextmanager
 def _timed(name: str, store: dict):
+    """Plain wall-clock timing (time.perf_counter, no sync). Only accurate for a block
+    that is genuinely CPU-only (e.g. ml_predict's LightGBM inference) -- for any block
+    containing GPU tensor ops, use _timed_gpu() instead. Measured 2026-07-17: an earlier
+    version of this function added torch.cuda.synchronize() on both entry and exit to
+    force accurate per-stage attribution -- that DID fix the attribution (confirmed
+    ml/heuristic/vd_lod's `greedy` stage converges to the same ~65-76ms once isolated
+    correctly, vs. the old 3x-inflated 108ms for ml) but also measurably inflated total
+    wall time (heuristic 238.7ms->306ms, ml 233ms->290ms, bicycle, 5-cam median) by
+    killing the free async pipelining CUDA does between consecutive kernel launches.
+    Sync-per-stage is a real, standard, well-documented CUDA effect (forcing the GPU
+    queue to drain removes overlap that existed for free) -- not something to leave in
+    permanently. Replaced by _timed_gpu()/CUDA events below: same accurate attribution,
+    without the pipeline-stalling side effect, because event recording doesn't block."""
     t0 = time.perf_counter()
     try:
         yield
     finally:
         store[name] = time.perf_counter() - t0
+
+
+@contextmanager
+def _timed_gpu(name: str, store: dict, events: list):
+    """CUDA-event-based timing for a block containing GPU tensor ops (with or without a
+    natural .cpu()/.item()/.numpy() sync inside it -- works either way, since events are
+    GPU-stream timestamps, not CPU wall-clock reads). Records a start/end marker pair
+    directly in the stream (near-zero CPU cost, does not block), so the GPU keeps
+    pipelining exactly as it would in production -- no torch.cuda.synchronize() happens
+    here. Elapsed time is only read out once ALL stages for this camera have been
+    recorded, via _finalize_gpu_events() (single sync at the very end of the per-camera
+    block, not one per stage). CPU falls back to plain wall-clock (no CUDA available)."""
+    if torch.cuda.is_available():
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        try:
+            yield
+        finally:
+            end.record()
+            events.append((name, start, end))
+    else:
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            store[name] = time.perf_counter() - t0
+
+
+def _finalize_gpu_events(store: dict, events: list) -> None:
+    """Call once per camera, after every _timed_gpu() block for that camera has recorded
+    its (start, end) pair. Single synchronize() -- not one per stage -- then reads out
+    each pair's true elapsed GPU time (ms -> s) into `store`."""
+    if not events or not torch.cuda.is_available():
+        return
+    torch.cuda.synchronize()
+    for name, start, end in events:
+        store[name] = start.elapsed_time(end) / 1000.0
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +226,7 @@ def _time_method(
         # the ~150-250ms per-camera run-to-run spread. Real deployment wouldn't call this
         # every frame either. If you add it back, re-measure and update this note.
         stages: dict = {}
+        events: list = []
         cam = sel_cameras[ci]
         all_ordered: np.ndarray | None = None
 
@@ -182,31 +234,31 @@ def _time_method(
         if method in _PROG_WEIGHT_MODE:
             wm = _PROG_WEIGHT_MODE[method]
 
-            with _timed("visibility", stages):
+            with _timed_gpu("visibility", stages, events):
                 vis   = visibility_AABB_pytorch.batched_check_tiles_visible(
                     min_corners_t, max_corners_t, cam, device=device)
                 dists = uc.calculate_distances(tile_centers, cam.camera_center.to(device))
 
-            with _timed("gaussian_weights", stages):
+            with _timed_gpu("gaussian_weights", stages, events):
                 w_gi = sc.camera_weights_for_scope(
                     args.gs_weight_scope, cam, vis, opacity, scale_0, scale_1, scale_2,
                     rot_0, rot_1, rot_2, rot_3, gs_xyz_t, device,
                     wm, args.img_w, args.img_h,
                     tile_index_offsets, tile_flat_indices)
 
-            with _timed("greedy", stages):
+            with _timed_gpu("greedy", stages, events):
                 all_ordered = sc.greedy_order_progressive(
                     vis, tile_index_offsets, tile_flat_indices,
                     w_gi, bytes_per_gaussian, max_budget_bytes)
 
         # ── VD_LOD (tile_partial, v/d only — no gaussian_weights) ────────────
         elif method == "vd_lod":
-            with _timed("visibility", stages):
+            with _timed_gpu("visibility", stages, events):
                 vis   = visibility_AABB_pytorch.batched_check_tiles_visible(
                     min_corners_t, max_corners_t, cam, device=device)
                 dists = uc.calculate_distances(tile_centers, cam.camera_center.to(device))
 
-            with _timed("utility", stages):
+            with _timed_gpu("utility", stages, events):
                 raw = uc.calculate_utility_param(
                     vis, dists,
                     num_of_level=1, weight_sum_tensor=None, complexity_tensor=None,
@@ -216,7 +268,7 @@ def _time_method(
                     raw = raw.cpu().numpy()
                 order_pairs = sc.sort_tiles(raw, n_gs_per_tile, bytes_per_gaussian, "marginal")
 
-            with _timed("greedy", stages):
+            with _timed_gpu("greedy", stages, events):
                 # perf 2026-07-02: vd_lod never computes gaussian_weights (no W_k signal,
                 # canonical convention per run_exp2.sh) -- gs_order="ply" skips the
                 # w_gi[tile_flat_indices].cpu() pull entirely. Previously passed a full
@@ -234,23 +286,23 @@ def _time_method(
 
         # ── HEURISTIC (tile_partial, vd_lod_w, screen_area W_k) ─────────────
         elif method == "heuristic":
-            with _timed("visibility", stages):
+            with _timed_gpu("visibility", stages, events):
                 vis   = visibility_AABB_pytorch.batched_check_tiles_visible(
                     min_corners_t, max_corners_t, cam, device=device)
                 dists = uc.calculate_distances(tile_centers, cam.camera_center.to(device))
 
-            with _timed("gaussian_weights", stages):
+            with _timed_gpu("gaussian_weights", stages, events):
                 w_gi = sc.compute_camera_weights(
                     cam, opacity, scale_0, scale_1, scale_2,
                     rot_0, rot_1, rot_2, rot_3, gs_xyz_t, device,
                     "screen_area", args.img_w, args.img_h)
 
-            with _timed("tile_weights", stages):
+            with _timed_gpu("tile_weights", stages, events):
                 W_k, _ = uc.compute_tile_weights_and_counts(
                     tile_index_offsets, tile_flat_indices, w_gi,
                     w_norm="sum", c_norm="sum")
 
-            with _timed("utility", stages):
+            with _timed_gpu("utility", stages, events):
                 raw = uc.calculate_utility_param(
                     vis, dists,
                     num_of_level=1, weight_sum_tensor=W_k, complexity_tensor=None,
@@ -260,18 +312,23 @@ def _time_method(
                     raw = raw.cpu().numpy()
                 order_pairs = sc.sort_tiles(raw, n_gs_per_tile, bytes_per_gaussian, "marginal")
 
-            with _timed("greedy", stages):
+            with _timed_gpu("greedy", stages, events):
                 all_ordered = sc.greedy_order(order_pairs, tile_index_offsets, tile_flat_indices,
                                               w_gi, bytes_per_gaussian, max_budget_bytes)
 
         # ── ML (tile_partial, group_a + model.predict — no gaussian_weights) ─
         elif method == "ml":
-            with _timed("visibility", stages):
+            # np_vis/np_dists .cpu() pulls folded INTO this block (2026-07-17, was two
+            # untimed lines after the block -- any pending async GPU work from
+            # batched_check_tiles_visible/calculate_distances got flushed here for real,
+            # but the wall-clock cost of that flush wasn't attributed to ANY stage,
+            # silently missing from total_s entirely, not just misattributed).
+            with _timed_gpu("visibility", stages, events):
                 vis   = visibility_AABB_pytorch.batched_check_tiles_visible(
                     min_corners_t, max_corners_t, cam, device=device)
                 dists = uc.calculate_distances(tile_centers, cam.camera_center.to(device))
-            np_vis   = vis.float().cpu().numpy()
-            np_dists = dists.cpu().numpy()
+                np_vis   = vis.float().cpu().numpy()
+                np_dists = dists.cpu().numpy()
 
             with _timed("ml_group_a", stages):
                 cam_w2v       = cam.world_view_transform.cpu().numpy()
@@ -303,7 +360,7 @@ def _time_method(
             # compute entirely; "weight" pays for real screen_area weights, measuring that cost
             # for ml specifically (not what run_exp2.sh does today, but a real config to compare).
             if args.gs_order == "weight":
-                with _timed("gaussian_weights", stages):
+                with _timed_gpu("gaussian_weights", stages, events):
                     w_gi = sc.compute_camera_weights(
                         cam, opacity, scale_0, scale_1, scale_2,
                         rot_0, rot_1, rot_2, rot_3, gs_xyz_t, device,
@@ -311,7 +368,7 @@ def _time_method(
             else:
                 w_gi = torch.empty(0, device=device)
 
-            with _timed("greedy", stages):
+            with _timed_gpu("greedy", stages, events):
                 all_ordered = sc.greedy_order(order_pairs, tile_index_offsets, tile_flat_indices,
                                               w_gi, bytes_per_gaussian, max_budget_bytes,
                                               gs_order=args.gs_order)
@@ -320,12 +377,13 @@ def _time_method(
         elif method == "oracle_online":
             rend_cam = rend_cameras[ci]
 
-            with _timed("visibility", stages):
+            # np_vis .cpu() pull folded into this block, same untimed-gap fix as ml above.
+            with _timed_gpu("visibility", stages, events):
                 vis = visibility_AABB_pytorch.batched_check_tiles_visible(
                     min_corners_t, max_corners_t, cam, device=device)
-            np_vis = vis.cpu().numpy() if hasattr(vis, "cpu") else np.asarray(vis)
+                np_vis = vis.cpu().numpy() if hasattr(vis, "cpu") else np.asarray(vis)
 
-            with _timed("full_render", stages):
+            with _timed_gpu("full_render", stages, events):
                 R_full = sc.render_gs(rend_gs_full, rend_cam, white_bg=False).detach()
 
             n_tiles = len(index_offsets) - 1
@@ -366,7 +424,7 @@ def _time_method(
 
             # perf 2026-07-02: same gs_order coupling as ml above.
             if args.gs_order == "weight":
-                with _timed("gaussian_weights", stages):
+                with _timed_gpu("gaussian_weights", stages, events):
                     w_gi = sc.compute_camera_weights(
                         cam, opacity, scale_0, scale_1, scale_2,
                         rot_0, rot_1, rot_2, rot_3, gs_xyz_t, device,
@@ -374,7 +432,7 @@ def _time_method(
             else:
                 w_gi = torch.empty(0, device=device)
 
-            with _timed("greedy", stages):
+            with _timed_gpu("greedy", stages, events):
                 order_pairs = sc.sort_tiles(scores, n_gs_per_tile, bytes_per_gaussian, "marginal")
                 all_ordered = sc.greedy_order(order_pairs, tile_index_offsets, tile_flat_indices,
                                               w_gi, bytes_per_gaussian, max_budget_bytes,
@@ -383,6 +441,7 @@ def _time_method(
         else:
             raise ValueError(f"Unknown method: {method}")
 
+        _finalize_gpu_events(stages, events)
         total_s = sum(v for k, v in stages.items() if isinstance(v, float) and k != "n_tiles_scored")
         budgets = _budget_slices(all_ordered, budget_pcts, total_scene_bytes, bytes_per_gaussian)
 

@@ -2,15 +2,20 @@
 # New bandwidth tier (2026-07-20): 120/180/240 Mbps replaces 60/120/300 canon -- 300 Mbps
 # saturated too fast and regressed with more tracks, 60 Mbps was bandwidth-starved at every
 # n_tracks (see .claude/PLAN.md n_tracks1-8 reading). n_tracks sparsified to 1,2,4,8,16
-# (3/5/6/7 added little over 4/8 in the prior 1-8 sweep). Same trace/method canon as
-# experiments/0717/run_stateful_sweep_gpu1.sh, output goes to a fresh output/0720/ dir
-# (not output/0717/ -- different bandwidth tier, not directly comparable/mergeable).
-# GPU1: traces 1-12. Raw nesting is user{N}/n_tracks{NT}/ (fold's native order), symlinked
-# into canonical n_tracks{NT}/user{N}/ for aggregate_streaming_sim.py's glob convention --
-# same pattern as experiments/0720/run_stateful_sweep_ntracks5678_gpu1.sh.
+# (3/5/6/7 added little over 4/8 in the prior 1-8 sweep). Output goes to a fresh output/0720/
+# dir (not output/0717/ -- different bandwidth tier, not directly comparable/mergeable).
+#
+# RESUME after 09:58:53 reboot killed the original 2-GPU run mid-sweep. user1/user13 already
+# completed pre-reboot (verified 5/5 n_tracks summary.csv) -- excluded from all trace splits
+# below. Split 4-way across GPU0-3 (originally 2-way across GPU1/2) to finish faster.
+#
+# Usage: CUDA_VISIBLE_DEVICES=<gpu> bash resume_bw120180240_ntracks124816.sh <trace...>
+#   GPU0: 2 3 4 5 6
+#   GPU1: 7 8 9 10 11 12
+#   GPU2: 14 15 16 17 18
+#   GPU3: 19 20 21 22 23 24
 set -e
-export CUDA_VISIBLE_DEVICES=1
-TRACES="1 2 3 4 5 6 7 8 9 10 11 12"
+TRACES="$*"
 PLY=/mnt/data1/samk/gs-quic/cs5262_tile_quic/exp-dataset/bicycle/point_cloud.ply
 TILING_CACHE=output/oracle_tiling_cache/bicycle_8x8x8.npz
 ML_MODEL_DIR=output/ml_models_experimental/per_scene/bicycle/AC
@@ -19,7 +24,7 @@ RAW=${OUT_BASE}/_raw
 
 for N in $TRACES; do
   TRACE=dataset/EyeNavGS_NTHU_Dataset/bicycle/user${N}_bicycle.csv
-  echo "=== user${N} n_tracks=1,2,4,8,16 ==="
+  echo "=== user${N} n_tracks=1,2,4,8,16 (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}) ==="
   conda run -n gaussian_splatting python streaming_sim.py \
     --output-root "${RAW}/user${N}" \
     --trace-file "${TRACE}" --ply "${PLY}" --tiling-cache "${TILING_CACHE}" \
@@ -34,4 +39,4 @@ for N in $TRACES; do
     ln -sfn "../_raw/user${N}/n_tracks${NT}" "${OUT_BASE}/n_tracks${NT}/user${N}"
   done
 done
-echo "GPU1 bw120180240_ntracks124816 batch done"
+echo "GPU${CUDA_VISIBLE_DEVICES} bw120180240_ntracks124816 batch done"

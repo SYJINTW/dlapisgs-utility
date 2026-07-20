@@ -1,16 +1,24 @@
 #!/bin/bash
-# Waits for both raw-sweep GPU wrappers (bw120180240_ntracks124816) to exit, then runs
+# Waits for all raw-sweep GPU wrappers (bw120180240_ntracks124816) to exit, then runs
 # finish_streaming_sim.sh (VMAF backfill + per-trace plots + utilization diagnostic) over
 # all 120 new dirs (24 users x n_tracks{1,2,4,8,16}), 4-way parallel sharded like the
 # n_tracks5-8 backfill earlier this session -- see .claude/PLAN.md "streaming_sim needs
 # finish_streaming_sim.sh" rule: VMAF is never inline, always chain this automatically,
 # don't wait to be asked.
+#
+# Usage: finish_after_bw120180240_ntracks124816.sh <gpu_wrapper_pid...>  (any count, e.g.
+# 2 PIDs for a 2-GPU launch or 4 PIDs for a 4-GPU split)
 set -e
 cd "$(dirname "$0")/../.."
-GPU1_PID=$1
-GPU2_PID=$2
+GPU_PIDS=("$@")
 
-while kill -0 "$GPU1_PID" 2>/dev/null || kill -0 "$GPU2_PID" 2>/dev/null; do
+any_alive() {
+  for p in "${GPU_PIDS[@]}"; do
+    kill -0 "$p" 2>/dev/null && return 0
+  done
+  return 1
+}
+while any_alive; do
   sleep 30
 done
 echo "=== both raw-sweep GPU jobs exited, starting VMAF/plots backfill ==="

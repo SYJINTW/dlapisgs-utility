@@ -64,12 +64,17 @@ except Exception:
 
 NTRACKS_ORDER = [1, 2, 3, 4]
 # Ordinal track-count palette, style intent matches plotting/paper/plot_format_ref/
-# streaming/*.png's n_tracks legend (No Tile/2/4/16 -> blue/orange/green/red).
+# streaming/*.png's n_tracks legend (No Tile/2/4/16 -> blue/orange/green/red). 5-8 (2026-07-20
+# optimal-#tracks sweep) extend the cycle with tab10's remaining colors.
 _NTRACKS_CONFIG = {
     1: {"label": "n=1", "color": "#1f77b4"},
     2: {"label": "n=2", "color": "#ff7f0e"},
     3: {"label": "n=3", "color": "#2ca02c"},
     4: {"label": "n=4", "color": "#d62728"},
+    5: {"label": "n=5", "color": "#9467bd"},
+    6: {"label": "n=6", "color": "#8c564b"},
+    7: {"label": "n=7", "color": "#e377c2"},
+    8: {"label": "n=8", "color": "#7f7f7f"},
 }
 
 
@@ -166,12 +171,13 @@ def plot_line(pooled: dict, metric: str, bandwidths: list[str], group_vals: list
     plt.close(fig)
 
 
-def plot_bar(all_rows: list[dict], metric: str, bandwidths: list[str], group_vals: list,
-             group_cfg: dict, group_key: str, time_marks: list[int], out_path: Path):
+def _pool_at_marks(all_rows: list[dict], metric: str, group_key: str,
+                    time_marks: list[int]) -> dict:
+    """pooled[bw][group_val][mark_sec] = [values across traces], snapped to the nearest
+    actual t_sec per mark. Shared by plot_bar and plot_line_marks -- same sparse-sampling
+    semantics, different rendering."""
     all_t = sorted({round(float(r["t_sec"]), 6) for r in all_rows})
     mark_to_t = {mark: min(all_t, key=lambda t: abs(t - mark)) for mark in time_marks}
-
-    # pooled[bw][group_val][mark_sec] = [values across traces]
     pooled: dict = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for r in all_rows:
         if not r.get(metric):
@@ -181,6 +187,51 @@ def plot_bar(all_rows: list[dict], metric: str, bandwidths: list[str], group_val
         for mark, snapped_t in mark_to_t.items():
             if t == snapped_t:
                 pooled[r["bandwidth_mbps"]][gv][mark].append(float(r[metric]))
+    return pooled
+
+
+def plot_line_marks(all_rows: list[dict], metric: str, bandwidths: list[str],
+                     group_vals: list, group_cfg: dict, group_key: str,
+                     time_marks: list[int], out_path: Path):
+    """Sparse line plot at time_marks (default 6: 10/20/.../60s) with real 95% CI error
+    bars (ax.errorbar) instead of plot_line's dense-per-frame shaded-band CI, and instead
+    of plot_bar's grouped bars -- same pooling as plot_bar, connected-line rendering."""
+    pooled = _pool_at_marks(all_rows, metric, group_key, time_marks)
+
+    fig, axes = plt.subplots(1, len(bandwidths), figsize=(5.5 * len(bandwidths), 4.8),
+                              sharey=True, constrained_layout=True)
+    if len(bandwidths) == 1:
+        axes = [axes]
+
+    for ax, bw in zip(axes, bandwidths):
+        for gv in group_vals:
+            cfg = group_cfg.get(gv, {})
+            means, cis = [], []
+            for mark in time_marks:
+                vals = np.asarray(pooled[bw][gv][mark])
+                if metric == "psnr":
+                    vals = np.clip(vals, None, PSNR_SATURATION_DB)
+                means.append(vals.mean() if len(vals) else np.nan)
+                cis.append(_ci95(vals) if len(vals) else 0.0)
+            ax.errorbar(time_marks, means, yerr=cis, marker="o", capsize=4, linewidth=2.0,
+                        color=cfg.get("color"), label=cfg.get("label", str(gv)), zorder=2)
+        ax.set_title(f"{bw} Mbps", fontsize=17)
+        ax.set_xlabel("Time (sec)", fontsize=15)
+        ax.set_xticks(time_marks)
+        ax.tick_params(labelsize=13, direction="out", which="both", top=False, right=False)
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+    axes[0].set_ylabel(_METRIC_YLABEL.get(metric, metric.upper()), fontsize=17)
+    axes[0].legend(loc="best", framealpha=0.9, fontsize=13)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(out_path), dpi=DPI, bbox_inches="tight")
+    fig.savefig(str(out_path.with_suffix(".eps")), format="eps", bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_bar(all_rows: list[dict], metric: str, bandwidths: list[str], group_vals: list,
+             group_cfg: dict, group_key: str, time_marks: list[int], out_path: Path):
+    pooled = _pool_at_marks(all_rows, metric, group_key, time_marks)
 
     n_bars = len(group_vals)
     width = 0.8 / n_bars
@@ -213,6 +264,50 @@ def plot_bar(all_rows: list[dict], metric: str, bandwidths: list[str], group_val
             spine.set_visible(True)
     axes[0].set_ylabel(_METRIC_YLABEL.get(metric, metric.upper()), fontsize=17)
     axes[0].legend(loc="best", framealpha=0.9, fontsize=13)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(out_path), dpi=DPI, bbox_inches="tight")
+    fig.savefig(str(out_path.with_suffix(".eps")), format="eps", bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_scalar(all_rows: list[dict], metric: str, bandwidths: list[str], group_vals: list,
+                 out_path: Path):
+    """Whole-session aggregate metric vs. #tracks -- one point per (bandwidth, n_tracks),
+    pooling every trace and every t_sec together (not faceted by time like plot_line/
+    plot_bar). Answers "does adding more tracks keep helping, or does it plateau/regress"
+    at a glance, instead of eyeballing a per-time-mark bar chart."""
+    # pooled[bw][group_val] = [values across all traces, all t_sec]
+    pooled: dict = defaultdict(lambda: defaultdict(list))
+    for r in all_rows:
+        if not r.get(metric):
+            continue
+        vals = pooled[r["bandwidth_mbps"]][int(r["n_tracks"])]
+        v = float(r[metric])
+        if metric == "psnr":
+            v = min(v, PSNR_SATURATION_DB)
+        vals.append(v)
+
+    fig, ax = plt.subplots(figsize=(6.5, 4.8), constrained_layout=True)
+    cmap = plt.get_cmap("viridis")
+    for i, bw in enumerate(bandwidths):
+        xs, means, cis = [], [], []
+        for gv in group_vals:
+            vals = np.asarray(pooled[bw].get(gv, []))
+            if len(vals) == 0:
+                continue
+            xs.append(gv)
+            means.append(vals.mean())
+            cis.append(_ci95(vals))
+        color = cmap(i / max(1, len(bandwidths) - 1))
+        ax.errorbar(xs, means, yerr=cis, marker="o", capsize=4, linewidth=2.0,
+                     color=color, label=f"{bw} Mbps", zorder=2)
+    ax.set_xlabel("Number of tracks", fontsize=15)
+    ax.set_ylabel(_METRIC_YLABEL.get(metric, metric.upper()), fontsize=17)
+    ax.set_xticks(group_vals)
+    ax.tick_params(labelsize=13, direction="out", which="both", top=False, right=False)
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+    ax.legend(loc="best", framealpha=0.9, fontsize=13)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(str(out_path), dpi=DPI, bbox_inches="tight")
     fig.savefig(str(out_path.with_suffix(".eps")), format="eps", bbox_inches="tight")
@@ -279,9 +374,16 @@ def main():
                          "expect/glob for. Defaults to 1-4 (today's full sweep) -- set "
                          "explicitly for a partial sweep (e.g. '1 2') so a missing value "
                          "doesn't hard-fail the glob.")
-    p.add_argument("--plot-mode", choices=["line", "bar"], default="line")
+    p.add_argument("--plot-mode", choices=["line", "bar", "scalar", "line_marks"],
+                    default="line",
+                    help="line: dense per-frame line + shaded-band CI. bar: grouped bars at "
+                         "--bar-time-marks. line_marks: connected line + errorbar 95%% CI at "
+                         "--bar-time-marks (sparse line, real error bars, no shading). "
+                         "scalar: whole-session aggregate metric vs. group value (x-axis is "
+                         "n_tracks/method, not time) -- for --group-by n_tracks, answers "
+                         "where more tracks stops helping.")
     p.add_argument("--bar-time-marks", type=int, nargs="+", default=[10, 20, 30, 40, 50, 60],
-                    help="Only used when --plot-mode bar.")
+                    help="Used by --plot-mode bar and line_marks.")
     p.add_argument("--bmw", action="store_true",
                     help="Also write bmw_traces.csv (best/median/worst trace per "
                          "bandwidth), independent of --plot-mode/--group-by.")
@@ -319,10 +421,16 @@ def main():
         if not any(r.get(metric) for r in all_rows):
             print(f"skip {metric}: no data")
             continue
-        suffix = "line_vs_time" if args.plot_mode == "line" else "grouped_bar_by_time"
+        suffix = {"line": "line_vs_time", "bar": "grouped_bar_by_time",
+                  "line_marks": "line_marks_vs_time", "scalar": "vs_ntracks"}[args.plot_mode]
         by = "method" if args.group_by == "method" else "ntracks"
         out_path = out_dir / f"{metric}_{suffix}_by_{by}.png"
-        if args.plot_mode == "line":
+        if args.plot_mode == "scalar":
+            plot_scalar(all_rows, metric, bandwidths, group_vals, out_path)
+        elif args.plot_mode == "line_marks":
+            plot_line_marks(all_rows, metric, bandwidths, group_vals, group_cfg, group_key,
+                             args.bar_time_marks, out_path)
+        elif args.plot_mode == "line":
             # pooled[(bandwidth, group_val)][t_sec] = [values]. round(): matches render
             # marks' fixed step exactly, but floats accumulate drift across many
             # summary.csv files -- rounding avoids fragmenting one nominal tick into

@@ -23,7 +23,9 @@ def load_model(model_dir: str, model_type: str, expected_n_gs: Optional[int] = N
     model= kwarg so every camera call reuses it instead of reloading/repatching.
 
     n_jobs=1 is real for sklearn RandomForest (joblib n_jobs=-1 spins a thread pool per
-    tiny-batch predict call, ~100ms dispatch overhead vs ~10-15ms single-thread traversal).
+    tiny-batch predict call -- pool-spinup dispatch overhead dominates single-thread
+    traversal at this batch size; re-measure locally if the exact ratio matters, this box's
+    per-call timing isn't a stable constant).
     No-op for XGBoost's sklearn wrapper -- its predict() takes the inplace_predict path,
     which never reads self.n_jobs (thread count is baked in at train time). Not currently
     a measurable stall for XGB (OpenMP pools persist across calls), so left in place but

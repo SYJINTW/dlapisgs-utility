@@ -107,8 +107,9 @@ def project_covariance_2d(xyz, scale_0, scale_1, scale_2,
     # perf 2026-07-17: cov3d = R·diag(s²)·R^T and JW = J·W_rot are fixed 3x3/2x3
     # shapes analytically expanded to scalar elementwise arithmetic instead of
     # batched matmul (cuBLAS small-N batched GEMM is launch/scheduling-bound at
-    # N~6M, ~87% of this function's CUDA time per profiler; measured 4.68x on
-    # bicycle, 81.8ms->17.5ms). Verified equivalent to the matmul form: 99.91%
+    # N~6M, profiler showed this as the dominant CUDA cost; re-profile for a real
+    # current speedup number instead of trusting one typed here). Verified
+    # equivalent to the matmul form: 99.91%
     # of GS agree within 1% relative tolerance; residual is float32 catastrophic
     # cancellation in det=a*c-b*b for extreme-scale outlier Gaussians, present
     # at the same magnitude in the original matmul-chain formula too (checked

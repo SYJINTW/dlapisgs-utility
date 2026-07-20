@@ -237,7 +237,7 @@ def nearest_oracle_camera(cam_center: torch.Tensor, eval_centers: torch.Tensor) 
 # ---------------------------------------------------------------------------
 
 def run_sanity_check(args, device, gs=None) -> bool:
-    """gs: optional pre-loaded GaussianModel (avoids a second ~8.5s PLY load when called
+    """gs: optional pre-loaded GaussianModel (avoids a second PLY load when called
     right before run_sweep, which needs the same model -- load once in main(), pass it in)."""
     trace_path = Path(args.trace_file) if args.trace_file else pick_longest_trace(
         Path(args.bicycle_trace_dir))
@@ -274,9 +274,10 @@ def run_sanity_check(args, device, gs=None) -> bool:
 
 # ---------------------------------------------------------------------------
 # Frame writer -- raw RGB24 piped straight into a persistent ffmpeg process that does
-# the RGB->YUV420p conversion, instead of a per-frame PNG encode (measured ~343ms/frame
-# vs ~15ms/frame piped -- PNG disk write was the actual per-mark bottleneck, not
-# rendering or selection; see .claude/PLAN.md fast-cadence entry).
+# the RGB->YUV420p conversion, instead of a per-frame PNG encode -- PNG disk write was
+# the actual per-mark bottleneck, not rendering or selection (see .claude/PLAN.md
+# fast-cadence entry; re-measure with a real timer if this needs re-verifying, don't
+# trust a stale wall-clock number in a comment on a shared, contention-prone box).
 # ---------------------------------------------------------------------------
 
 class FrameWriter:
@@ -302,7 +303,7 @@ class FrameWriter:
 # ---------------------------------------------------------------------------
 
 def run_sweep(args, device, rend_gs_full=None):
-    """rend_gs_full: optional pre-loaded GaussianModel (avoids a second ~8.5s PLY load when
+    """rend_gs_full: optional pre-loaded GaussianModel (avoids a second PLY load when
     run_sanity_check already loaded one right before this -- load once in main(), pass it in).
 
     Stateful persistent-buffer streaming model (2026-07-16 redesign, replaces the earlier
@@ -663,8 +664,11 @@ def run_vmaf(args):
             # empirically this session -- claims .y4m support in --help but silently fails
             # to read frame data from a well-formed y4m file); raw .yuv with explicit
             # -w/-h/-p/-b works.
-            # --threads 8: real measured 8.3s->1.35s per call (6.2x) on this 64-core box,
-            # load average ~4.5 at measurement time -- plenty of headroom for 8 threads.
+            # --threads 8: this is a shared, contention-prone box (12+ concurrent users,
+            # load average observed swinging from ~0.2 to 27+) -- per-call wall time is
+            # NOT a fixed constant, it tracks real load at run time. Don't hardcode an
+            # expected rate here; check the actual run's log for real per-call/per-dir
+            # timing if you need a number.
             subprocess.run(
                 ["vmaf", "-r", str(gt_yuv), "-d", str(dist_yuv),
                  "-w", str(img_w), "-h", str(img_h), "-p", "420", "-b", "8",

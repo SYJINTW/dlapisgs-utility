@@ -327,8 +327,9 @@ def greedy_order(order_pairs, tile_index_offsets, tile_flat_indices, w_gi,
     elif gs_order == "ply":
         # file/storage order, no per-Gaussian weight signal (baseline). perf 2026-07-17:
         # sorting an already-ascending arange is a no-op (stable sort of sorted input ==
-        # identity permutation) -- was paying a full O(n_gs log n_gs) GPU sort (~35ms,
-        # bicycle) for zero effect. Confirmed via time_selection.py CUDA-event timing.
+        # identity permutation) -- was paying a full O(n_gs log n_gs) GPU sort for zero
+        # effect. Confirmed via time_selection.py CUDA-event timing; re-run that for a
+        # real current number instead of trusting one typed here.
         ord1 = torch.arange(n_gs, device=device)
     else:
         raise ValueError(f"unknown gs_order '{gs_order}'")

@@ -40,9 +40,9 @@ DPI = 300
 # Same colors/labels as plotting/paper_plot_metrics.ipynb's KEY_CONFIG, for
 # cross-figure consistency in the paper.
 _METHOD_CONFIG = {
-    "vd_lod":  {"label": "Heuristic (baseline)", "color": "#1f77b4"},
-    "v_lod_w": {"label": "Heuristic (ours)",      "color": "#8c564b"},
-    "ml":      {"label": "Learned (ours)",        "color": "#2ca02c"},
+    "vd_lod":  {"label": "Tile-Based",       "color": "#1f77b4"},
+    "v_lod_w": {"label": "Heuristic (Ours)", "color": "#8c564b"},
+    "ml":      {"label": "ML (Ours)",        "color": "#2ca02c"},
 }
 _METRIC_YLABEL = {"psnr": "Quality in PSNR (dB)", "ssim": "Quality in SSIM", "vmaf": "Quality in VMAF"}
 PSNR_SATURATION_DB = 60.0  # matches experiments/plot_metrics.py's saturation convention

@@ -413,20 +413,28 @@ def run_sweep(args, device, rend_gs_full=None):
         logger.info("Oracle: {} tiles, {} eval cameras (nearest-pose-matched to "
                     "{} cadence ticks)", n_oracle_tiles, len(_eval_cams), len(cadence_rows))
 
-    out_root = Path(args.output_root)
-    (out_root / "gt_renders").mkdir(parents=True, exist_ok=True)
-    for bw in args.bandwidths_mbps:
-        for method in args.methods:
-            (out_root / f"renders/bw_{bw}mbps/{method}").mkdir(parents=True, exist_ok=True)
-    (out_root / "metrics").mkdir(parents=True, exist_ok=True)
-    vmaf_dir = out_root / "vmaf"
+    # Multi-n_tracks fold (see .claude/streaming-sim-n-tracks-fold-spec.md): a single
+    # --n-tracks value keeps today's flat --output-root layout unchanged; multiple values
+    # nest under <output-root>/n_tracks{NT}/ so Pass 1 (orders) and GT render can be shared
+    # across all n_tracks values instead of recomputed once per value.
+    n_tracks_list = args.n_tracks
+    root = Path(args.output_root)
+    out_dirs = ({n_tracks_list[0]: root} if len(n_tracks_list) == 1
+                else {nt: root / f"n_tracks{nt}" for nt in n_tracks_list})
 
-    frame_writers = {"gt": FrameWriter(vmaf_dir / "gt.yuv", img_w, img_h)}
-    for bw in args.bandwidths_mbps:
-        for method in args.methods:
-            key = (bw, method)
-            frame_writers[key] = FrameWriter(
-                vmaf_dir / f"bw_{bw}mbps" / method / "distorted.yuv", img_w, img_h)
+    frame_writers = {}
+    for nt, nt_root in out_dirs.items():
+        (nt_root / "gt_renders").mkdir(parents=True, exist_ok=True)
+        for bw in args.bandwidths_mbps:
+            for method in args.methods:
+                (nt_root / f"renders/bw_{bw}mbps/{method}").mkdir(parents=True, exist_ok=True)
+        (nt_root / "metrics").mkdir(parents=True, exist_ok=True)
+        vmaf_dir = nt_root / "vmaf"
+        frame_writers[(nt, "gt")] = FrameWriter(vmaf_dir / "gt.yuv", img_w, img_h)
+        for bw in args.bandwidths_mbps:
+            for method in args.methods:
+                frame_writers[(nt, bw, method)] = FrameWriter(
+                    vmaf_dir / f"bw_{bw}mbps" / method / "distorted.yuv", img_w, img_h)
     png_pool = sc.AsyncWritePool(args.png_workers)
 
     n_tiles = len(index_offsets) - 1
@@ -495,32 +503,33 @@ def run_sweep(args, device, rend_gs_full=None):
     #     unclaimed tiles remain (2026-07-16 user request; see plot_track_utilization.py). ---
     track_rate_total = {bw: budget_bytes(bw, 1.0) for bw in args.bandwidths_mbps}  # bytes/sec
     schedules = {}
-    schedule_dir = out_root / "schedule"
-    schedule_dir.mkdir(parents=True, exist_ok=True)
-    for method in args.methods:
-        cadence_order_pairs = [orders[(ci, method)] for ci in range(len(cadence_rows))]
-        for bw in args.bandwidths_mbps:
-            track_rates = [track_rate_total[bw] / args.n_tracks] * args.n_tracks
-            schedule = build_session_schedule(
-                cadence_marks, cadence_order_pairs, cameras, method,
-                tile_index_offsets, tile_flat_indices,
-                opacity, scale_0, scale_1, scale_2, rot_0, rot_1, rot_2, rot_3,
-                gs_xyz_t, device, args.weight_mode, img_w, img_h, bpg,
-                n_tiles, track_rates, gs_order=args.gs_order)
-            schedules[(method, bw)] = schedule
-            entries = [
-                {"tile_idx": ti, "track": tr, "start_sec": st, "end_sec": en,
-                 "n_gs": len(tile_order), "bytes": len(tile_order) * bpg}
-                for ti, (st, en, tr, tile_order) in schedule.items()
-            ]
-            (schedule_dir / f"{method}_bw{bw}mbps.json").write_text(json.dumps({
-                "n_tracks": args.n_tracks, "bandwidth_mbps": bw,
-                "track_rates_bps": track_rates, "bpg": bpg, "n_tiles": n_tiles,
-                "session_duration_sec": duration_ms / 1000.0, "entries": entries,
-            }, indent=2))
-    logger.info("schedules: {} methods x {} bandwidths, whole-session event-driven "
-                "({:.1f}s elapsed)", len(args.methods), len(args.bandwidths_mbps),
-                time.time() - t0)
+    for nt in n_tracks_list:
+        schedule_dir = out_dirs[nt] / "schedule"
+        schedule_dir.mkdir(parents=True, exist_ok=True)
+        for method in args.methods:
+            cadence_order_pairs = [orders[(ci, method)] for ci in range(len(cadence_rows))]
+            for bw in args.bandwidths_mbps:
+                track_rates = [track_rate_total[bw] / nt] * nt
+                schedule = build_session_schedule(
+                    cadence_marks, cadence_order_pairs, cameras, method,
+                    tile_index_offsets, tile_flat_indices,
+                    opacity, scale_0, scale_1, scale_2, rot_0, rot_1, rot_2, rot_3,
+                    gs_xyz_t, device, args.weight_mode, img_w, img_h, bpg,
+                    n_tiles, track_rates, gs_order=args.gs_order)
+                schedules[(nt, method, bw)] = schedule
+                entries = [
+                    {"tile_idx": ti, "track": tr, "start_sec": st, "end_sec": en,
+                     "n_gs": len(tile_order), "bytes": len(tile_order) * bpg}
+                    for ti, (st, en, tr, tile_order) in schedule.items()
+                ]
+                (schedule_dir / f"{method}_bw{bw}mbps.json").write_text(json.dumps({
+                    "n_tracks": nt, "bandwidth_mbps": bw,
+                    "track_rates_bps": track_rates, "bpg": bpg, "n_tiles": n_tiles,
+                    "session_duration_sec": duration_ms / 1000.0, "entries": entries,
+                }, indent=2))
+    logger.info("schedules: {} n_tracks x {} methods x {} bandwidths, whole-session "
+                "event-driven ({:.1f}s elapsed)", len(n_tracks_list), len(args.methods),
+                len(args.bandwidths_mbps), time.time() - t0)
 
     # --- Pass 2: dense render/metric samples off the persistent schedule -- delivered GS
     #     count per tile only ever grows (no per-window reset), actual continuous camera
@@ -532,7 +541,7 @@ def run_sweep(args, device, rend_gs_full=None):
     save_indices = ({round(f * (n_frames - 1)) for f in (0.0, 0.25, 0.5, 0.75, 1.0)}
                      if n_frames > 1 else {0})
     is_repr_mark = lambda fi: fi in save_indices  # noqa: E731
-    metric_rows = []
+    metric_rows = {nt: [] for nt in n_tracks_list}
     for fine_idx, trace_row in enumerate(render_rows):
         t_sec = render_marks[fine_idx]
 
@@ -541,51 +550,57 @@ def run_sweep(args, device, rend_gs_full=None):
             uid=fine_idx, znear=args.znear, zfar=args.zfar, device=device,
             swap_top_bottom=args.swap_top_bottom)
 
+        # GT is n_tracks-independent -- rendered once per frame, then written/saved into
+        # every n_tracks subdir (duplicated on purpose, see fold-spec design decision 2).
         gt_rendered = sc.render_gs(rend_gs_full, cam, args.white_bg)
-        frame_writers["gt"].write(gt_rendered)
-        if is_repr_mark(fine_idx) and args.png_workers > 0:
-            png_pool.submit(
-                torchvision.utils.save_image, gt_rendered.cpu().clone(),
-                str(out_root / "gt_renders" / f"frame_{fine_idx:04d}.png"))
 
-        for method in args.methods:
-            for bw in args.bandwidths_mbps:
-                schedule = schedules[(method, bw)]
-                rate_k = track_rate_total[bw] / args.n_tracks
-                sel_parts, used_bytes = [], 0
-                for tile_idx, (start, end, track_idx, tile_order) in schedule.items():
-                    n_tile = len(tile_order)
-                    if n_tile == 0 or t_sec <= start:
-                        continue
-                    if t_sec >= end:
-                        n_gs = n_tile
-                    else:
-                        n_gs = min(int(rate_k * (t_sec - start) // bpg), n_tile)
-                    if n_gs > 0:
-                        sel_parts.append(tile_order[:n_gs])
-                        used_bytes += n_gs * bpg
-                selected = np.concatenate(sel_parts) if sel_parts else np.array([], dtype=np.int64)
-                sub_gs = sc.subset_gaussians(rend_gs_full, selected)
-                rendered = sc.render_gs(sub_gs, cam, args.white_bg)
-                del sub_gs
-                metrics = sc.compute_metrics(rendered, gt_rendered, skip_lpips=True)
+        for nt in n_tracks_list:
+            nt_root = out_dirs[nt]
+            frame_writers[(nt, "gt")].write(gt_rendered)
+            if is_repr_mark(fine_idx) and args.png_workers > 0:
+                png_pool.submit(
+                    torchvision.utils.save_image, gt_rendered.cpu().clone(),
+                    str(nt_root / "gt_renders" / f"frame_{fine_idx:04d}.png"))
 
-                frame_writers[(bw, method)].write(rendered)
-                if is_repr_mark(fine_idx) and args.png_workers > 0:
-                    png_path = out_root / f"renders/bw_{bw}mbps/{method}/frame_{fine_idx:04d}.png"
-                    png_pool.submit(
-                        torchvision.utils.save_image, rendered.cpu().clone(), str(png_path))
+            for method in args.methods:
+                for bw in args.bandwidths_mbps:
+                    schedule = schedules[(nt, method, bw)]
+                    rate_k = track_rate_total[bw] / nt
+                    sel_parts, used_bytes = [], 0
+                    for tile_idx, (start, end, track_idx, tile_order) in schedule.items():
+                        n_tile = len(tile_order)
+                        if n_tile == 0 or t_sec <= start:
+                            continue
+                        if t_sec >= end:
+                            n_gs = n_tile
+                        else:
+                            n_gs = min(int(rate_k * (t_sec - start) // bpg), n_tile)
+                        if n_gs > 0:
+                            sel_parts.append(tile_order[:n_gs])
+                            used_bytes += n_gs * bpg
+                    selected = (np.concatenate(sel_parts) if sel_parts
+                                else np.array([], dtype=np.int64))
+                    sub_gs = sc.subset_gaussians(rend_gs_full, selected)
+                    rendered = sc.render_gs(sub_gs, cam, args.white_bg)
+                    del sub_gs
+                    metrics = sc.compute_metrics(rendered, gt_rendered, skip_lpips=True)
 
-                metric_rows.append({
-                    "frame_idx": fine_idx, "t_sec": t_sec, "method": method,
-                    "bandwidth_mbps": bw,
-                    "theoretical_max_bytes": int(track_rate_total[bw] * t_sec),
-                    "used_bytes": used_bytes,
-                    "coverage_frac": used_bytes / full_scene_bytes,
-                    "n_tracks": args.n_tracks,
-                    "n_selected": len(selected), "n_gs_total": len(opacity),
-                    "psnr": metrics["psnr"], "ssim": metrics["ssim"],
-                })
+                    frame_writers[(nt, bw, method)].write(rendered)
+                    if is_repr_mark(fine_idx) and args.png_workers > 0:
+                        png_path = nt_root / f"renders/bw_{bw}mbps/{method}/frame_{fine_idx:04d}.png"
+                        png_pool.submit(
+                            torchvision.utils.save_image, rendered.cpu().clone(), str(png_path))
+
+                    metric_rows[nt].append({
+                        "frame_idx": fine_idx, "t_sec": t_sec, "method": method,
+                        "bandwidth_mbps": bw,
+                        "theoretical_max_bytes": int(track_rate_total[bw] * t_sec),
+                        "used_bytes": used_bytes,
+                        "coverage_frac": used_bytes / full_scene_bytes,
+                        "n_tracks": nt,
+                        "n_selected": len(selected), "n_gs_total": len(opacity),
+                        "psnr": metrics["psnr"], "ssim": metrics["ssim"],
+                    })
         if fine_idx % 10 == 0 or fine_idx == len(render_rows) - 1:
             logger.info("frame {}/{} t={:.1f}s done ({:.1f}s elapsed)",
                         fine_idx + 1, len(render_rows), t_sec, time.time() - t0)
@@ -595,29 +610,31 @@ def run_sweep(args, device, rend_gs_full=None):
     png_pool.drain()
     png_pool.shutdown()
 
-    rows = metric_rows
-    summary_csv = out_root / "metrics" / "summary.csv"
-    with open(summary_csv, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        w.writeheader()
-        w.writerows(rows)
-    (out_root / "metrics" / "summary.json").write_text(json.dumps(rows, indent=2))
-    logger.success("Wrote {} rows to {}", len(rows), summary_csv)
+    for nt in n_tracks_list:
+        nt_root = out_dirs[nt]
+        rows = metric_rows[nt]
+        summary_csv = nt_root / "metrics" / "summary.csv"
+        with open(summary_csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+        (nt_root / "metrics" / "summary.json").write_text(json.dumps(rows, indent=2))
+        logger.success("Wrote {} rows to {}", len(rows), summary_csv)
 
-    params = {
-        "trace_path": str(trace_path), "n_cadence_ticks": len(cadence_rows),
-        "n_frames": len(render_rows), "render_interval_sec": args.render_interval_sec,
-        "interval_sec": args.interval_sec, "bandwidths_mbps": args.bandwidths_mbps,
-        "methods": args.methods, "img_w": img_w, "img_h": img_h,
-        "ply": str(args.ply), "tiling_cache": str(args.tiling_cache),
-        "ml_model_dir": args.ml_model_dir, "ml_model_type": args.ml_model_type,
-        "weight_mode": args.weight_mode, "w_norm": args.w_norm, "c_norm": args.c_norm,
-        "white_bg": args.white_bg, "swap_top_bottom": args.swap_top_bottom,
-        "n_tracks": args.n_tracks, "gs_order": args.gs_order,
-        "full_scene_bytes": full_scene_bytes,
-        "elapsed_sec": time.time() - t0,
-    }
-    (out_root / "params.yaml").write_text(json.dumps(params, indent=2))
+        params = {
+            "trace_path": str(trace_path), "n_cadence_ticks": len(cadence_rows),
+            "n_frames": len(render_rows), "render_interval_sec": args.render_interval_sec,
+            "interval_sec": args.interval_sec, "bandwidths_mbps": args.bandwidths_mbps,
+            "methods": args.methods, "img_w": img_w, "img_h": img_h,
+            "ply": str(args.ply), "tiling_cache": str(args.tiling_cache),
+            "ml_model_dir": args.ml_model_dir, "ml_model_type": args.ml_model_type,
+            "weight_mode": args.weight_mode, "w_norm": args.w_norm, "c_norm": args.c_norm,
+            "white_bg": args.white_bg, "swap_top_bottom": args.swap_top_bottom,
+            "n_tracks": nt, "gs_order": args.gs_order,
+            "full_scene_bytes": full_scene_bytes,
+            "elapsed_sec": time.time() - t0,
+        }
+        (nt_root / "params.yaml").write_text(json.dumps(params, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -736,12 +753,18 @@ def parse_args():
     # rewrite (2026-07-16, explicit user decision -- circle back later). Every tile's full
     # Gaussian set is delivered. selection_core.prune_tile_gs itself is untouched and stays
     # available for reuse when this is revisited.
-    p.add_argument("--n-tracks", type=int, default=1,
+    p.add_argument("--n-tracks", type=int, nargs="+", default=[1],
                     help="Number of simultaneous QUIC/MOQ-style transmission tracks, equal "
                          "bandwidth share. Each track works one tile at a time to completion "
                          "and, once free, claims the highest-priority not-yet-delivered tile "
                          "(event-driven, work-conserving -- see build_session_schedule()). "
-                         "1 = strictly-serial single-track (default).")
+                         "1 = strictly-serial single-track (default). Accepts multiple values "
+                         "(e.g. --n-tracks 1 2 3 4) to sweep n_tracks in one process, sharing "
+                         "the n_tracks-independent tile-ranking (Pass 1) and GT render across "
+                         "all values instead of recomputing them per value -- see "
+                         ".claude/streaming-sim-n-tracks-fold-spec.md. A single value keeps "
+                         "the flat --output-root layout; multiple values nest as "
+                         "<output-root>/n_tracks{NT}/...")
     p.add_argument("--white-bg", action="store_true")
     p.add_argument("--znear", type=float, default=0.01)
     p.add_argument("--zfar", type=float, default=100.0)

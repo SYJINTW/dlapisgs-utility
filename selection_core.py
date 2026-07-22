@@ -20,6 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from loguru import logger
 
 HERE = Path(__file__).resolve().parent
 WORKSPACE = HERE.parent
@@ -340,6 +341,62 @@ def greedy_order(order_pairs, tile_index_offsets, tile_flat_indices, w_gi,
     return tile_flat_indices[final_order][:max_count].detach().cpu().numpy().astype(np.int64)
 
 
+def _prune_keep_count(n_total: int, keep_frac: float, max_gs_per_tile: int | None) -> int:
+    """Shared keep-count arithmetic for prune_tile_gs/split_tile_primary_remainder -- one
+    formula, not duplicated per caller (project rule: shared selection logic lives here
+    only). Floors at 1 (never drops a tile to zero) unless n_total itself is 0."""
+    if n_total == 0:
+        return 0
+    n_keep = max(1, int(round(n_total * keep_frac)))
+    if max_gs_per_tile is not None:
+        n_keep = min(n_keep, max_gs_per_tile)
+    return min(n_keep, n_total)
+
+
+_WARNED_PLY_PRUNE_NOOP: set = set()
+
+
+def split_tile_primary_remainder(order: np.ndarray, keep_frac: float, scheme: str,
+                                  gs_order: str = "weight",
+                                  max_gs_per_tile: int | None = None
+                                  ) -> tuple[np.ndarray, np.ndarray]:
+    """Split one tile's already-ordered Gaussian index array (as produced by
+    streaming_sim.tile_gs_order_at_tick, or any caller's own per-tile ordering) into
+    (primary, remainder), for a two-tier claim: a scheduler sends `primary` first
+    (finishing the tile faster), then `remainder` later if session time/budget allows
+    (see streaming_sim.build_session_schedule). Reuses prune_tile_gs's exact keep-count
+    formula via _prune_keep_count, so both functions agree on "how many Gaussians survive
+    the cut."
+
+    No-op (returns `(order, empty)`) in three cases, all centralized here rather than left
+    to callers to remember (same precedent as greedy_order()'s NO_WEIGHT_SCHEMES override,
+    selection_core.py:309-310):
+      - `scheme in NO_WEIGHT_SCHEMES` (no real per-GS weight -- currently just vd_lod Tile-Based baseline utility).
+      - `keep_frac >= 1.0` (nothing to split).
+      - `gs_order == "ply"` for an otherwise weight-bearing scheme: `order` is plain
+        storage order in that case (tile_gs_order_at_tick never computes a weight when
+        gs_order="ply"), so a "primary top-keep_frac" split has no quality meaning --
+        logs one warning (not per-tile/per-tick) so this combination is visible, not
+        silently different from what the caller asked for, while still running.
+    """
+    if scheme in NO_WEIGHT_SCHEMES or keep_frac >= 1.0:
+        return order, np.empty(0, dtype=order.dtype)
+    if gs_order == "ply":
+        if not _WARNED_PLY_PRUNE_NOOP:
+            logger.warning(
+                "split_tile_primary_remainder: gs_order='ply' with scheme={!r} and "
+                "keep_frac={} -- primary/remainder split has no quality meaning under "
+                "storage order, no-op'd for the rest of this process (full tile sent as "
+                "one primary claim).", scheme, keep_frac)
+            _WARNED_PLY_PRUNE_NOOP.add(True)
+        return order, np.empty(0, dtype=order.dtype)
+    n = len(order)
+    if n == 0:
+        return order, np.empty(0, dtype=order.dtype)
+    n_keep = _prune_keep_count(n, keep_frac, max_gs_per_tile)
+    return order[:n_keep], order[n_keep:]
+
+
 def prune_tile_gs(tile_index_offsets, tile_flat_indices, w_gi, keep_frac, scheme,
                    max_gs_per_tile=None):
     """Online per-tile Gaussian pruning (2026-07-15, Workstream C of the scene-size-
@@ -384,10 +441,7 @@ def prune_tile_gs(tile_index_offsets, tile_flat_indices, w_gi, keep_frac, scheme
         if len(tile_idx) == 0:
             new_offsets.append(new_offsets[-1])
             continue
-        n_keep = max(1, int(round(len(tile_idx) * keep_frac)))
-        if max_gs_per_tile is not None:
-            n_keep = min(n_keep, max_gs_per_tile)
-        n_keep = min(n_keep, len(tile_idx))
+        n_keep = _prune_keep_count(len(tile_idx), keep_frac, max_gs_per_tile)
         tile_idx_t = torch.as_tensor(tile_idx, dtype=torch.long, device=device)
         tile_w = w_gi[tile_idx_t]
         _, order = torch.sort(tile_w, descending=True, stable=True)
@@ -490,6 +544,91 @@ def oracle_scores(scheme, oracle_data, camera_index, n_tiles):
         I_aoi_n = I_aoi / s_aoi if s_aoi > 0 else I_aoi
         combined = I_loo_n + I_aoi_n
         return np.where(finite, combined, -np.inf)
+
+
+def compute_exact_loo_scores(full_gs, cam, white_bg: bool,
+                              tile_index_offsets: torch.Tensor,
+                              tile_flat_indices: torch.Tensor, n_tiles: int,
+                              gt_rendered: torch.Tensor | None = None) -> np.ndarray:
+    """Exact per-camera leave-one-tile-out ΔMSE, computed live at the caller's exact
+    pose -- no nearest-pose snap, no precomputed NPZ (see oracle_scores()'s 'oracle_loo'
+    branch, which reads a fixed 150-cam NPZ and requires nearest_oracle_camera() to snap
+    a continuous streaming pose onto it; this function exists to measure how much that
+    snap costs, by giving 'oracle_loo_exact' a directly-comparable non-snapped score at
+    the same tick). Renders R_full once (or reuses gt_rendered if the caller already has
+    it -- e.g. streaming_sim.py's Pass 2 GT render), then one LOO render per tile (scene
+    minus that tile's own GS). Returns the same contract as oracle_scores(): positive
+    ΔMSE per tile, -inf for empty tiles, ready to feed straight into sort_tiles().
+
+    Cost is real, not guessed: measured ~0.065s/render (bicycle, ~1600px, this function's
+    own steady-state loop, user1 canary 2026-07-22) -- N_tiles renders per call at that
+    rate, no batching trick applied here. Callers doing this across many cadence ticks
+    should go through ExactLooCache below rather than recomputing on every run -- this
+    function itself has no disk I/O, it's a pure per-call compute."""
+    device = full_gs._xyz.device
+    n_total = int(full_gs._xyz.shape[0])
+    if gt_rendered is None:
+        gt_rendered = render_gs(full_gs, cam, white_bg)
+    all_idx = torch.arange(n_total, dtype=torch.long, device=device)
+    scores = np.full(n_tiles, -np.inf, dtype=np.float64)
+    for k in range(n_tiles):
+        start, end = int(tile_index_offsets[k]), int(tile_index_offsets[k + 1])
+        if end == start:
+            continue
+        member = tile_flat_indices[start:end].to(device)
+        keep_mask = torch.ones(n_total, dtype=torch.bool, device=device)
+        keep_mask[member] = False
+        keep_idx = all_idx[keep_mask].cpu().numpy()
+        sub = subset_gaussians(full_gs, keep_idx)
+        rendered = render_gs(sub, cam, white_bg)
+        scores[k] = torch.mean((rendered - gt_rendered) ** 2).item()
+        del sub, rendered
+    return scores
+
+
+class ExactLooCache:
+    """Disk cache for compute_exact_loo_scores(), one NPZ per (trace, tiling) -- same
+    compute-once-read-forever pattern as experiments/oracle_dq.py's OracleDQResult, just
+    keyed by cadence tick instead of a fixed eval-camera list (2026-07-22: the first
+    version of oracle_loo_exact recomputed live on every streaming_sim.py run, which is
+    exactly the mistake oracle_dq.py already solved once -- don't re-make it).
+
+    Incremental flush every `flush_every` ticks, same crash-recovery shape as
+    exp4_oracle_dq.py's --flush-every: a killed run only loses its most recent partial
+    batch of ticks, not the whole trace. NaN = not yet computed (a real score is either
+    finite or -inf for an empty tile, never NaN), so resuming after a kill/crash just
+    means the next run's per-tick get() calls miss on whatever wasn't flushed yet."""
+
+    def __init__(self, path, n_ticks: int, n_tiles: int, flush_every: int = 20):
+        self.path = Path(path)
+        self.n_ticks, self.n_tiles = n_ticks, n_tiles
+        self.flush_every = flush_every
+        self._dirty = 0
+        if self.path.exists():
+            scores = np.load(self.path)["scores"]
+            if scores.shape == (n_ticks, n_tiles):
+                self.scores = scores.astype(np.float64, copy=True)
+            else:
+                logger.warning("ExactLooCache {}: shape {} != expected {}, reinitializing.",
+                                self.path, scores.shape, (n_ticks, n_tiles))
+                self.scores = np.full((n_ticks, n_tiles), np.nan, dtype=np.float64)
+        else:
+            self.scores = np.full((n_ticks, n_tiles), np.nan, dtype=np.float64)
+
+    def get(self, tick: int) -> np.ndarray | None:
+        row = self.scores[tick]
+        return None if np.isnan(row).any() else row
+
+    def set(self, tick: int, scores: np.ndarray) -> None:
+        self.scores[tick] = scores
+        self._dirty += 1
+        if self._dirty >= self.flush_every:
+            self.flush()
+
+    def flush(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(str(self.path), scores=self.scores)
+        self._dirty = 0
 
 
 def sort_tiles(raw_scores, n_gs_per_tile, bytes_per_gaussian, greedy_key,

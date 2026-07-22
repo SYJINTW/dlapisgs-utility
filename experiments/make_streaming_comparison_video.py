@@ -66,7 +66,9 @@ def main():
     p.add_argument("--bandwidth", required=True, help="e.g. 600.0")
     p.add_argument("--method", required=True, help="e.g. ml")
     p.add_argument("--panel", required=True, action="append",
-                    help="LABEL=OUTPUT_ROOT_TEMPLATE, repeatable, {trace} substituted. "
+                    help="LABEL=OUTPUT_ROOT_TEMPLATE[|METHOD], repeatable, {trace} substituted. "
+                         "Optional |METHOD overrides --method for this panel only (for a "
+                         "method-comparison video at one fixed config dir). "
                          "GT is read from the first panel's dir (GT doesn't depend on config).")
     p.add_argument("--cols", type=int, default=None,
                     help="panels per row, including the GT panel (default: all in one row)")
@@ -78,15 +80,18 @@ def main():
     args = p.parse_args()
 
     panel_templates = _parse_kv(args.panel)
-    first_dir = REPO / next(iter(panel_templates.values())).format(trace=args.trace)
+    first_tmpl_path = next(iter(panel_templates.values())).partition("|")[0]
+    first_dir = REPO / first_tmpl_path.format(trace=args.trace)
     params = json.loads((first_dir / "params.yaml").read_text())
     w, h = params["img_w"], params["img_h"]
     fps = args.fps if args.fps is not None else 1.0 / params["render_interval_sec"]
 
     panels = [("ground_truth", first_dir / "vmaf" / "gt.yuv")]
     for label, tmpl in panel_templates.items():
-        d = REPO / tmpl.format(trace=args.trace)
-        yuv = d / "vmaf" / f"bw_{args.bandwidth}mbps" / args.method / "distorted.yuv"
+        tmpl_path, _, method_override = tmpl.partition("|")
+        method = method_override or args.method
+        d = REPO / tmpl_path.format(trace=args.trace)
+        yuv = d / "vmaf" / f"bw_{args.bandwidth}mbps" / method / "distorted.yuv"
         assert yuv.exists(), f"missing: {yuv}"
         panels.append((label, yuv))
 

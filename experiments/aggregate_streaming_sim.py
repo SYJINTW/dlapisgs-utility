@@ -62,6 +62,12 @@ except Exception:
     plt.rc("text", usetex=False)
     plt.rc("font", **csfont)
 
+# Matches plotting/paper_plot_metrics.ipynb cell 2's color_palette/errorbar style exactly,
+# so every streaming-sim figure shares the same look as the rest of the paper.
+_PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+            "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+_ERR_LW, _ERR_CAPSIZE, _ERR_CAPTHICK = 1.5, 4, 1.5
+
 NTRACKS_ORDER = [1, 2, 3, 4]
 # Ordinal track-count palette, style intent matches plotting/paper/plot_format_ref/
 # streaming/*.png's n_tracks legend (No Tile/2/4/16 -> blue/orange/green/red). 5-8 (2026-07-20
@@ -287,8 +293,7 @@ def plot_scalar(all_rows: list[dict], metric: str, bandwidths: list[str], group_
             v = min(v, PSNR_SATURATION_DB)
         vals.append(v)
 
-    fig, ax = plt.subplots(figsize=(6.5, 4.8), constrained_layout=True)
-    cmap = plt.get_cmap("viridis")
+    fig, ax = plt.subplots(figsize=(6.4, 4.8), constrained_layout=True)
     for i, bw in enumerate(bandwidths):
         xs, means, cis = [], [], []
         for gv in group_vals:
@@ -298,8 +303,9 @@ def plot_scalar(all_rows: list[dict], metric: str, bandwidths: list[str], group_
             xs.append(gv)
             means.append(vals.mean())
             cis.append(_ci95(vals))
-        color = cmap(i / max(1, len(bandwidths) - 1))
-        ax.errorbar(xs, means, yerr=cis, marker="o", capsize=4, linewidth=2.0,
+        color = _PALETTE[i % len(_PALETTE)]
+        ax.errorbar(xs, means, yerr=cis, marker="o", capsize=_ERR_CAPSIZE,
+                     elinewidth=_ERR_LW, capthick=_ERR_CAPTHICK, linewidth=2.0,
                      color=color, label=f"{bw} Mbps", zorder=2)
     ax.set_xlabel("Number of tracks", fontsize=15)
     ax.set_ylabel(_METRIC_YLABEL.get(metric, metric.upper()), fontsize=17)
@@ -389,9 +395,39 @@ def main():
                          "bandwidth), independent of --plot-mode/--group-by.")
     p.add_argument("--bmw-method", default="ml")
     p.add_argument("--bmw-metric", default="vmaf")
+    p.add_argument("--extra-glob", default=None,
+                    help="Second sweep tree to pull additional bandwidth line(s) from, e.g. "
+                         "a different-tier sweep with a fill-in n_tracks value the primary "
+                         "--glob's tree doesn't have. Same '{}' rule as --glob under "
+                         "--group-by n_tracks. Rows are filtered to --extra-bandwidths before "
+                         "merging -- NOT a blind union, since two independently-run sweeps can "
+                         "legitimately share a bandwidth value (e.g. both include 120Mbps) and "
+                         "merging that would silently double-count one bandwidth's trace pool.")
+    p.add_argument("--extra-bandwidths", nargs="+", default=None,
+                    help="Which bandwidth_mbps values to keep from --extra-glob. Required with "
+                         "--extra-glob.")
     args = p.parse_args()
+    if args.extra_glob and not args.extra_bandwidths:
+        raise SystemExit("--extra-glob requires --extra-bandwidths")
 
     all_rows = _load_rows(args)
+    if args.extra_glob:
+        if args.group_by != "n_tracks":
+            raise SystemExit("--extra-glob only supported with --group-by n_tracks")
+        keep_bw = set(args.extra_bandwidths)
+        extra_rows = []
+        for nt in args.n_tracks_values:
+            for path in sorted(glob.glob(args.extra_glob.format(nt))):
+                extra_rows.extend(
+                    r for r in _read_rows(Path(path))
+                    if r["method"] == args.fix_method and r["bandwidth_mbps"] in keep_bw
+                       and r["n_tracks"] == str(nt))
+        if not extra_rows:
+            raise SystemExit(f"--extra-glob matched but no rows survived the "
+                              f"bandwidth={keep_bw} filter -- check --extra-bandwidths")
+        print(f"extra: {len(extra_rows)} rows from --extra-glob "
+              f"(bandwidths={sorted(keep_bw, key=float)})")
+        all_rows.extend(extra_rows)
     for r in all_rows:
         r.setdefault("_trace_id", None)  # filled in below only if --bmw needs it
     bandwidths = sorted({r["bandwidth_mbps"] for r in all_rows}, key=float)

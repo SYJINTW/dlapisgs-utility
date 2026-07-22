@@ -40,10 +40,23 @@ DPI = 300
 # Same colors/labels as plotting/paper_plot_metrics.ipynb's KEY_CONFIG, for
 # cross-figure consistency in the paper.
 _METHOD_CONFIG = {
-    "vd_lod":     {"label": "Tile-Based",       "color": "#1f77b4"},
-    "v_lod_w":    {"label": "Heuristic (Ours)", "color": "#8c564b"},
-    "ml":         {"label": "ML (Ours)",        "color": "#2ca02c"},
-    "oracle_loo": {"label": "Proxy Oracle",     "color": "#d62728"},
+    "vd_lod":           {"label": "Tile-Based",              "color": "#1f77b4"},
+    "v_lod_w":          {"label": "Heuristic (Ours)",        "color": "#8c564b"},
+    "ml":               {"label": "ML (Ours)",               "color": "#2ca02c"},
+    # Two-tier primary/remainder prune sweep (2026-07-22, output/0722/): same method,
+    # --prune-keep-frac < 1.0 (top-keep_frac GS delivered first per tile, remainder
+    # topped up by idle tracks). vd_lod has no prune variant -- it's in
+    # selection_core.NO_WEIGHT_SCHEMES, prune no-ops without a gaussian weight order.
+    "v_lod_w_prune0.5":  {"label": "Heuristic (prune 0.5)",  "color": "#c49c94"},
+    "v_lod_w_prune0.33": {"label": "Heuristic (prune 0.33)", "color": "#a05a2c"},
+    "ml_prune0.5":        {"label": "ML (prune 0.5)",        "color": "#98df8a"},
+    "ml_prune0.33":       {"label": "ML (prune 0.33)",       "color": "#1b6b1b"},
+    # oracle_loo carries TWO stacked approximations (LOO-not-Shapley + nearest-pose
+    # snap to a fixed 150-cam eval grid); oracle_loo_exact only carries the first (no
+    # pose-snap -- scored live at the streaming trace's own continuous pose each tick).
+    # Neither is a true oracle -- don't call either one "exact" (2026-07-22, user).
+    "oracle_loo":       {"label": "Proxy² Oracle (pose-snapped)", "color": "#d62728"},
+    "oracle_loo_exact": {"label": "Proxy Oracle",            "color": "#000000"},
 }
 _METRIC_YLABEL = {"psnr": "Quality in PSNR (dB)", "ssim": "Quality in SSIM", "vmaf": "Quality in VMAF"}
 PSNR_SATURATION_DB = 60.0  # matches experiments/plot_metrics.py's saturation convention
